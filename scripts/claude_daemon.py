@@ -6,6 +6,8 @@ Single worker polling thread. Sessions are keyed by project:task.
 This is a thin entry point. All logic lives in the daemon/ package.
 """
 
+import json
+import os
 import sys
 import signal
 
@@ -98,17 +100,28 @@ def _recover_after_restart(worker):
                 worker._executor.submit(worker._process_message_safe, msg)
 
 
-def _ensure_cloudflared():
-    """cloudflared가 없으면 자동 설치. 성공 시 True, 실패 시 False."""
-    import shutil, subprocess, platform
-    # shutil.which may miss homebrew paths in launchd environment
+def _find_cloudflared() -> str | None:
+    """cloudflared 바이너리 경로 반환. 없으면 None."""
+    import shutil
     for p in ["cloudflared", "/opt/homebrew/bin/cloudflared", "/usr/local/bin/cloudflared"]:
-        if shutil.which(p) or os.path.isfile(p):
-            return True
+        found = shutil.which(p)
+        if found:
+            return found
+        if os.path.isfile(p):
+            return p
+    return None
 
-    logger.info("[home-portal] cloudflared not found, installing...")
+
+def _ensure_cloudflared() -> str | None:
+    """cloudflared가 없으면 자동 설치. 바이너리 경로 반환, 실패 시 None."""
+    import shutil, subprocess, platform
+
+    path = _find_cloudflared()
+    if path:
+        return path
+
+    logger.info("[tunnel] cloudflared not found, installing...")
     try:
-        # macOS: brew 시도
         if platform.system() == "Darwin":
             brew = shutil.which("brew") or "/opt/homebrew/bin/brew"
             result = subprocess.run(
@@ -116,10 +129,10 @@ def _ensure_cloudflared():
                 capture_output=True, text=True, timeout=300
             )
             if result.returncode == 0:
-                logger.info("[home-portal] cloudflared installed via brew")
-                return True
+                logger.info("[tunnel] cloudflared installed via brew")
+                return _find_cloudflared()
             # brew 실패 시 직접 다운로드
-            logger.warning(f"[home-portal] brew install failed, trying direct download")
+            logger.warning("[tunnel] brew install failed, trying direct download")
             arch = "arm64" if platform.machine() == "arm64" else "amd64"
             url = f"https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-{arch}.tgz"
             subprocess.run(
@@ -130,18 +143,134 @@ def _ensure_cloudflared():
                 ["tar", "-xzf", "/tmp/cloudflared.tgz", "-C", "/usr/local/bin/"],
                 timeout=30, check=True
             )
-            logger.info("[home-portal] cloudflared installed via direct download")
-            return True
+            logger.info("[tunnel] cloudflared installed via direct download")
+            return _find_cloudflared() or "/usr/local/bin/cloudflared"
         else:
-            logger.error("[home-portal] Auto-install only supported on macOS")
-            return False
+            logger.error("[tunnel] Auto-install only supported on macOS")
+            return None
     except Exception as e:
-        logger.error(f"[home-portal] Failed to install cloudflared: {e}")
-        return False
+        logger.error(f"[tunnel] Failed to install cloudflared: {e}")
+        return None
+
+
+def _save_config_fields(**fields):
+    """config.json에 필드를 추가/업데이트하고 메모리에도 반영."""
+    from daemon.globals import CONFIG_PATH
+    with open(CONFIG_PATH) as f:
+        data = json.load(f)
+    data.update(fields)
+    with open(CONFIG_PATH, "w") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+    config.update(fields)
+
+
+def _ensure_tunnel(api_key: str, username: str, cloudflared_path: str) -> str | None:
+    """Cloudflare Tunnel이 설정되어 있는지 확인하고, 없으면 자동 생성.
+    tunnel_id를 반환. 실패 시 None."""
+    import subprocess
+    from pathlib import Path
+
+    tunnel_id = config.get("cloudflare_tunnel_id", "")
+    tunnel_token = config.get("cloudflare_tunnel_token", "")
+
+    # --- 1. 터널이 없으면 서버 API로 생성 ---
+    if not tunnel_id or not tunnel_token:
+        logger.info(f"[tunnel] No tunnel configured, creating via API for user '{username}'...")
+        result = api_request(api_key, "POST", "/api/tunnel/create", body={"username": username})
+        if not result or not result.get("tunnelId"):
+            logger.error(f"[tunnel] Failed to create tunnel: {result}")
+            return None
+        tunnel_id = result["tunnelId"]
+        tunnel_token = result["tunnelToken"]
+        _save_config_fields(
+            cloudflare_tunnel_id=tunnel_id,
+            cloudflare_tunnel_token=tunnel_token,
+        )
+        logger.info(f"[tunnel] Created tunnel: pv-{username} ({tunnel_id[:8]}...)")
+
+    # --- 2. cloudflared 프로세스 확인/시작 ---
+    cf_running = False
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", "cloudflared.*tunnel.*run"],
+            capture_output=True, text=True
+        )
+        cf_running = result.returncode == 0
+    except Exception:
+        pass
+
+    if not cf_running:
+        logger.info("[tunnel] cloudflared not running, starting as launchd service...")
+        plist_label = "com.cloudflare.cloudflared"
+        plist_path = Path.home() / "Library" / "LaunchAgents" / f"{plist_label}.plist"
+
+        import plistlib
+        plist = {
+            "Label": plist_label,
+            "ProgramArguments": [
+                cloudflared_path,
+                "tunnel", "--no-autoupdate", "--protocol", "http2",
+                "run", "--token", tunnel_token,
+            ],
+            "RunAtLoad": True,
+            "KeepAlive": True,
+            "ThrottleInterval": 30,
+            "StandardOutPath": str(Path.home() / ".claude-daemon" / "cloudflared-stdout.log"),
+            "StandardErrorPath": str(Path.home() / ".claude-daemon" / "cloudflared-stderr.log"),
+        }
+
+        # 기존 plist 언로드
+        if plist_path.exists():
+            subprocess.run(
+                ["launchctl", "bootout", f"gui/{os.getuid()}", str(plist_path)],
+                capture_output=True
+            )
+
+        with open(plist_path, "wb") as f:
+            plistlib.dump(plist, f)
+
+        subprocess.run(
+            ["launchctl", "bootstrap", f"gui/{os.getuid()}", str(plist_path)],
+            capture_output=True
+        )
+        logger.info(f"[tunnel] cloudflared launchd service started")
+    else:
+        logger.info("[tunnel] cloudflared already running")
+
+    return tunnel_id
+
+
+def _ensure_dns_route(api_key: str, username: str, tunnel_id: str):
+    """Home Portal용 DNS + ingress 라우트가 등록되었는지 확인/생성."""
+    username_slug = username.lower().replace("_", "-")
+    username_slug = "".join(c for c in username_slug if c.isalnum() or c == "-")
+    hostname = f"{username_slug}.peter-voice.site"
+
+    # 서버 API로 DNS + ingress 등록 (멱등 — 이미 있으면 업데이트)
+    result = api_request(api_key, "POST", "/api/tunnel/add-route", body={
+        "username": username_slug,
+        "project": "",  # 빈 프로젝트 = Home Portal
+        "port": 3000,
+        "tunnelId": tunnel_id,
+    })
+    if result and result.get("url"):
+        logger.info(f"[tunnel] DNS route ensured: {result['url']}")
+    else:
+        logger.warning(f"[tunnel] DNS route registration result: {result}")
+
+    return f"https://{hostname}"
 
 
 def _ensure_home_portal():
-    """Home Portal launchd 확인/시작 + tunnel_url 서버 등록."""
+    """Home Portal + Cloudflare Tunnel 전체 자동 프로비저닝.
+
+    1. cloudflared 설치 확인/자동 설치
+    2. 터널 없으면 서버 API로 자동 생성 + config 저장
+    3. cloudflared 서비스 실행 확인/시작
+    4. Home Portal 웹서버 실행 확인/시작
+    5. DNS + ingress 라우트 등록
+    6. tunnel_url 서버에 등록
+    """
     if not config.get("home_portal_enabled", True):
         logger.info("[home-portal] Disabled via config")
         return
@@ -151,19 +280,26 @@ def _ensure_home_portal():
         return
 
     try:
-        # 0. cloudflared 설치 확인
-        if not _ensure_cloudflared():
+        # 1. cloudflared 설치 확인
+        cloudflared_path = _ensure_cloudflared()
+        if not cloudflared_path:
             logger.error("[home-portal] cloudflared required but installation failed")
             return
 
-        # 1. username 조회
+        # 2. username 조회
         me = api_request(api_key, "GET", "/api/bot/me")
         if not me or not me.get("username"):
             logger.warning("[home-portal] Could not resolve username from /api/bot/me")
             return
         username = me["username"]
 
-        # 2. Home Portal launchd 시작 (이미 실행 중이면 스킵)
+        # 3. 터널 확인/생성 + cloudflared 서비스 시작
+        tunnel_id = _ensure_tunnel(api_key, username, cloudflared_path)
+        if not tunnel_id:
+            logger.error("[home-portal] Tunnel setup failed")
+            return
+
+        # 4. Home Portal launchd 시작 (이미 실행 중이면 스킵)
         import subprocess
         from pathlib import Path
         plist_path = Path.home() / "Library" / "LaunchAgents" / "com.petervoice.home-portal.plist"
@@ -188,10 +324,10 @@ def _ensure_home_portal():
         else:
             logger.info("[home-portal] Already running")
 
-        # 3. tunnel_url 서버에 등록
-        username_slug = username.lower().replace("_", "-")
-        username_slug = "".join(c for c in username_slug if c.isalnum() or c == "-")
-        tunnel_url = f"https://{username_slug}.peter-voice.site"
+        # 5. DNS + ingress 라우트 등록
+        tunnel_url = _ensure_dns_route(api_key, username, tunnel_id)
+
+        # 6. tunnel_url 서버에 등록
         api_request(api_key, "PATCH", "/api/bot/status", body={"tunnel_url": tunnel_url})
         logger.info(f"[home-portal] Registered tunnel_url: {tunnel_url}")
 
