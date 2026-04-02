@@ -1085,6 +1085,27 @@ const server = http.createServer((req, res) => {
       } catch (e) { json({ error: "이동 실패: " + e.message }, 500); }
     }).catch(e => json({ error: e.message }, 400));
   }
+  // Docs API: /api/docs/delete — 파일/폴더 삭제
+  else if (pathname === "/api/docs/delete" && req.method === "POST") {
+    readBody().then(body => {
+      const { dir, filePath } = body;
+      if (!dir || !filePath) return json({ error: "dir, filePath 필요" }, 400);
+      const base = validateDocsDir(dir);
+      if (!base) return json({ error: "접근 불가 경로" }, 403);
+      const full = path.resolve(base, filePath);
+      if (!full.startsWith(base)) return json({ error: "접근 불가 경로" }, 403);
+      if (!fs.existsSync(full)) return json({ error: "파일 없음" }, 404);
+      try {
+        const stat = fs.statSync(full);
+        if (stat.isDirectory()) {
+          fs.rmSync(full, { recursive: true, force: true });
+        } else {
+          fs.unlinkSync(full);
+        }
+        json({ ok: true });
+      } catch (e) { json({ error: "삭제 실패: " + e.message }, 500); }
+    }).catch(e => json({ error: e.message }, 400));
+  }
   // Skills API: /api/skills — 설치된 스킬 목록
   else if (pathname === "/api/skills" && req.method === "GET") {
     const skillsDir = path.join(os.homedir(), ".claude", "skills");
