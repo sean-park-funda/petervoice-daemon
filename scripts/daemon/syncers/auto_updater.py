@@ -37,6 +37,21 @@ class AutoUpdater(threading.Thread):
         r = self._git("rev-parse", "HEAD")
         return r.stdout.strip() if r.returncode == 0 else ""
 
+    def _restart_home_portal_if_changed(self, old_head: str, new_head: str):
+        """Restart Home Portal launchd service if home-portal.js changed."""
+        r = self._git("diff", "--name-only", old_head, new_head)
+        if r.returncode == 0 and "home-portal.js" in r.stdout:
+            logger.info("[updater] home-portal.js changed — restarting Home Portal")
+            try:
+                import os
+                uid = os.getuid()
+                plist = os.path.expanduser("~/Library/LaunchAgents/com.petervoice.home-portal.plist")
+                subprocess.run(["launchctl", "bootout", f"gui/{uid}", plist], capture_output=True)
+                subprocess.run(["launchctl", "bootstrap", f"gui/{uid}", plist], capture_output=True)
+                logger.info("[updater] Home Portal restarted")
+            except Exception as e:
+                logger.warning(f"[updater] Home Portal restart failed: {e}")
+
     def _pip_install_if_changed(self, old_head: str, new_head: str):
         """Run pip install if requirements.txt changed between commits."""
         r = self._git("diff", "--name-only", old_head, new_head)
@@ -101,7 +116,10 @@ class AutoUpdater(threading.Thread):
         # 4. Install dependencies if changed
         self._pip_install_if_changed(old_head, new_head)
 
-        # 5. Restart
+        # 5. Restart Home Portal if home-portal.js changed
+        self._restart_home_portal_if_changed(old_head, new_head)
+
+        # 6. Restart daemon
         self._consecutive_failures = 0
         logger.info("[updater] Restarting daemon to apply updates...")
         shutdown_event.set()
