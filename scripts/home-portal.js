@@ -641,12 +641,19 @@ function verifyAuth(req) {
   const apiKey = config.api_key;
   if (!apiKey) return false;
 
+  // 1. 헤더 인증 (API 호출용)
   const header = req.headers["x-api-key"] || req.headers["authorization"];
-  if (!header) return false;
+  if (header) {
+    const token = header.startsWith("Bearer ") ? header.slice(7) : header;
+    if (token === apiKey) return true;
+  }
 
-  // "Bearer pv_xxx" 또는 "pv_xxx" 형태 모두 지원
-  const token = header.startsWith("Bearer ") ? header.slice(7) : header;
-  return token === apiKey;
+  // 2. 쿼리 파라미터 인증 (브라우저 링크용)
+  const url = new URL(req.url, `http://localhost:${PORT}`);
+  const queryToken = url.searchParams.get("token");
+  if (queryToken && queryToken === apiKey) return true;
+
+  return false;
 }
 
 // ─── Server ──────────────────────────────────────────
