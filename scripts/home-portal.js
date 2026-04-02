@@ -734,7 +734,7 @@ function handleAuthCallback(req, res, url) {
   const redirectUrl = url.pathname || "/";
   res.writeHead(302, {
     Location: redirectUrl,
-    "Set-Cookie": `pv_session=${sessionToken}; HttpOnly; Secure; SameSite=Strict; Max-Age=${SESSION_MAX_AGE}; Path=/`,
+    "Set-Cookie": `pv_session=${sessionToken}; HttpOnly; Secure; SameSite=Lax; Max-Age=${SESSION_MAX_AGE}; Path=/`,
   });
   res.end();
   return true;
