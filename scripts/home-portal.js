@@ -569,7 +569,22 @@ function execUnpublish(body) {
 
 function getProjectDirs() {
   const config = loadConfig();
-  return config.project_dirs || {};
+  const explicit = config.project_dirs || {};
+  // Proxy: config에 없는 프로젝트도 ~/Projects/{id}에 존재하면 자동 매핑
+  return new Proxy(explicit, {
+    get(target, prop) {
+      if (typeof prop !== "string") return undefined;
+      if (target[prop]) return target[prop];
+      const guess = path.join(PROJECTS_DIR, prop);
+      if (fs.existsSync(guess)) return guess;
+      return undefined;
+    },
+    has(target, prop) {
+      if (typeof prop !== "string") return false;
+      if (prop in target) return true;
+      return fs.existsSync(path.join(PROJECTS_DIR, prop));
+    },
+  });
 }
 
 function apiDocsList(projectId) {
