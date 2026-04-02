@@ -627,16 +627,16 @@ function apiDocsRead(projectId, docPath) {
 
 // ─── Auth ────────────────────────────────────────────
 
-function isLocalRequest(req) {
-  const addr = req.socket.remoteAddress;
-  return addr === "127.0.0.1" || addr === "::1" || addr === "::ffff:127.0.0.1";
+function isTunnelRequest(req) {
+  // cloudflared가 프록시하면 Cf-Connecting-Ip 헤더가 추가됨
+  return !!req.headers["cf-connecting-ip"];
 }
 
 function verifyAuth(req) {
-  // localhost 요청은 인증 불필요
-  if (isLocalRequest(req)) return true;
+  // 터널 경유가 아닌 진짜 로컬 요청은 인증 불필요
+  if (!isTunnelRequest(req)) return true;
 
-  // 외부 요청은 API key 필요
+  // 터널 경유 외부 요청은 API key 필요
   const config = loadConfig();
   const apiKey = config.api_key;
   if (!apiKey) return false;
