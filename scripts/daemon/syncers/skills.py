@@ -1,10 +1,13 @@
 """Skills syncer: periodically sync skills from API to ~/.claude/skills/."""
 
 import json
+import shutil
 import threading
 
 from daemon.globals import SKILLS_DIR, config, shutdown_event, logger
 from daemon.api import api_request
+
+CLEANUP_FLAG = SKILLS_DIR / ".cleanup-v1-done"
 
 
 class SkillsSyncer(threading.Thread):
@@ -12,6 +15,39 @@ class SkillsSyncer(threading.Thread):
 
     def __init__(self):
         super().__init__(daemon=True, name="skills-syncer")
+
+    def _cleanup_auto_installed(self):
+        """일회성: 예전 auto-install로 깔린 마켓 스킬을 전부 제거.
+        유저가 마켓에서 직접 다시 설치하도록 함."""
+        if CLEANUP_FLAG.exists():
+            return
+
+        api_key = config.get("api_key", "")
+        if not api_key:
+            return
+
+        # DB에서 마켓 스킬 ID 목록 조회
+        result = api_request(api_key, "GET", "/api/bot/skills", timeout=10)
+        if not result or "skills" not in result:
+            return
+        market_ids = {s["id"].strip() for s in result["skills"] if s.get("id")}
+
+        if not SKILLS_DIR.exists():
+            CLEANUP_FLAG.touch()
+            return
+
+        removed = []
+        for d in SKILLS_DIR.iterdir():
+            if not d.is_dir() or d.name.startswith("."):
+                continue
+            # 마켓에 있는 스킬만 제거 (유저가 직접 만든 로컬 스킬은 보존)
+            if d.name in market_ids:
+                shutil.rmtree(d, ignore_errors=True)
+                removed.append(d.name)
+
+        CLEANUP_FLAG.touch()
+        if removed:
+            logger.info(f"[skills] Cleanup: removed {len(removed)} auto-installed skills")
 
     def sync_once(self):
         api_key = config.get("api_key", "")
@@ -25,7 +61,7 @@ class SkillsSyncer(threading.Thread):
         skills = result["skills"]
 
         SKILLS_DIR.mkdir(parents=True, exist_ok=True)
-        synced, removed = [], []
+        synced = []
 
         for skill in skills:
             skill_id = skill.get("id", "").strip()
@@ -47,11 +83,16 @@ class SkillsSyncer(threading.Thread):
 
         if synced:
             logger.info(f"[skills] Synced: {', '.join(synced)}")
-        if removed:
-            logger.info(f"[skills] Removed: {', '.join(removed)}")
 
     def run(self):
         logger.info("[skills] Syncer started")
+
+        # 일회성 정리: 예전 auto-install된 마켓 스킬 제거
+        try:
+            self._cleanup_auto_installed()
+        except Exception as e:
+            logger.error(f"[skills] Cleanup error: {e}")
+
         try:
             self.sync_once()
         except Exception as e:
