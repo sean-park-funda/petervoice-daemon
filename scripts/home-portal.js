@@ -667,8 +667,8 @@ const server = http.createServer((req, res) => {
     res.end(JSON.stringify(data));
   };
 
-  // Auth check for /api/docs/ (외부 요청 시 인증 필수)
-  if (pathname.startsWith("/api/docs/") && !verifyAuth(req)) {
+  // Auth check: 모든 경로에 인증 적용 (localhost는 스킵)
+  if (!verifyAuth(req)) {
     return json({ error: "인증 필요" }, 401);
   }
 
