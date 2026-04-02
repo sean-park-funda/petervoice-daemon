@@ -754,33 +754,45 @@ function parseMultipart(req) {
     const contentType = req.headers["content-type"] || "";
     const match = contentType.match(/boundary=(.+)/);
     if (!match) return reject(new Error("No boundary"));
-    const boundary = "--" + match[1];
+    const boundaryBuf = Buffer.from("--" + match[1]);
+    const CRLF2 = Buffer.from("\r\n\r\n");
+    const CRLF = Buffer.from("\r\n");
 
     const chunks = [];
     req.on("data", (chunk) => chunks.push(chunk));
     req.on("end", () => {
       const buf = Buffer.concat(chunks);
       const parts = {};
-      const str = buf.toString("binary");
-      const sections = str.split(boundary).slice(1, -1);
 
-      for (const section of sections) {
-        const headerEnd = section.indexOf("\r\n\r\n");
-        if (headerEnd === -1) continue;
-        const header = section.slice(0, headerEnd);
-        const body = section.slice(headerEnd + 4, section.endsWith("\r\n") ? section.length - 2 : section.length);
-        const nameMatch = header.match(/name="([^"]+)"/);
-        if (!nameMatch) continue;
+      let pos = 0;
+      while (pos < buf.length) {
+        const bStart = buf.indexOf(boundaryBuf, pos);
+        if (bStart === -1) break;
+        const afterBoundary = bStart + boundaryBuf.length;
+        // Check for closing boundary (--)
+        if (buf[afterBoundary] === 0x2D && buf[afterBoundary + 1] === 0x2D) break;
+        const headerStart = afterBoundary + 2; // skip \r\n after boundary
+        const headerEnd = buf.indexOf(CRLF2, headerStart);
+        if (headerEnd === -1) break;
+        const headerStr = buf.slice(headerStart, headerEnd).toString("utf-8");
+        const bodyStart = headerEnd + 4;
+        const nextBoundary = buf.indexOf(boundaryBuf, bodyStart);
+        const bodyEnd = nextBoundary !== -1 ? nextBoundary - 2 : buf.length; // -2 for \r\n before boundary
+        const bodyBuf = buf.slice(bodyStart, bodyEnd);
+
+        const nameMatch = headerStr.match(/name="([^"]+)"/);
+        if (!nameMatch) { pos = nextBoundary !== -1 ? nextBoundary : buf.length; continue; }
         const name = nameMatch[1];
-        const fileMatch = header.match(/filename="([^"]+)"/);
+        const fileMatch = headerStr.match(/filename="([^"]*)"/) || headerStr.match(/filename\*=UTF-8''(.+)/);
         if (fileMatch) {
-          // binary file — extract from buffer directly
-          const headerBytes = Buffer.byteLength(section.slice(0, headerEnd + 4), "binary");
-          const start = buf.indexOf(boundary) === -1 ? 0 : 0; // find in original buf
-          parts[name] = { filename: fileMatch[1], data: Buffer.from(body, "binary") };
+          let filename = fileMatch[1];
+          // RFC 5987 decoding
+          if (headerStr.includes("filename*=")) filename = decodeURIComponent(filename);
+          parts[name] = { filename, data: bodyBuf };
         } else {
-          parts[name] = body;
+          parts[name] = bodyBuf.toString("utf-8");
         }
+        pos = nextBoundary !== -1 ? nextBoundary : buf.length;
       }
       resolve(parts);
     });
@@ -1034,6 +1046,122 @@ const server = http.createServer((req, res) => {
         json({ error: "저장 실패: " + e.message }, 500);
       }
     }).catch(e => json({ error: "업로드 파싱 실패: " + e.message }, 400));
+  }
+  // Docs API: /api/docs/copy — 파일/폴더 복사 (다른 프로젝트로)
+  else if (pathname === "/api/docs/copy" && req.method === "POST") {
+    readBody().then(body => {
+      const { dir, filePath, targetDir, targetPath: tp } = body;
+      if (!dir || !filePath || !targetDir) return json({ error: "dir, filePath, targetDir 필요" }, 400);
+      const srcBase = validateDocsDir(dir);
+      const dstBase = validateDocsDir(targetDir);
+      if (!srcBase || !dstBase) return json({ error: "접근 불가 경로" }, 403);
+      const srcFull = path.resolve(srcBase, filePath);
+      const dstFull = path.resolve(dstBase, tp || filePath);
+      if (!srcFull.startsWith(srcBase) || !dstFull.startsWith(dstBase)) return json({ error: "접근 불가 경로" }, 403);
+      if (!fs.existsSync(srcFull)) return json({ error: "원본 없음" }, 404);
+      try {
+        fs.mkdirSync(path.dirname(dstFull), { recursive: true });
+        fs.cpSync(srcFull, dstFull, { recursive: true });
+        json({ ok: true, dest: path.relative(dstBase, dstFull) });
+      } catch (e) { json({ error: "복사 실패: " + e.message }, 500); }
+    }).catch(e => json({ error: e.message }, 400));
+  }
+  // Docs API: /api/docs/move — 파일/폴더 이동 (다른 프로젝트로)
+  else if (pathname === "/api/docs/move" && req.method === "POST") {
+    readBody().then(body => {
+      const { dir, filePath, targetDir, targetPath: tp } = body;
+      if (!dir || !filePath || !targetDir) return json({ error: "dir, filePath, targetDir 필요" }, 400);
+      const srcBase = validateDocsDir(dir);
+      const dstBase = validateDocsDir(targetDir);
+      if (!srcBase || !dstBase) return json({ error: "접근 불가 경로" }, 403);
+      const srcFull = path.resolve(srcBase, filePath);
+      const dstFull = path.resolve(dstBase, tp || filePath);
+      if (!srcFull.startsWith(srcBase) || !dstFull.startsWith(dstBase)) return json({ error: "접근 불가 경로" }, 403);
+      if (!fs.existsSync(srcFull)) return json({ error: "원본 없음" }, 404);
+      try {
+        fs.mkdirSync(path.dirname(dstFull), { recursive: true });
+        fs.renameSync(srcFull, dstFull);
+        json({ ok: true, dest: path.relative(dstBase, dstFull) });
+      } catch (e) { json({ error: "이동 실패: " + e.message }, 500); }
+    }).catch(e => json({ error: e.message }, 400));
+  }
+  // Skills API: /api/skills — 설치된 스킬 목록
+  else if (pathname === "/api/skills" && req.method === "GET") {
+    const skillsDir = path.join(os.homedir(), ".claude", "skills");
+    if (!fs.existsSync(skillsDir)) return json({ skills: [] });
+    try {
+      const entries = fs.readdirSync(skillsDir, { withFileTypes: true });
+      const skills = [];
+      for (const entry of entries) {
+        if (!entry.isDirectory()) continue;
+        const skillMd = path.join(skillsDir, entry.name, "SKILL.md");
+        if (!fs.existsSync(skillMd)) continue;
+        const raw = fs.readFileSync(skillMd, "utf-8");
+        // frontmatter 파싱
+        const fmMatch = raw.match(/^---\n([\s\S]*?)\n---/);
+        const skill = { id: entry.name, name: entry.name, description: "", category: "", tags: "", version: "", author: "" };
+        if (fmMatch) {
+          const fm = fmMatch[1];
+          const nameM = fm.match(/^name:\s*(.+)$/m);
+          const descM = fm.match(/^description:\s*"?([^"\n]+)"?$/m);
+          const catM = fm.match(/category:\s*"?([^"\n,}]+)"?/);
+          const tagsM = fm.match(/tags:\s*"?([^"\n}]+)"?/);
+          const verM = fm.match(/version:\s*"?([^"\n,}]+)"?/);
+          const authM = fm.match(/author:\s*"?([^"\n,}]+)"?/);
+          if (nameM) skill.name = nameM[1].trim();
+          if (descM) skill.description = descM[1].trim();
+          if (catM) skill.category = catM[1].trim();
+          if (tagsM) skill.tags = tagsM[1].trim();
+          if (verM) skill.version = verM[1].trim();
+          if (authM) skill.author = authM[1].trim();
+        }
+        skills.push(skill);
+      }
+      skills.sort((a, b) => a.name.localeCompare(b.name));
+      json({ skills });
+    } catch (e) { json({ error: e.message }, 500); }
+  }
+  // Skills API: /api/skills/read — 스킬 SKILL.md 전체 내용
+  else if (pathname === "/api/skills/read" && req.method === "GET") {
+    const id = params.get("id");
+    if (!id) return json({ error: "id 필요" }, 400);
+    const skillMd = path.join(os.homedir(), ".claude", "skills", id, "SKILL.md");
+    if (!skillMd.startsWith(path.join(os.homedir(), ".claude", "skills"))) return json({ error: "접근 불가" }, 403);
+    if (!fs.existsSync(skillMd)) return json({ error: "스킬 없음" }, 404);
+    try {
+      const content = fs.readFileSync(skillMd, "utf-8");
+      // frontmatter 제거 후 본문만
+      const body = content.replace(/^---\n[\s\S]*?\n---\n*/, "");
+      json({ id, content: body });
+    } catch (e) { json({ error: e.message }, 500); }
+  }
+  // Skills API: /api/skills/install — 스킬 설치 (SKILL.md 내용을 받아 로컬에 저장)
+  else if (pathname === "/api/skills/install" && req.method === "POST") {
+    readBody().then(body => {
+      const { id, content } = body;
+      if (!id || !content) return json({ error: "id, content 필요" }, 400);
+      if (/[\/\\]/.test(id)) return json({ error: "잘못된 id" }, 400);
+      const skillDir = path.join(os.homedir(), ".claude", "skills", id);
+      try {
+        fs.mkdirSync(skillDir, { recursive: true });
+        fs.writeFileSync(path.join(skillDir, "SKILL.md"), content, "utf-8");
+        json({ ok: true, id });
+      } catch (e) { json({ error: "설치 실패: " + e.message }, 500); }
+    }).catch(e => json({ error: e.message }, 400));
+  }
+  // Skills API: /api/skills/uninstall — 스킬 제거
+  else if (pathname === "/api/skills/uninstall" && req.method === "POST") {
+    readBody().then(body => {
+      const { id } = body;
+      if (!id) return json({ error: "id 필요" }, 400);
+      if (/[\/\\]/.test(id)) return json({ error: "잘못된 id" }, 400);
+      const skillDir = path.join(os.homedir(), ".claude", "skills", id);
+      if (!fs.existsSync(skillDir)) return json({ ok: true, id });
+      try {
+        fs.rmSync(skillDir, { recursive: true, force: true });
+        json({ ok: true, id });
+      } catch (e) { json({ error: "제거 실패: " + e.message }, 500); }
+    }).catch(e => json({ error: e.message }, 400));
   }
   else if (pathname === "/api/publish" && req.method === "POST") {
     readBody().then(body => json(execPublish(body)));

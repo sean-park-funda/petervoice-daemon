@@ -30,25 +30,18 @@ class SkillsSyncer(threading.Thread):
         for skill in skills:
             skill_id = skill.get("id", "").strip()
             content = skill.get("content", "")
-            enabled = skill.get("enabled", True)
             if not skill_id:
                 continue
 
             skill_dir = SKILLS_DIR / skill_id
             skill_file = skill_dir / "SKILL.md"
 
-            if not enabled:
-                if skill_file.exists():
-                    skill_file.unlink()
-                    try:
-                        skill_dir.rmdir()
-                    except OSError:
-                        pass
-                    removed.append(skill_id)
+            # 업데이트 전용: 로컬에 이미 설치된 스킬만 DB 내용으로 갱신
+            # 로컬에 없는 스킬은 건드리지 않음 (마켓 UI에서 설치)
+            if not skill_file.exists():
                 continue
 
-            skill_dir.mkdir(exist_ok=True)
-            if not skill_file.exists() or skill_file.read_text(encoding="utf-8") != content:
+            if skill_file.read_text(encoding="utf-8") != content:
                 skill_file.write_text(content, encoding="utf-8")
                 synced.append(skill_id)
 

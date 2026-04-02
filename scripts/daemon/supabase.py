@@ -49,6 +49,19 @@ def _fetch_project_directory(project: str) -> str | None:
     return settings.get("directory") or None
 
 
+def _update_project_directory(project: str, directory: str):
+    """DB에 프로젝트 디렉토리 경로 기록."""
+    api_key = config.get("api_key", "")
+    if not api_key:
+        return
+    try:
+        api_request(api_key, "PATCH", "/api/bot/project-settings",
+                    body={"project": project, "directory": directory}, timeout=5)
+        logger.info(f"[project] Registered directory for {project}: {directory}")
+    except Exception as e:
+        logger.warning(f"[project] Failed to register directory for {project}: {e}")
+
+
 def get_project_dir(project: str) -> str:
     from daemon.globals import DAEMON_DIR
     # 1) API에서 directory 조회
@@ -60,9 +73,10 @@ def get_project_dir(project: str) -> str:
     dirs = config.get("project_dirs", {})
     if project in dirs:
         return dirs[project]
-    # 3) 자동 디렉토리 생성
+    # 3) 자동 디렉토리 생성 + DB에 기록
     auto_dir = str(DAEMON_DIR / "projects" / project)
     os.makedirs(auto_dir, exist_ok=True)
+    _update_project_directory(project, auto_dir)
     return auto_dir
 
 
