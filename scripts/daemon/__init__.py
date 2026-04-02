@@ -1,0 +1,1 @@
+"""Claude Daemon — modular package."""
