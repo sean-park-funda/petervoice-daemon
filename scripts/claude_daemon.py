@@ -98,6 +98,46 @@ def _recover_after_restart(worker):
                 worker._executor.submit(worker._process_message_safe, msg)
 
 
+def _ensure_cloudflared():
+    """cloudflared가 없으면 자동 설치. 성공 시 True, 실패 시 False."""
+    import shutil, subprocess, platform
+    if shutil.which("cloudflared"):
+        return True
+
+    logger.info("[home-portal] cloudflared not found, installing...")
+    try:
+        # macOS: brew 시도
+        if platform.system() == "Darwin":
+            brew = shutil.which("brew") or "/opt/homebrew/bin/brew"
+            result = subprocess.run(
+                [brew, "install", "cloudflared"],
+                capture_output=True, text=True, timeout=300
+            )
+            if result.returncode == 0:
+                logger.info("[home-portal] cloudflared installed via brew")
+                return True
+            # brew 실패 시 직접 다운로드
+            logger.warning(f"[home-portal] brew install failed, trying direct download")
+            arch = "arm64" if platform.machine() == "arm64" else "amd64"
+            url = f"https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-{arch}.tgz"
+            subprocess.run(
+                ["curl", "-sL", url, "-o", "/tmp/cloudflared.tgz"],
+                timeout=120, check=True
+            )
+            subprocess.run(
+                ["tar", "-xzf", "/tmp/cloudflared.tgz", "-C", "/usr/local/bin/"],
+                timeout=30, check=True
+            )
+            logger.info("[home-portal] cloudflared installed via direct download")
+            return True
+        else:
+            logger.error("[home-portal] Auto-install only supported on macOS")
+            return False
+    except Exception as e:
+        logger.error(f"[home-portal] Failed to install cloudflared: {e}")
+        return False
+
+
 def _ensure_home_portal():
     """Home Portal launchd 확인/시작 + tunnel_url 서버 등록."""
     if not config.get("home_portal_enabled", True):
@@ -109,6 +149,11 @@ def _ensure_home_portal():
         return
 
     try:
+        # 0. cloudflared 설치 확인
+        if not _ensure_cloudflared():
+            logger.error("[home-portal] cloudflared required but installation failed")
+            return
+
         # 1. username 조회
         me = api_request(api_key, "GET", "/api/bot/me")
         if not me or not me.get("username"):
