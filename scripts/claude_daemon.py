@@ -370,7 +370,11 @@ def main():
         # Start syncer threads
         SecretsSyncer().start()
         SkillsSyncer().start()
-        DocsSyncer().start()
+        if config.get("docs_sync_enabled", False):
+            DocsSyncer().start()
+        else:
+            logger.info("[docs] Syncer disabled (docs_sync_enabled=false)")
+
         AutoUpdater().start()
 
         worker = Worker()

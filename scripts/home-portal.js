@@ -578,32 +578,73 @@ function apiDocsList(projectId) {
   if (!projectDir) return { error: `프로젝트 없음: ${projectId}` };
 
   const docsDir = path.join(projectDir, "docs");
-  if (!fs.existsSync(docsDir)) return { files: [] };
+  if (!fs.existsSync(docsDir)) return { documents: [] };
 
-  const files = [];
-  function scan(dir, prefix) {
+  // 계층 구조로 반환 (DocumentsPanel Doc 인터페이스 호환)
+  const foldersMap = {}; // relPath → folder doc
+  const rootDocs = [];
+
+  function scan(dir, prefix, parentId) {
     try {
       const entries = fs.readdirSync(dir, { withFileTypes: true });
-      for (const entry of entries) {
-        if (entry.name.startsWith(".")) continue;
+      const sorted = entries
+        .filter(e => !e.name.startsWith("."))
+        .sort((a, b) => {
+          if (a.isDirectory() !== b.isDirectory()) return a.isDirectory() ? -1 : 1;
+          return a.name.localeCompare(b.name);
+        });
+
+      let sortOrder = 0;
+      for (const entry of sorted) {
         const fullPath = path.join(dir, entry.name);
         const relPath = prefix ? `${prefix}/${entry.name}` : entry.name;
+
         if (entry.isDirectory()) {
-          scan(fullPath, relPath);
+          const folder = {
+            id: `folder:${relPath}`,
+            title: entry.name,
+            content: "",
+            type: "folder",
+            parent_id: parentId,
+            file_path: null,
+            pinned: false,
+            sort_order: sortOrder++,
+            created_at: new Date().toISOString(),
+            updated_at: new Date().toISOString(),
+            children: [],
+          };
+          foldersMap[relPath] = folder;
+          if (parentId && foldersMap[prefix]) {
+            foldersMap[prefix].children.push(folder);
+          } else {
+            rootDocs.push(folder);
+          }
+          scan(fullPath, relPath, `folder:${relPath}`);
         } else if (entry.name.endsWith(".md")) {
           const stat = fs.statSync(fullPath);
-          files.push({
-            path: relPath,
+          const doc = {
+            id: `doc:${relPath}`,
             title: entry.name.replace(/\.md$/, ""),
-            size: stat.size,
-            modified: stat.mtime.toISOString(),
-          });
+            content: "",
+            type: "doc",
+            parent_id: parentId,
+            file_path: relPath,
+            pinned: false,
+            sort_order: sortOrder++,
+            created_at: stat.birthtime.toISOString(),
+            updated_at: stat.mtime.toISOString(),
+          };
+          if (parentId && foldersMap[prefix]) {
+            foldersMap[prefix].children.push(doc);
+          } else {
+            rootDocs.push(doc);
+          }
         }
       }
     } catch {}
   }
-  scan(docsDir, "");
-  return { project: projectId, files };
+  scan(docsDir, "", null);
+  return { project: projectId, documents: rootDocs };
 }
 
 function apiDocsRead(projectId, docPath) {
@@ -701,11 +742,18 @@ function verifyAuth(req) {
     sessions.delete(sessionToken); // 만료된 세션 정리
   }
 
-  // 2. 헤더 인증 (API/데몬 호출용)
-  const header = req.headers["x-api-key"] || req.headers["authorization"];
-  if (header) {
-    const token = header.startsWith("Bearer ") ? header.slice(7) : header;
-    if (token === apiKey) return true;
+  // 2. X-Api-Key 헤더 (데몬 호출용)
+  const xApiKey = req.headers["x-api-key"];
+  if (xApiKey && xApiKey === apiKey) return true;
+
+  // 3. Authorization: Bearer JWT (브라우저 직접 통신용)
+  const authHeader = req.headers["authorization"];
+  if (authHeader && authHeader.startsWith("Bearer ")) {
+    const jwt = authHeader.slice(7);
+    // raw api_key 일치도 허용 (하위 호환)
+    if (jwt === apiKey) return true;
+    // JWT 검증
+    if (verifyJwt(jwt, apiKey)) return true;
   }
 
   return false;
@@ -762,8 +810,16 @@ const server = http.createServer((req, res) => {
   const url = new URL(req.url, `http://localhost:${PORT}`);
   const pathname = url.pathname;
 
-  // CORS
-  res.setHeader("Access-Control-Allow-Origin", "*");
+  // CORS — 특정 origin만 허용 (브라우저 직접 통신)
+  const ALLOWED_ORIGINS = ["https://peter-voice.vercel.app", "http://localhost:3001"];
+  const origin = req.headers.origin;
+  if (origin && ALLOWED_ORIGINS.includes(origin)) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Access-Control-Allow-Credentials", "true");
+  } else if (!origin) {
+    // origin 없는 요청 (같은 도메인, curl 등) 허용
+    res.setHeader("Access-Control-Allow-Origin", "*");
+  }
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-Api-Key, Authorization");
   if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
