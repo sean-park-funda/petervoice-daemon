@@ -7,6 +7,7 @@
  */
 
 const http = require("http");
+const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
@@ -627,34 +628,125 @@ function apiDocsRead(projectId, docPath) {
 
 // ─── Auth ────────────────────────────────────────────
 
+// 세션 스토어 (메모리 — 재시작 시 초기화, 재인증이면 충분)
+const sessions = new Map(); // sessionToken → { createdAt, expiresAt }
+const SESSION_MAX_AGE = 86400; // 24시간
+
+function generateSessionToken() {
+  return crypto.randomBytes(32).toString("hex");
+}
+
+function base64url(data) {
+  const buf = typeof data === "string" ? Buffer.from(data) : data;
+  return buf.toString("base64url");
+}
+
+function base64urlDecode(str) {
+  return Buffer.from(str, "base64url").toString("utf-8");
+}
+
+function verifyJwt(token, secret) {
+  const parts = token.split(".");
+  if (parts.length !== 3) return null;
+  const [header, payload, signature] = parts;
+  const expected = base64url(
+    crypto.createHmac("sha256", secret).update(`${header}.${payload}`).digest()
+  );
+  if (signature.length !== expected.length) return null;
+  if (!crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected))) return null;
+  try {
+    const decoded = JSON.parse(base64urlDecode(payload));
+    const now = Math.floor(Date.now() / 1000);
+    if (decoded.exp < now) return null;
+    return decoded;
+  } catch { return null; }
+}
+
+function parseCookies(req) {
+  const header = req.headers.cookie || "";
+  const cookies = {};
+  header.split(";").forEach(pair => {
+    const [k, ...v] = pair.trim().split("=");
+    if (k) cookies[k] = v.join("=");
+  });
+  return cookies;
+}
+
 function isTunnelRequest(req) {
-  // cloudflared가 프록시하면 Cf-Connecting-Ip 헤더가 추가됨
   return !!req.headers["cf-connecting-ip"];
 }
 
 function verifyAuth(req) {
-  // 터널 경유가 아닌 진짜 로컬 요청은 인증 불필요
+  // 로컬 요청은 인증 불필요
   if (!isTunnelRequest(req)) return true;
 
-  // 터널 경유 외부 요청은 API key 필요
   const config = loadConfig();
   const apiKey = config.api_key;
   if (!apiKey) return false;
 
-  // 1. 헤더 인증 (API 호출용)
+  // 1. 세션 쿠키 인증
+  const cookies = parseCookies(req);
+  const sessionToken = cookies["pv_session"];
+  if (sessionToken && sessions.has(sessionToken)) {
+    const session = sessions.get(sessionToken);
+    if (session.expiresAt > Date.now()) return true;
+    sessions.delete(sessionToken); // 만료된 세션 정리
+  }
+
+  // 2. 헤더 인증 (API/데몬 호출용)
   const header = req.headers["x-api-key"] || req.headers["authorization"];
   if (header) {
     const token = header.startsWith("Bearer ") ? header.slice(7) : header;
     if (token === apiKey) return true;
   }
 
-  // 2. 쿼리 파라미터 인증 (브라우저 링크용)
-  const url = new URL(req.url, `http://localhost:${PORT}`);
-  const queryToken = url.searchParams.get("token");
-  if (queryToken && queryToken === apiKey) return true;
-
   return false;
 }
+
+// JWT auth → 세션 쿠키 발급, 302 redirect
+function handleAuthCallback(req, res, url) {
+  const authToken = url.searchParams.get("auth");
+  if (!authToken) return false;
+
+  const config = loadConfig();
+  const apiKey = config.api_key;
+  if (!apiKey) {
+    res.writeHead(401, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "API key not configured" }));
+    return true;
+  }
+
+  const payload = verifyJwt(authToken, apiKey);
+  if (!payload) {
+    res.writeHead(401, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "유효하지 않거나 만료된 토큰" }));
+    return true;
+  }
+
+  // 세션 생성
+  const sessionToken = generateSessionToken();
+  sessions.set(sessionToken, {
+    createdAt: Date.now(),
+    expiresAt: Date.now() + SESSION_MAX_AGE * 1000,
+  });
+
+  // 쿠키 세팅 + 깨끗한 URL로 리다이렉트
+  const redirectUrl = url.pathname || "/";
+  res.writeHead(302, {
+    Location: redirectUrl,
+    "Set-Cookie": `pv_session=${sessionToken}; HttpOnly; Secure; SameSite=Strict; Max-Age=${SESSION_MAX_AGE}; Path=/`,
+  });
+  res.end();
+  return true;
+}
+
+// 만료 세션 정리 (1시간마다)
+setInterval(() => {
+  const now = Date.now();
+  for (const [token, session] of sessions) {
+    if (session.expiresAt <= now) sessions.delete(token);
+  }
+}, 3600000);
 
 // ─── Server ──────────────────────────────────────────
 
@@ -673,6 +765,11 @@ const server = http.createServer((req, res) => {
     res.writeHead(status, { "Content-Type": "application/json" });
     res.end(JSON.stringify(data));
   };
+
+  // JWT auth callback: ?auth=JWT → 세션 쿠키 발급 후 리다이렉트
+  if (url.searchParams.has("auth")) {
+    if (handleAuthCallback(req, res, url)) return;
+  }
 
   // Auth check: 모든 경로에 인증 적용 (localhost는 스킵)
   if (!verifyAuth(req)) {
