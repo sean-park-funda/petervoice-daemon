@@ -370,10 +370,13 @@ HOME_PORTAL_LABEL = "com.petervoice.home-portal"
 
 
 def start_home_portal(username: str = None) -> dict:
-    """홈 포탈 웹서버 시작 + Cloudflare 라우팅 등록"""
+    """홈 포탈 웹서버 시작 + Cloudflare 라우팅 등록.
+    username: 유저 고유 아이디 (DB username). 터널 hostname에 사용."""
     if not username:
         username = config.get("bot_name", "user")
-    username_slug = username.lower().replace(" ", "-")
+    # username은 이미 [a-z0-9_] 형식이지만 안전하게 정리
+    username_slug = username.lower().replace(" ", "-").replace("_", "-")
+    username_slug = "".join(c for c in username_slug if c.isalnum() or c == "-")
 
     # home-portal.js 경로
     portal_script = Path(__file__).resolve().parent.parent / "home-portal.js"

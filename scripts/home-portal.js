@@ -556,6 +556,99 @@ function execUnpublish(body) {
   }
 }
 
+// ─── Docs API ───────────────────────────────────────
+
+function getProjectDirs() {
+  const config = loadConfig();
+  return config.project_dirs || {};
+}
+
+function apiDocsList(projectId) {
+  const dirs = getProjectDirs();
+  const projectDir = dirs[projectId];
+  if (!projectDir) return { error: `프로젝트 없음: ${projectId}` };
+
+  const docsDir = path.join(projectDir, "docs");
+  if (!fs.existsSync(docsDir)) return { files: [] };
+
+  const files = [];
+  function scan(dir, prefix) {
+    try {
+      const entries = fs.readdirSync(dir, { withFileTypes: true });
+      for (const entry of entries) {
+        if (entry.name.startsWith(".")) continue;
+        const fullPath = path.join(dir, entry.name);
+        const relPath = prefix ? `${prefix}/${entry.name}` : entry.name;
+        if (entry.isDirectory()) {
+          scan(fullPath, relPath);
+        } else if (entry.name.endsWith(".md")) {
+          const stat = fs.statSync(fullPath);
+          files.push({
+            path: relPath,
+            title: entry.name.replace(/\.md$/, ""),
+            size: stat.size,
+            modified: stat.mtime.toISOString(),
+          });
+        }
+      }
+    } catch {}
+  }
+  scan(docsDir, "");
+  return { project: projectId, files };
+}
+
+function apiDocsRead(projectId, docPath) {
+  const dirs = getProjectDirs();
+  const projectDir = dirs[projectId];
+  if (!projectDir) return { error: `프로젝트 없음: ${projectId}` };
+
+  const docsDir = path.resolve(projectDir, "docs");
+  const filePath = path.resolve(docsDir, docPath);
+
+  // path traversal 방지
+  if (!filePath.startsWith(docsDir)) return { error: "접근 불가 경로" };
+  if (!filePath.endsWith(".md")) return { error: ".md 파일만 지원" };
+  if (!fs.existsSync(filePath)) return { error: "파일 없음" };
+
+  try {
+    const content = fs.readFileSync(filePath, "utf-8");
+    const stat = fs.statSync(filePath);
+    return {
+      path: docPath,
+      title: path.basename(docPath, ".md"),
+      content,
+      size: stat.size,
+      modified: stat.mtime.toISOString(),
+    };
+  } catch {
+    return { error: "읽기 실패" };
+  }
+}
+
+// ─── Auth ────────────────────────────────────────────
+
+function isLocalRequest(req) {
+  const addr = req.socket.remoteAddress;
+  return addr === "127.0.0.1" || addr === "::1" || addr === "::ffff:127.0.0.1";
+}
+
+function verifyAuth(req) {
+  // localhost 요청은 인증 불필요
+  if (isLocalRequest(req)) return true;
+
+  // 외부 요청은 API key 필요
+  const config = loadConfig();
+  const apiKey = config.api_key;
+  if (!apiKey) return false;
+
+  const header = req.headers["x-api-key"] || req.headers["authorization"];
+  if (!header) return false;
+
+  // "Bearer pv_xxx" 또는 "pv_xxx" 형태 모두 지원
+  const token = header.startsWith("Bearer ") ? header.slice(7) : header;
+  return token === apiKey;
+}
+
 // ─── Server ──────────────────────────────────────────
 
 const server = http.createServer((req, res) => {
@@ -565,7 +658,7 @@ const server = http.createServer((req, res) => {
   // CORS
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-Api-Key, Authorization");
   if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
 
   // JSON helper
@@ -573,6 +666,11 @@ const server = http.createServer((req, res) => {
     res.writeHead(status, { "Content-Type": "application/json" });
     res.end(JSON.stringify(data));
   };
+
+  // Auth check for /api/docs/ (외부 요청 시 인증 필수)
+  if (pathname.startsWith("/api/docs/") && !verifyAuth(req)) {
+    return json({ error: "인증 필요" }, 401);
+  }
 
   // Read body helper
   const readBody = () => new Promise((resolve) => {
@@ -604,6 +702,19 @@ const server = http.createServer((req, res) => {
   else if (pathname.startsWith("/api/logs/") && req.method === "GET") {
     const id = pathname.split("/api/logs/")[1];
     json(apiLogs(decodeURIComponent(id)));
+  }
+  // Docs API: /api/docs/:project — 문서 목록
+  else if (pathname.match(/^\/api\/docs\/[^/]+$/) && req.method === "GET") {
+    const projectId = decodeURIComponent(pathname.split("/api/docs/")[1]);
+    json(apiDocsList(projectId));
+  }
+  // Docs API: /api/docs/:project/:path — 문서 내용
+  else if (pathname.match(/^\/api\/docs\/[^/]+\/.+/) && req.method === "GET") {
+    const rest = pathname.slice("/api/docs/".length);
+    const slashIdx = rest.indexOf("/");
+    const projectId = decodeURIComponent(rest.slice(0, slashIdx));
+    const docPath = decodeURIComponent(rest.slice(slashIdx + 1));
+    json(apiDocsRead(projectId, docPath));
   }
   else if (pathname === "/api/publish" && req.method === "POST") {
     readBody().then(body => json(execPublish(body)));

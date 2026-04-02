@@ -26,6 +26,7 @@ from daemon.syncers.auto_updater import AutoUpdater
 from daemon.heartbeat import HeartbeatThread
 from daemon.manager.thread import ManagerThread
 from daemon.manager.http_server import start_manager_http_server
+from daemon.api import api_request
 
 
 def handle_signal(signum, frame):
@@ -97,6 +98,60 @@ def _recover_after_restart(worker):
                 worker._executor.submit(worker._process_message_safe, msg)
 
 
+def _ensure_home_portal():
+    """Home Portal launchd 확인/시작 + tunnel_url 서버 등록."""
+    if not config.get("home_portal_enabled", True):
+        logger.info("[home-portal] Disabled via config")
+        return
+
+    api_key = config.get("api_key", "")
+    if not api_key:
+        return
+
+    try:
+        # 1. username 조회
+        me = api_request(api_key, "GET", "/api/bot/me")
+        if not me or not me.get("username"):
+            logger.warning("[home-portal] Could not resolve username from /api/bot/me")
+            return
+        username = me["username"]
+
+        # 2. Home Portal launchd 시작 (이미 실행 중이면 스킵)
+        import subprocess
+        from pathlib import Path
+        plist_path = Path.home() / "Library" / "LaunchAgents" / "com.petervoice.home-portal.plist"
+        portal_running = False
+        if plist_path.exists():
+            try:
+                result = subprocess.run(
+                    ["launchctl", "list", "com.petervoice.home-portal"],
+                    capture_output=True, text=True
+                )
+                portal_running = result.returncode == 0
+            except Exception:
+                pass
+
+        if not portal_running:
+            from daemon.site_manager import start_home_portal
+            result = start_home_portal(username=username)
+            if result.get("error"):
+                logger.error(f"[home-portal] Failed to start: {result['error']}")
+                return
+            logger.info(f"[home-portal] Started: {result.get('url')}")
+        else:
+            logger.info("[home-portal] Already running")
+
+        # 3. tunnel_url 서버에 등록
+        username_slug = username.lower().replace("_", "-")
+        username_slug = "".join(c for c in username_slug if c.isalnum() or c == "-")
+        tunnel_url = f"https://{username_slug}.peter-voice.site"
+        api_request(api_key, "PATCH", "/api/bot/status", body={"tunnel_url": tunnel_url})
+        logger.info(f"[home-portal] Registered tunnel_url: {tunnel_url}")
+
+    except Exception as e:
+        logger.error(f"[home-portal] Error: {e}")
+
+
 def main():
     setup_logging()
     logger.info("=" * 60)
@@ -165,6 +220,9 @@ def main():
 
         # Recover after restart: notify users and reprocess pending messages
         _recover_after_restart(worker)
+
+        # Ensure Home Portal is running + register tunnel URL
+        _ensure_home_portal()
 
         # Main loop: watchdog + force_restart polling
         user_id = resolve_user_id()
