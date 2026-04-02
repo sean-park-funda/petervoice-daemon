@@ -567,33 +567,18 @@ function execUnpublish(body) {
 
 // ─── Docs API ───────────────────────────────────────
 
-function getProjectDirs() {
-  const config = loadConfig();
-  const explicit = config.project_dirs || {};
-  // Proxy: config에 없는 프로젝트도 ~/Projects/{id}에 존재하면 자동 매핑
-  return new Proxy(explicit, {
-    get(target, prop) {
-      if (typeof prop !== "string") return undefined;
-      if (target[prop]) return target[prop];
-      const guess = path.join(PROJECTS_DIR, prop);
-      if (fs.existsSync(guess)) return guess;
-      return undefined;
-    },
-    has(target, prop) {
-      if (typeof prop !== "string") return false;
-      if (prop in target) return true;
-      return fs.existsSync(path.join(PROJECTS_DIR, prop));
-    },
-  });
+function validateDocsDir(dir) {
+  // path traversal 방지: 홈 디렉토리 하위만 허용
+  const homeDir = os.homedir();
+  const resolved = path.resolve(dir);
+  if (!resolved.startsWith(homeDir)) return null;
+  return resolved;
 }
 
-function apiDocsList(projectId) {
-  const dirs = getProjectDirs();
-  const projectDir = dirs[projectId];
-  if (!projectDir) return { error: `프로젝트 없음: ${projectId}` };
-
-  const docsDir = path.join(projectDir, "docs");
-  if (!fs.existsSync(docsDir)) return { documents: [] };
+function apiDocsList(docsDir) {
+  const validated = validateDocsDir(docsDir);
+  if (!validated) return { error: "접근 불가 경로" };
+  if (!fs.existsSync(validated)) return { documents: [] };
 
   // 계층 구조로 반환 (DocumentsPanel Doc 인터페이스 호환)
   const foldersMap = {}; // relPath → folder doc
@@ -658,20 +643,18 @@ function apiDocsList(projectId) {
       }
     } catch {}
   }
-  scan(docsDir, "", null);
-  return { project: projectId, documents: rootDocs };
+  scan(validated, "", null);
+  return { documents: rootDocs };
 }
 
-function apiDocsRead(projectId, docPath) {
-  const dirs = getProjectDirs();
-  const projectDir = dirs[projectId];
-  if (!projectDir) return { error: `프로젝트 없음: ${projectId}` };
+function apiDocsRead(docsDir, docPath) {
+  const validated = validateDocsDir(docsDir);
+  if (!validated) return { error: "접근 불가 경로" };
 
-  const docsDir = path.resolve(projectDir, "docs");
-  const filePath = path.resolve(docsDir, docPath);
+  const filePath = path.resolve(validated, docPath);
 
   // path traversal 방지
-  if (!filePath.startsWith(docsDir)) return { error: "접근 불가 경로" };
+  if (!filePath.startsWith(validated)) return { error: "접근 불가 경로" };
   if (!filePath.endsWith(".md")) return { error: ".md 파일만 지원" };
   if (!fs.existsSync(filePath)) return { error: "파일 없음" };
 
@@ -886,18 +869,18 @@ const server = http.createServer((req, res) => {
     const id = pathname.split("/api/logs/")[1];
     json(apiLogs(decodeURIComponent(id)));
   }
-  // Docs API: /api/docs/:project — 문서 목록
-  else if (pathname.match(/^\/api\/docs\/[^/]+$/) && req.method === "GET") {
-    const projectId = decodeURIComponent(pathname.split("/api/docs/")[1]);
-    json(apiDocsList(projectId));
+  // Docs API: /api/docs — 문서 목록 (dir 쿼리 파라미터)
+  else if (pathname === "/api/docs" && req.method === "GET") {
+    const dir = url.searchParams.get("dir");
+    if (!dir) return json({ error: "dir 파라미터 필요" }, 400);
+    json(apiDocsList(dir));
   }
-  // Docs API: /api/docs/:project/:path — 문서 내용
-  else if (pathname.match(/^\/api\/docs\/[^/]+\/.+/) && req.method === "GET") {
-    const rest = pathname.slice("/api/docs/".length);
-    const slashIdx = rest.indexOf("/");
-    const projectId = decodeURIComponent(rest.slice(0, slashIdx));
-    const docPath = decodeURIComponent(rest.slice(slashIdx + 1));
-    json(apiDocsRead(projectId, docPath));
+  // Docs API: /api/docs/read — 문서 내용 (dir + path 쿼리 파라미터)
+  else if (pathname === "/api/docs/read" && req.method === "GET") {
+    const dir = url.searchParams.get("dir");
+    const docPath = url.searchParams.get("path");
+    if (!dir || !docPath) return json({ error: "dir, path 파라미터 필요" }, 400);
+    json(apiDocsRead(dir, docPath));
   }
   else if (pathname === "/api/publish" && req.method === "POST") {
     readBody().then(body => json(execPublish(body)));
