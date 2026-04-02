@@ -205,9 +205,13 @@ function apiLogs(projectId) {
 
 // ─── HTML ────────────────────────────────────────────
 
-function renderHTML() {
+function renderHTML(req) {
   const config = loadConfig();
-  const username = (config.bot_name || "user").toLowerCase().replace(/\s/g, "-");
+  // 타이틀용 이름: Host 헤더에서 추출 (sean.peter-voice.site → sean), 없으면 OS 유저명
+  const host = req && req.headers && req.headers.host;
+  const username = (host && host.includes("."))
+    ? host.split(".")[0]
+    : os.userInfo().username;
 
   return `<!DOCTYPE html>
 <html lang="ko">
@@ -512,7 +516,9 @@ function execPublish(body) {
   const { project_id, project_dir } = body;
   if (!project_id || !project_dir) return { error: "project_id, project_dir 필수" };
   const config = loadConfig();
-  const username = (config.bot_name || "user").toLowerCase().replace(/\s/g, "-");
+  const username = config.tunnel_url
+    ? new URL(config.tunnel_url).hostname.split(".")[0]
+    : (config.bot_name || "user").toLowerCase().replace(/\s/g, "-");
   try {
     const script = path.join(__dirname, "publish.py");
     const out = execSync(
@@ -544,7 +550,9 @@ function execUnpublish(body) {
   const { project_id } = body;
   if (!project_id) return { error: "project_id 필수" };
   const config = loadConfig();
-  const username = (config.bot_name || "user").toLowerCase().replace(/\s/g, "-");
+  const username = config.tunnel_url
+    ? new URL(config.tunnel_url).hostname.split(".")[0]
+    : (config.bot_name || "user").toLowerCase().replace(/\s/g, "-");
   try {
     const script = path.join(__dirname, "publish.py");
     const out = execSync(
@@ -788,7 +796,7 @@ const server = http.createServer((req, res) => {
   // Routes
   if (pathname === "/" && req.method === "GET") {
     res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-    res.end(renderHTML());
+    res.end(renderHTML(req));
   }
   else if (pathname === "/api/sites" && req.method === "GET") {
     json(apiSites());
