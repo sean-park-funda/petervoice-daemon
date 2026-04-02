@@ -620,17 +620,24 @@ function apiDocsList(docsDir) {
             rootDocs.push(folder);
           }
           scan(fullPath, relPath, `folder:${relPath}`);
-        } else if (entry.name.endsWith(".md")) {
+        } else {
           const stat = fs.statSync(fullPath);
+          const ext = path.extname(entry.name).toLowerCase();
+          const IMAGE_EXTS = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp"]);
+          let fileType = "file";
+          if (ext === ".md") fileType = "doc";
+          else if (IMAGE_EXTS.has(ext)) fileType = "image";
+
           const doc = {
-            id: `doc:${relPath}`,
-            title: entry.name.replace(/\.md$/, ""),
+            id: `${fileType}:${relPath}`,
+            title: ext === ".md" ? entry.name.replace(/\.md$/, "") : entry.name,
             content: "",
-            type: "doc",
+            type: fileType,
             parent_id: parentId,
             file_path: relPath,
             pinned: false,
             sort_order: sortOrder++,
+            size: stat.size,
             created_at: stat.birthtime.toISOString(),
             updated_at: stat.mtime.toISOString(),
           };
@@ -671,6 +678,94 @@ function apiDocsRead(docsDir, docPath) {
   } catch {
     return { error: "읽기 실패" };
   }
+}
+
+const MIME_TYPES = {
+  ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+  ".gif": "image/gif", ".webp": "image/webp", ".svg": "image/svg+xml",
+  ".bmp": "image/bmp", ".pdf": "application/pdf", ".mp4": "video/mp4",
+  ".webm": "video/webm", ".mp3": "audio/mpeg", ".wav": "audio/wav",
+  ".json": "application/json", ".txt": "text/plain", ".csv": "text/csv",
+  ".py": "text/plain", ".js": "text/plain", ".ts": "text/plain",
+};
+
+function serveDocsFile(res, docsDir, filePath) {
+  const validated = validateDocsDir(docsDir);
+  if (!validated) { res.writeHead(403); res.end("Forbidden"); return; }
+
+  const fullPath = path.resolve(validated, filePath);
+  if (!fullPath.startsWith(validated)) { res.writeHead(403); res.end("Forbidden"); return; }
+  if (!fs.existsSync(fullPath)) { res.writeHead(404); res.end("Not found"); return; }
+
+  try {
+    const ext = path.extname(fullPath).toLowerCase();
+    const mime = MIME_TYPES[ext] || "application/octet-stream";
+    const stat = fs.statSync(fullPath);
+    res.writeHead(200, {
+      "Content-Type": mime,
+      "Content-Length": stat.size,
+      "Cache-Control": "private, max-age=300",
+    });
+    fs.createReadStream(fullPath).pipe(res);
+  } catch {
+    res.writeHead(500); res.end("Read error");
+  }
+}
+
+function apiDocsMkdir(docsDir, name) {
+  const validated = validateDocsDir(docsDir);
+  if (!validated) return { error: "접근 불가 경로" };
+  if (!name || !/^[a-zA-Z0-9가-힣_\-. ]+$/.test(name)) return { error: "잘못된 폴더명" };
+
+  const target = path.join(validated, name);
+  if (!target.startsWith(validated)) return { error: "접근 불가 경로" };
+  if (fs.existsSync(target)) return { error: "이미 존재" };
+
+  try {
+    fs.mkdirSync(target, { recursive: true });
+    return { ok: true, path: name };
+  } catch {
+    return { error: "폴더 생성 실패" };
+  }
+}
+
+function parseMultipart(req) {
+  return new Promise((resolve, reject) => {
+    const contentType = req.headers["content-type"] || "";
+    const match = contentType.match(/boundary=(.+)/);
+    if (!match) return reject(new Error("No boundary"));
+    const boundary = "--" + match[1];
+
+    const chunks = [];
+    req.on("data", (chunk) => chunks.push(chunk));
+    req.on("end", () => {
+      const buf = Buffer.concat(chunks);
+      const parts = {};
+      const str = buf.toString("binary");
+      const sections = str.split(boundary).slice(1, -1);
+
+      for (const section of sections) {
+        const headerEnd = section.indexOf("\r\n\r\n");
+        if (headerEnd === -1) continue;
+        const header = section.slice(0, headerEnd);
+        const body = section.slice(headerEnd + 4, section.endsWith("\r\n") ? section.length - 2 : section.length);
+        const nameMatch = header.match(/name="([^"]+)"/);
+        if (!nameMatch) continue;
+        const name = nameMatch[1];
+        const fileMatch = header.match(/filename="([^"]+)"/);
+        if (fileMatch) {
+          // binary file — extract from buffer directly
+          const headerBytes = Buffer.byteLength(section.slice(0, headerEnd + 4), "binary");
+          const start = buf.indexOf(boundary) === -1 ? 0 : 0; // find in original buf
+          parts[name] = { filename: fileMatch[1], data: Buffer.from(body, "binary") };
+        } else {
+          parts[name] = body;
+        }
+      }
+      resolve(parts);
+    });
+    req.on("error", reject);
+  });
 }
 
 // ─── Auth ────────────────────────────────────────────
@@ -881,6 +976,44 @@ const server = http.createServer((req, res) => {
     const docPath = url.searchParams.get("path");
     if (!dir || !docPath) return json({ error: "dir, path 파라미터 필요" }, 400);
     json(apiDocsRead(dir, docPath));
+  }
+  // Docs API: /api/docs/file — 바이너리 파일 서빙
+  else if (pathname === "/api/docs/file" && req.method === "GET") {
+    const dir = url.searchParams.get("dir");
+    const filePath = url.searchParams.get("path");
+    if (!dir || !filePath) return json({ error: "dir, path 파라미터 필요" }, 400);
+    serveDocsFile(res, dir, filePath);
+  }
+  // Docs API: /api/docs/mkdir — 폴더 생성
+  else if (pathname === "/api/docs/mkdir" && req.method === "POST") {
+    readBody().then(body => {
+      const { dir, name } = body;
+      if (!dir || !name) return json({ error: "dir, name 필요" }, 400);
+      json(apiDocsMkdir(dir, name));
+    });
+  }
+  // Docs API: /api/docs/upload — 파일 업로드
+  else if (pathname === "/api/docs/upload" && req.method === "POST") {
+    parseMultipart(req).then(parts => {
+      const dir = parts.dir;
+      const subpath = parts.path || "";
+      const file = parts.file;
+      if (!dir || !file) return json({ error: "dir, file 필요" }, 400);
+      const validated = validateDocsDir(dir);
+      if (!validated) return json({ error: "접근 불가 경로" }, 403);
+      const targetDir = subpath ? path.join(validated, path.dirname(subpath)) : validated;
+      const fileName = subpath ? path.basename(subpath) : file.filename;
+      const targetPath = path.resolve(targetDir, fileName);
+      if (!targetPath.startsWith(validated)) return json({ error: "접근 불가 경로" }, 403);
+      if (file.data.length > 50 * 1024 * 1024) return json({ error: "50MB 초과" }, 413);
+      try {
+        fs.mkdirSync(targetDir, { recursive: true });
+        fs.writeFileSync(targetPath, file.data);
+        json({ ok: true, path: path.relative(validated, targetPath), size: file.data.length });
+      } catch (e) {
+        json({ error: "저장 실패: " + e.message }, 500);
+      }
+    }).catch(e => json({ error: "업로드 파싱 실패: " + e.message }, 400));
   }
   else if (pathname === "/api/publish" && req.method === "POST") {
     readBody().then(body => json(execPublish(body)));
