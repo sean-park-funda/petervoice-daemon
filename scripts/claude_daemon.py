@@ -101,8 +101,10 @@ def _recover_after_restart(worker):
 def _ensure_cloudflared():
     """cloudflared가 없으면 자동 설치. 성공 시 True, 실패 시 False."""
     import shutil, subprocess, platform
-    if shutil.which("cloudflared"):
-        return True
+    # shutil.which may miss homebrew paths in launchd environment
+    for p in ["cloudflared", "/opt/homebrew/bin/cloudflared", "/usr/local/bin/cloudflared"]:
+        if shutil.which(p) or os.path.isfile(p):
+            return True
 
     logger.info("[home-portal] cloudflared not found, installing...")
     try:
