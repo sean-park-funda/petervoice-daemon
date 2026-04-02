@@ -624,9 +624,19 @@ function apiDocsList(docsDir) {
           const stat = fs.statSync(fullPath);
           const ext = path.extname(entry.name).toLowerCase();
           const IMAGE_EXTS = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp"]);
+          const CODE_EXTS = new Set([".py", ".js", ".ts", ".tsx", ".jsx", ".css", ".html", ".xml", ".sh", ".bash", ".sql", ".rs", ".go", ".java", ".c", ".cpp", ".h", ".rb", ".php", ".swift", ".kt", ".r", ".lua", ".pl", ".ex", ".exs"]);
+          const TEXT_EXTS = new Set([".txt", ".csv", ".json", ".yaml", ".yml", ".toml", ".env", ".ini", ".cfg"]);
+          const VIDEO_EXTS = new Set([".mp4", ".webm", ".mov", ".avi"]);
+          const AUDIO_EXTS = new Set([".mp3", ".wav", ".ogg", ".m4a", ".flac"]);
+          const PDF_EXT = ".pdf";
           let fileType = "file";
           if (ext === ".md") fileType = "doc";
           else if (IMAGE_EXTS.has(ext)) fileType = "image";
+          else if (CODE_EXTS.has(ext)) fileType = "code";
+          else if (TEXT_EXTS.has(ext)) fileType = "text";
+          else if (VIDEO_EXTS.has(ext)) fileType = "video";
+          else if (AUDIO_EXTS.has(ext)) fileType = "audio";
+          else if (ext === PDF_EXT) fileType = "pdf";
 
           const doc = {
             id: `${fileType}:${relPath}`,
@@ -662,15 +672,25 @@ function apiDocsRead(docsDir, docPath) {
 
   // path traversal 방지
   if (!filePath.startsWith(validated)) return { error: "접근 불가 경로" };
-  if (!filePath.endsWith(".md")) return { error: ".md 파일만 지원" };
   if (!fs.existsSync(filePath)) return { error: "파일 없음" };
+
+  // 텍스트로 읽을 수 있는 확장자만 허용
+  const TEXT_EXTS = new Set([
+    ".md", ".txt", ".csv", ".json", ".yaml", ".yml", ".toml",
+    ".py", ".js", ".ts", ".tsx", ".jsx", ".css", ".html", ".xml",
+    ".sh", ".bash", ".zsh", ".sql", ".env", ".ini", ".cfg",
+    ".rs", ".go", ".java", ".c", ".cpp", ".h", ".rb", ".php",
+    ".swift", ".kt", ".r", ".lua", ".pl", ".ex", ".exs",
+  ]);
+  const ext = path.extname(filePath).toLowerCase();
+  if (!TEXT_EXTS.has(ext)) return { error: "텍스트 파일만 지원" };
 
   try {
     const content = fs.readFileSync(filePath, "utf-8");
     const stat = fs.statSync(filePath);
     return {
       path: docPath,
-      title: path.basename(docPath, ".md"),
+      title: path.basename(docPath, ext),
       content,
       size: stat.size,
       modified: stat.mtime.toISOString(),
