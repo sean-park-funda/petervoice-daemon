@@ -125,6 +125,9 @@ class DocsSyncer(threading.Thread):
         projects = self._get_all_projects()
         for proj in projects:
             try:
+                # 프로젝트 디렉토리 + docs 폴더 미리 생성 (웹에서 신규 프로젝트 생성 시 즉시 문서탭 사용 가능)
+                docs_dir = Path(proj["directory"]) / "docs"
+                docs_dir.mkdir(parents=True, exist_ok=True)
                 self._sync_project(proj["id"], proj["directory"])
             except Exception as e:
                 logger.error(f"[docs] Error syncing {proj['id']}: {e}")
