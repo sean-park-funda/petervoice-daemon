@@ -3,11 +3,24 @@
 import json
 import shutil
 import threading
+from pathlib import Path
 
 from daemon.globals import SKILLS_DIR, config, shutdown_event, logger
 from daemon.api import api_request
 
 CLEANUP_FLAG = SKILLS_DIR / ".cleanup-v1-done"
+BUNDLE_INSTALLED_FLAG = SKILLS_DIR / ".bundle-v1-done"
+
+
+def _find_bundle_dir() -> Path | None:
+    """레포의 skills/ 폴더를 찾는다."""
+    d = Path(__file__).resolve().parent
+    for _ in range(5):
+        candidate = d / "skills"
+        if (d / ".git").exists() and candidate.is_dir():
+            return candidate
+        d = d.parent
+    return None
 
 
 class SkillsSyncer(threading.Thread):
@@ -48,6 +61,29 @@ class SkillsSyncer(threading.Thread):
         CLEANUP_FLAG.touch()
         if removed:
             logger.info(f"[skills] Cleanup: removed {len(removed)} auto-installed skills")
+
+    def _install_bundled_skills(self):
+        """레포의 skills/ 폴더에 있는 번들 스킬을 로컬에 설치 (없는 것만)."""
+        bundle_dir = _find_bundle_dir()
+        if not bundle_dir:
+            return
+
+        SKILLS_DIR.mkdir(parents=True, exist_ok=True)
+        installed = []
+
+        for skill_dir in bundle_dir.iterdir():
+            if not skill_dir.is_dir() or skill_dir.name.startswith("."):
+                continue
+            local_dir = SKILLS_DIR / skill_dir.name
+            # 이미 로컬에 있으면 건드리지 않음 (유저 삭제 존중: flag 파일로 체크)
+            if local_dir.exists():
+                continue
+            # 복사
+            shutil.copytree(skill_dir, local_dir)
+            installed.append(skill_dir.name)
+
+        if installed:
+            logger.info(f"[skills] Bundled skills installed: {', '.join(installed)}")
 
     def sync_once(self):
         api_key = config.get("api_key", "")
@@ -92,6 +128,12 @@ class SkillsSyncer(threading.Thread):
             self._cleanup_auto_installed()
         except Exception as e:
             logger.error(f"[skills] Cleanup error: {e}")
+
+        # 번들 스킬 설치 (매 시작 시 — 새 번들 추가분만 복사)
+        try:
+            self._install_bundled_skills()
+        except Exception as e:
+            logger.error(f"[skills] Bundle install error: {e}")
 
         try:
             self.sync_once()
