@@ -18,7 +18,11 @@ const args = process.argv.slice(2);
 const PORT = parseInt(getArg("--port") || "3000");
 const CONFIG_DIR = getArg("--config-dir") || path.join(os.homedir(), ".claude-daemon");
 const SITES_FILE = path.join(os.homedir(), ".petervoice-sites", "sites.json");
-const PROJECTS_DIR = path.join(os.homedir(), "Projects");
+// 프로젝트 디렉토리: 두 곳 모두 탐색 (기존 ~/Projects + 신규 ~/.claude-daemon/projects/)
+const PROJECTS_DIRS = [
+  path.join(os.homedir(), "Projects"),
+  path.join(CONFIG_DIR, "projects"),
+].filter(d => fs.existsSync(d));
 
 function getArg(name) {
   const idx = args.indexOf(name);
@@ -59,11 +63,17 @@ function apiProjects() {
   const publishedDirs = new Set(Object.values(sites).map(s => s.project_dir));
 
   try {
-    const entries = fs.readdirSync(PROJECTS_DIR, { withFileTypes: true });
-    return entries
-      .filter(e => e.isDirectory() && !e.name.startsWith("."))
-      .map(e => {
-        const dir = path.join(PROJECTS_DIR, e.name);
+    const results = [];
+    const seen = new Set();
+    for (const projDir of PROJECTS_DIRS) {
+      if (!fs.existsSync(projDir)) continue;
+      const entries = fs.readdirSync(projDir, { withFileTypes: true });
+      for (const e of entries) {
+        if (!e.isDirectory() || e.name.startsWith(".")) continue;
+        if (seen.has(e.name)) continue;
+        seen.add(e.name);
+
+        const dir = path.join(projDir, e.name);
         let framework = "unknown";
         const pkgPath = path.join(dir, "package.json");
         const indexPath = path.join(dir, "index.html");
@@ -85,15 +95,17 @@ function apiProjects() {
           ? Object.entries(sites).find(([, s]) => s.project_dir === dir)
           : null;
 
-        return {
+        results.push({
           name: e.name,
           dir,
           framework,
           published,
           url: siteEntry ? siteEntry[1].url : null,
           port: siteEntry ? siteEntry[1].port : null,
-        };
-      });
+        });
+      }
+    }
+    return results;
   } catch { return []; }
 }
 
@@ -141,16 +153,22 @@ function apiSystem() {
 }
 
 function apiBrowse(relDir) {
-  // 보안: ~/Projects/ 하위만 허용
-  const baseDir = path.resolve(PROJECTS_DIR);
-  const targetDir = path.resolve(baseDir, relDir || "");
+  // 보안: 허용된 프로젝트 디렉토리 하위만 접근 가능
+  let baseDir = null;
+  let targetDir = null;
 
-  if (!targetDir.startsWith(baseDir)) {
-    return { error: "접근 불가 경로" };
+  for (const projDir of PROJECTS_DIRS) {
+    const base = path.resolve(projDir);
+    const target = path.resolve(base, relDir || "");
+    if (target.startsWith(base) && fs.existsSync(target) && fs.statSync(target).isDirectory()) {
+      baseDir = base;
+      targetDir = target;
+      break;
+    }
   }
 
-  if (!fs.existsSync(targetDir) || !fs.statSync(targetDir).isDirectory()) {
-    return { error: "디렉토리 없음" };
+  if (!baseDir || !targetDir) {
+    return { error: relDir ? "디렉토리 없음" : "접근 불가 경로" };
   }
 
   try {
