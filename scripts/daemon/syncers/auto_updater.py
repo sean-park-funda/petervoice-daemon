@@ -122,7 +122,7 @@ class AutoUpdater(threading.Thread):
         # 6. Restart daemon
         self._consecutive_failures = 0
         logger.info("[updater] Restarting daemon to apply updates...")
-        from daemon.globals import g
+        import daemon.globals as g
         g.restart_requested = True
         shutdown_event.set()
 
