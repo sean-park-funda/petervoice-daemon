@@ -30,9 +30,16 @@ from daemon.prompts import get_prompt_file, build_system_prompt
 def run_claude(prompt: str, project: str, _retry_count: int = 0, _overload_retry: int = 0) -> tuple[str, str | None, list[str]]:
     api_key = config["api_key"]
 
-    # kanban:{card_id} → 원본 프로젝트 디렉토리 사용
+    # branch:{branch_id} → 부모 프로젝트 디렉토리 사용
+    is_branch = project.startswith("branch:")
     is_kanban = project.startswith("kanban:")
-    if is_kanban:
+    if is_branch:
+        from daemon.branches import fetch_branch, build_branch_prompt, build_branch_context
+        branch_id = int(project.split(":")[1])
+        branch_data = fetch_branch(branch_id)
+        real_project = branch_data.get("project_id", "general") if branch_data else "general"
+        project_dir = get_project_dir(real_project)
+    elif is_kanban:
         from daemon.kanban import build_kanban_prompt, _fetch_kanban_card
         kanban_card_id = int(project.split(":")[1])
         kanban_card = _fetch_kanban_card(kanban_card_id)
@@ -52,7 +59,7 @@ def run_claude(prompt: str, project: str, _retry_count: int = 0, _overload_retry
     if not is_demo:
         cmd.append("--dangerously-skip-permissions")
 
-    settings_project = real_project if is_kanban else project
+    settings_project = real_project if (is_branch or is_kanban) else project
     proj_settings = _fetch_project_settings(settings_project)
     if proj_settings.get("chrome"):
         cmd.append("--chrome")
@@ -64,7 +71,13 @@ def run_claude(prompt: str, project: str, _retry_count: int = 0, _overload_retry
     if effort:
         cmd.extend(["--effort", effort])
 
-    if is_kanban and kanban_card:
+    if is_branch and branch_data:
+        # 브랜치: 시스템 프롬프트 + 새 세션이면 부모 맥락/브랜치 정보를 첫 메시지에 prepend
+        combined = build_branch_prompt(branch_data)
+        if not sid:
+            context_block = build_branch_context(branch_data)
+            prompt = f"{context_block}\n\n---\n\n{prompt}"
+    elif is_kanban and kanban_card:
         # 칸반 카드: 시스템 프롬프트(규칙) + 새 세션이면 카드 정보를 첫 메시지에 prepend
         from daemon.kanban import build_kanban_card_context
         combined = build_kanban_prompt(kanban_card)
@@ -124,8 +137,8 @@ def run_claude(prompt: str, project: str, _retry_count: int = 0, _overload_retry
     if sid:
         key = session_key(project)
         with sessions_lock:
-            prev_account = g.sessions.get(key, {}).get("account")
-        if prev_account and prev_account != account_name:
+            prev_account = g.sessions.get(key, {}).get("account") or "default"
+        if prev_account != account_name:
             logger.info(f"Account changed for {project}: {prev_account} → {account_name}, auto-resetting session")
             save_session_context(project)
             reset_session(project)
@@ -336,6 +349,10 @@ def run_claude(prompt: str, project: str, _retry_count: int = 0, _overload_retry
 
         if new_session_id:
             update_session(project, new_session_id, account=account_name)
+            # 브랜치 세션 ID를 DB에도 동기화
+            if is_branch and new_session_id != sid:
+                from daemon.branches import update_branch_session
+                update_branch_session(int(project.split(":")[1]), new_session_id)
 
         return (response_text, new_session_id, tool_lines)
 
