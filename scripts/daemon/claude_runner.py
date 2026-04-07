@@ -125,14 +125,9 @@ def run_claude(prompt: str, project: str, _retry_count: int = 0, _overload_retry
         combined_file.write_text(combined, encoding="utf-8")
         cmd.extend(["--append-system-prompt-file", str(combined_file)])
 
-    if sid:
-        cmd.extend(["--resume", sid])
-
-    cmd.extend(["--", prompt])
-
     bot_name = config.get("bot_name", "bot")
 
-    # Resolve account — auto-reset session if account changed
+    # Resolve account — auto-reset session if account changed (must happen before --resume)
     account_name = proj_settings.get("account") or "default"
     if sid:
         key = session_key(project)
@@ -143,6 +138,11 @@ def run_claude(prompt: str, project: str, _retry_count: int = 0, _overload_retry
             save_session_context(project)
             reset_session(project)
             sid = None
+
+    if sid:
+        cmd.extend(["--resume", sid])
+
+    cmd.extend(["--", prompt])
     accounts = config.get("accounts", {})
     account_config_dir = accounts.get(account_name, {}).get("config_dir") if account_name != "default" else None
     if account_config_dir:
