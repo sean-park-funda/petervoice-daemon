@@ -25,6 +25,7 @@ from daemon.syncers.secrets import SecretsSyncer
 from daemon.syncers.skills import SkillsSyncer
 from daemon.syncers.docs import DocsSyncer
 from daemon.syncers.auto_updater import AutoUpdater
+from daemon.summon import SummonManager
 from daemon.heartbeat import HeartbeatThread
 from daemon.manager.thread import ManagerThread
 from daemon.manager.http_server import start_manager_http_server
@@ -376,6 +377,7 @@ def main():
             logger.info("[docs] Syncer disabled (docs_sync_enabled=false)")
 
         AutoUpdater().start()
+        SummonManager().start()
 
         worker = Worker()
         worker.start()
