@@ -899,6 +899,11 @@ function verifyAuth(req) {
     if (verifyJwt(jwt, apiKey)) return true;
   }
 
+  // 4. Query parameter token (공유 링크용)
+  const urlObj = new URL(req.url, `http://localhost`);
+  const queryToken = urlObj.searchParams.get("token");
+  if (queryToken && verifyJwt(queryToken, apiKey)) return true;
+
   return false;
 }
 
