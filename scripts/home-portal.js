@@ -1207,6 +1207,109 @@ const server = http.createServer((req, res) => {
       } catch (e) { json({ error: "제거 실패: " + e.message }, 500); }
     }).catch(e => json({ error: e.message }, 400));
   }
+  // Share: /share — 문서 공유 뷰어 (HTML 렌더링)
+  else if (pathname === "/share" && req.method === "GET") {
+    const dir = url.searchParams.get("dir");
+    const filePath = url.searchParams.get("path");
+    const token = url.searchParams.get("token");
+    if (!dir || !filePath) { res.writeHead(400); res.end("dir, path 파라미터 필요"); return; }
+
+    const validated = validateDocsDir(dir);
+    if (!validated) { res.writeHead(403); res.end("Forbidden"); return; }
+    const fullPath = path.resolve(validated, filePath);
+    if (!fullPath.startsWith(validated) || !fs.existsSync(fullPath)) { res.writeHead(404); res.end("Not found"); return; }
+
+    const ext = path.extname(fullPath).toLowerCase();
+    const title = path.basename(filePath, ext);
+    const isMarkdown = [".md", ".mdx"].includes(ext);
+    const isCode = [".js",".ts",".jsx",".tsx",".py",".rb",".go",".rs",".java",".c",".cpp",".h",".sh",".sql",".json",".yaml",".yml",".toml",".css",".html",".xml"].includes(ext);
+    const isImage = [".png",".jpg",".jpeg",".gif",".webp",".svg",".bmp"].includes(ext);
+    const isText = [".txt",".csv",".log"].includes(ext);
+
+    // 이미지: 직접 서빙
+    if (isImage) {
+      serveDocsFile(res, dir, filePath);
+      return;
+    }
+
+    // 텍스트 계열: HTML 뷰어로 렌더링
+    let content = "";
+    try { content = fs.readFileSync(fullPath, "utf-8"); } catch { res.writeHead(500); res.end("Read error"); return; }
+
+    // 마크다운 내 상대 이미지 경로를 포탈 URL로 변환
+    const docDir = filePath.includes("/") ? filePath.split("/").slice(0, -1).join("/") : "";
+    if (isMarkdown) {
+      content = content.replace(/!\[([^\]]*)\]\((?!http|data:)([^)]+)\)/g, (match, alt, imgPath) => {
+        const cleanPath = imgPath.startsWith("./") ? imgPath.slice(2) : imgPath;
+        const resolvedImg = docDir ? `${docDir}/${cleanPath}` : cleanPath;
+        return `![${alt}](/api/docs/file?dir=${encodeURIComponent(dir)}&path=${encodeURIComponent(resolvedImg)}${token ? "&token=" + token : ""})`;
+      });
+    }
+
+    const escapedContent = content.replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/&/g, "&amp;");
+    const lang = isCode ? ext.slice(1) : "text";
+
+    const html = `<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>${title} — PeterVoice</title>
+${isMarkdown ? `
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"><\/script>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/github-markdown-css@5/github-markdown-light.min.css">
+` : `
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/prismjs@1/themes/prism.min.css">
+<script src="https://cdn.jsdelivr.net/npm/prismjs@1/prism.min.js"><\/script>
+<script src="https://cdn.jsdelivr.net/npm/prismjs@1/plugins/autoloader/prism-autoloader.min.js"><\/script>
+`}
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #fff; color: #24292f; }
+  .header { background: #f6f8fa; border-bottom: 1px solid #d0d7de; padding: 12px 24px; display: flex; align-items: center; gap: 12px; }
+  .header h1 { font-size: 16px; font-weight: 600; }
+  .header .badge { font-size: 11px; color: #656d76; background: #eaeef2; padding: 2px 8px; border-radius: 12px; }
+  .container { max-width: 900px; margin: 0 auto; padding: 32px 24px; }
+  .markdown-body { font-size: 15px; line-height: 1.7; }
+  .markdown-body img { max-width: 100%; border-radius: 8px; margin: 16px 0; cursor: pointer; }
+  .code-wrap { background: #f6f8fa; border: 1px solid #d0d7de; border-radius: 8px; overflow-x: auto; padding: 16px; font-size: 13px; line-height: 1.5; }
+  .code-wrap code { white-space: pre; }
+  .lightbox { display: none; position: fixed; inset: 0; z-index: 9999; background: rgba(0,0,0,.9); align-items: center; justify-content: center; cursor: pointer; }
+  .lightbox.active { display: flex; }
+  .lightbox img { max-width: 95vw; max-height: 95vh; object-fit: contain; }
+</style>
+</head>
+<body>
+<div class="header">
+  <h1>${title}</h1>
+  <span class="badge">${ext.slice(1).toUpperCase()}</span>
+</div>
+<div class="container">
+${isMarkdown
+  ? `<div id="md" class="markdown-body"></div>
+<script>
+const raw = ${JSON.stringify(content)};
+document.getElementById('md').innerHTML = marked.parse(raw);
+// 이미지 라이트박스
+document.addEventListener('click', e => {
+  if (e.target.tagName === 'IMG' && e.target.closest('.markdown-body')) {
+    const lb = document.getElementById('lightbox');
+    lb.querySelector('img').src = e.target.src;
+    lb.classList.add('active');
+  }
+});
+<\/script>`
+  : `<div class="code-wrap"><code class="language-${lang}">${escapedContent}</code></div>
+<script>Prism.highlightAll();<\/script>`
+}
+</div>
+<div id="lightbox" class="lightbox" onclick="this.classList.remove('active')"><img src="" alt=""></div>
+</body>
+</html>`;
+
+    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+    res.end(html);
+  }
   else if (pathname === "/api/publish" && req.method === "POST") {
     readBody().then(body => json(execPublish(body)));
   }
