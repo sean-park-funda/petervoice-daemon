@@ -61,14 +61,17 @@ def build_branch_prompt(branch: dict) -> str:
     project_prompt = project_prompt_file.read_text(encoding="utf-8") if project_prompt_file.exists() else ""
 
     # Layer 4: Branch/kanban rules
+    branch_num = branch.get("branch_number", branch.get("id"))
+    branch_id = branch.get("id")
+    # 이전 대화 조회 시 사용할 project ID (kanban 카드가 아닌 branch ID)
+    conversation_hint = f"\n## 이전 대화 조회\n이 세션의 대화 기록은 `project=branch:{branch_id}`로 조회하세요. 칸반 카드 ID가 아닌 **branch:{branch_id}**를 사용할 것.\n"
+
     kanban_card_full = branch.get("kanban_card_full")
     if kanban_card_full:
         # 칸반 카드가 연결된 브랜치 → 기존 카드 규칙 사용
         from daemon.kanban import build_kanban_prompt
-        # build_kanban_prompt already includes common + project prompt,
-        # so we use it directly but we need to include _petervoice_system
         kanban_combined = build_kanban_prompt(kanban_card_full)
-        combined = "\n\n".join(p for p in [system_prompt_pv, kanban_combined] if p)
+        combined = "\n\n".join(p for p in [system_prompt_pv, kanban_combined, conversation_hint] if p)
         return combined
     else:
         # 순수 브랜치 → 간결한 브랜치 규칙
@@ -95,7 +98,7 @@ curl -X PATCH "$API_URL/api/branches/{branch_id}" \\
   -d '{{"status": "archived"}}'
 ```
 """
-        combined = "\n\n".join(p for p in [system_prompt_pv, common_prompt, project_prompt, branch_rules] if p)
+        combined = "\n\n".join(p for p in [system_prompt_pv, common_prompt, project_prompt, branch_rules, conversation_hint] if p)
         return combined
 
 
