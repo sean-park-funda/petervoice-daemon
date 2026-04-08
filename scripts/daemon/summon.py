@@ -5,6 +5,7 @@
 """
 
 import json
+import re
 import subprocess
 import threading
 import time
@@ -35,6 +36,11 @@ CRITIC_PROMPT = """당신은 **비판자(Critic)** 에이전트입니다. 소환
 - 종료 시 반드시 `[SUMMON_COMPLETE]` 태그로 시작하는 최종 요약을 작성
 - 요약에는: (1) 주요 개선 사항, (2) 최종 결론, (3) 남은 과제를 포함
 - 한국어로 답변
+
+## 전문가 지정 호출
+- 특정 전문가에게만 의견을 구하려면 `@전문가명`을 응답에 포함 (예: `@designer @code-reviewer`)
+- @태그가 없으면 모든 전문가가 호출됨
+- 예: "UI 부분은 좀 더 봐야 합니다. @designer 의견 부탁합니다."
 
 ## 종료 판단 기준
 - 작업물의 완성도가 충분하다고 판단될 때
@@ -80,6 +86,19 @@ EXPERT_PROMPTS = {
 - 한국어로 답변
 """,
 }
+
+
+def _parse_mentioned_experts(critic_response: str, all_experts: list[str]) -> list[str]:
+    """비판자 응답에서 @전문가명 태그를 파싱하여 호출할 전문가 목록 반환.
+
+    @태그가 없으면 전체 전문가 반환 (기존 동작 유지).
+    """
+    mentions = set(re.findall(r"@(\w[\w-]*)", critic_response))
+    if not mentions:
+        return all_experts
+
+    matched = [e for e in all_experts if e in mentions]
+    return matched if matched else all_experts
 
 
 def _run_claude_once(prompt: str, system_prompt: str, cwd: str) -> str:
@@ -186,6 +205,8 @@ def _run_summon_session(session: dict):
     if context:
         conversation_log.append(f"[프로젝트 컨텍스트]\n{context}")
 
+    prev_critic_response = ""  # 이전 비판자 응답 (@ 태그 파싱용)
+
     for round_num in range(1, max_rounds + 1):
         if shutdown_event.is_set():
             break
@@ -200,9 +221,17 @@ def _run_summon_session(session: dict):
 
         _update_session(session_id, current_round=round_num)
 
-        # 1. 전문가 의견 수집 (있는 경우)
+        # 1. 전문가 의견 수집 — 비판자의 @태그로 호출 대상 결정
+        if round_num == 1:
+            round_experts = experts  # 첫 라운드는 전체 전문가
+        else:
+            round_experts = _parse_mentioned_experts(prev_critic_response, experts)
+
+        if round_experts != experts:
+            logger.info(f"[summon] Round {round_num}: calling subset {round_experts} (from @mentions)")
+
         expert_opinions = []
-        for expert in experts:
+        for expert in round_experts:
             expert_prompt = EXPERT_PROMPTS.get(expert, f"당신은 {expert} 전문가입니다. 한국어로 답변하세요.")
             expert_input = f"현재 대화 맥락:\n\n{''.join(conversation_log[-6:])}\n\n위 맥락을 보고 {expert} 관점에서 의견을 제시하세요. (라운드 {round_num})"
 
@@ -231,6 +260,7 @@ def _run_summon_session(session: dict):
 라운드 {round_num}/{max_rounds}"""
 
         critic_response = _run_claude_once(critic_input, critic_system, cwd)
+        prev_critic_response = critic_response
 
         _update_session(session_id, message={
             "round": round_num,
@@ -241,7 +271,8 @@ def _run_summon_session(session: dict):
         conversation_log.append(f"[라운드 {round_num}]\n{expert_section}\n\n[비판자] {critic_response}")
 
         # 상태 업데이트
-        _post_chat_message(host_project, f"🔮 소환 라운드 {round_num}/{max_rounds} 완료")
+        called = ", ".join(round_experts) if round_experts else "비판자 단독"
+        _post_chat_message(host_project, f"🔮 소환 라운드 {round_num}/{max_rounds} 완료 ({called})")
 
         # 3. 완료 체크
         if "[SUMMON_COMPLETE]" in critic_response:
