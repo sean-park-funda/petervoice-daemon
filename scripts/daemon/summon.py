@@ -243,6 +243,9 @@ def _run_summon_session(session: dict):
                 "content": opinion,
             })
 
+            # 전문가 발언을 채팅에 표시
+            _post_chat_message(host_project, f"🔮 **[{expert}]** (라운드 {round_num})\n\n{opinion}")
+
         # 2. 비판자 턴
         all_context = "\n\n".join(conversation_log[-6:])
         expert_section = "\n\n".join(expert_opinions) if expert_opinions else "(전문가 없음 — 비판자 단독)"
@@ -267,11 +270,10 @@ def _run_summon_session(session: dict):
             "content": critic_response,
         })
 
-        conversation_log.append(f"[라운드 {round_num}]\n{expert_section}\n\n[비판자] {critic_response}")
+        # 비판자 발언을 채팅에 표시
+        _post_chat_message(host_project, f"🔮 **[비판자]** (라운드 {round_num})\n\n{critic_response}")
 
-        # 상태 업데이트
-        called = ", ".join(round_experts) if round_experts else "비판자 단독"
-        _post_chat_message(host_project, f"🔮 소환 라운드 {round_num}/{max_rounds} 완료 ({called})")
+        conversation_log.append(f"[라운드 {round_num}]\n{expert_section}\n\n[비판자] {critic_response}")
 
         # 3. 완료 체크
         if "[SUMMON_COMPLETE]" in critic_response:
