@@ -110,7 +110,6 @@ def _run_claude_once(prompt: str, system_prompt: str, cwd: str) -> str:
         CLAUDE_CMD, "-p",
         "--output-format", "json",
         "--append-system-prompt-file", str(prompt_file),
-        "--verbose",
         "--dangerously-skip-permissions",
     ]
 
