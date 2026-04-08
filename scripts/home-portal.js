@@ -152,6 +152,204 @@ function apiSystem() {
   };
 }
 
+// ─── Git API Handlers ────────────────────────────────
+
+function validateGitDir(dir) {
+  // 보안: 허용된 프로젝트 디렉토리 하위만 접근 가능
+  const resolved = path.resolve(dir);
+  for (const projDir of PROJECTS_DIRS) {
+    if (resolved.startsWith(path.resolve(projDir))) return resolved;
+  }
+  // 홈 디렉토리 하위 허용 (데몬 프로젝트 등)
+  if (resolved.startsWith(os.homedir())) return resolved;
+  return null;
+}
+
+function apiGitRepos(dir) {
+  const validated = validateGitDir(dir);
+  if (!validated) return { error: "접근 불가 경로" };
+  if (!fs.existsSync(validated)) return { error: "경로 없음" };
+
+  // dir 자체가 git repo인지 확인
+  if (fs.existsSync(path.join(validated, ".git"))) {
+    return { repos: [gitRepoInfo(validated)] };
+  }
+
+  // 하위 디렉토리에서 git repo 탐색 (1레벨만)
+  const repos = [];
+  try {
+    const entries = fs.readdirSync(validated, { withFileTypes: true });
+    for (const e of entries) {
+      if (!e.isDirectory() || e.name.startsWith(".")) continue;
+      const sub = path.join(validated, e.name);
+      if (fs.existsSync(path.join(sub, ".git"))) {
+        repos.push(gitRepoInfo(sub));
+      }
+    }
+  } catch {}
+  return { repos };
+}
+
+function gitRepoInfo(dir) {
+  let remoteUrl = "";
+  let defaultBranch = "main";
+  try {
+    remoteUrl = execSync("git -C " + JSON.stringify(dir) + " remote get-url origin 2>/dev/null", { encoding: "utf-8" }).trim();
+  } catch {}
+  try {
+    // HEAD가 가리키는 브랜치
+    defaultBranch = execSync("git -C " + JSON.stringify(dir) + " rev-parse --abbrev-ref HEAD", { encoding: "utf-8" }).trim();
+  } catch {}
+  return {
+    repo_name: path.basename(dir),
+    local_path: dir,
+    remote_url: remoteUrl || null,
+    default_branch: defaultBranch,
+  };
+}
+
+function apiGitBranches(dir) {
+  const validated = validateGitDir(dir);
+  if (!validated) return { error: "접근 불가 경로" };
+  try {
+    const raw = execSync("git -C " + JSON.stringify(validated) + " branch --format='%(refname:short)' 2>/dev/null", { encoding: "utf-8" });
+    const branches = raw.trim().split("\n").filter(Boolean);
+    let current = "";
+    try {
+      current = execSync("git -C " + JSON.stringify(validated) + " rev-parse --abbrev-ref HEAD", { encoding: "utf-8" }).trim();
+    } catch {}
+    return { branches, current };
+  } catch (e) {
+    return { error: "git 실행 실패: " + e.message };
+  }
+}
+
+function apiGitCommits(dir, branch, limit) {
+  const validated = validateGitDir(dir);
+  if (!validated) return { error: "접근 불가 경로" };
+  try {
+    const format = '{"hash":"%H","short_hash":"%h","message":"%s","author":"%an","date":"%aI"}';
+    const raw = execSync(
+      `git -C ${JSON.stringify(validated)} log ${JSON.stringify(branch)} --max-count=${limit} --format='${format}' --no-merges 2>/dev/null`,
+      { encoding: "utf-8", maxBuffer: 10 * 1024 * 1024 }
+    );
+    const commits = raw.trim().split("\n").filter(Boolean).map(line => {
+      try { return JSON.parse(line); } catch { return null; }
+    }).filter(Boolean);
+
+    // 각 커밋에 stat 추가
+    for (const c of commits) {
+      try {
+        const stat = execSync(
+          `git -C ${JSON.stringify(validated)} diff-tree --no-commit-id --shortstat ${c.hash} 2>/dev/null`,
+          { encoding: "utf-8" }
+        ).trim();
+        const fm = stat.match(/(\d+) file/);
+        const am = stat.match(/(\d+) insertion/);
+        const dm = stat.match(/(\d+) deletion/);
+        c.files_changed = fm ? parseInt(fm[1]) : 0;
+        c.additions = am ? parseInt(am[1]) : 0;
+        c.deletions = dm ? parseInt(dm[1]) : 0;
+      } catch {
+        c.files_changed = 0;
+        c.additions = 0;
+        c.deletions = 0;
+      }
+    }
+    return { commits };
+  } catch (e) {
+    return { error: "git 실행 실패: " + e.message };
+  }
+}
+
+function apiGitDiff(dir, commit) {
+  const validated = validateGitDir(dir);
+  if (!validated) return { error: "접근 불가 경로" };
+  try {
+    // 커밋의 변경 파일 목록
+    const nameStatus = execSync(
+      `git -C ${JSON.stringify(validated)} diff-tree --no-commit-id -r --name-status ${JSON.stringify(commit)} 2>/dev/null`,
+      { encoding: "utf-8" }
+    ).trim();
+
+    const files = nameStatus.split("\n").filter(Boolean).map(line => {
+      const parts = line.split("\t");
+      const statusMap = { A: "added", M: "modified", D: "deleted", R: "renamed" };
+      return {
+        status: statusMap[parts[0]?.[0]] || "modified",
+        path: parts[parts.length - 1],
+      };
+    });
+
+    // 각 파일의 diff
+    const fileDiffs = [];
+    for (const f of files) {
+      try {
+        const diff = execSync(
+          `git -C ${JSON.stringify(validated)} show ${JSON.stringify(commit)} -- ${JSON.stringify(f.path)} 2>/dev/null`,
+          { encoding: "utf-8", maxBuffer: 5 * 1024 * 1024 }
+        );
+        // diff 부분만 추출 (커밋 메타 제거)
+        const diffStart = diff.indexOf("diff --git");
+        const diffText = diffStart >= 0 ? diff.slice(diffStart) : diff;
+        const am = diffText.match(/^\+[^+]/gm);
+        const dm = diffText.match(/^-[^-]/gm);
+        fileDiffs.push({
+          path: f.path,
+          status: f.status,
+          diff_text: diffText,
+          additions: am ? am.length : 0,
+          deletions: dm ? dm.length : 0,
+        });
+      } catch {
+        fileDiffs.push({ path: f.path, status: f.status, diff_text: "", additions: 0, deletions: 0 });
+      }
+    }
+    return { file_diffs: fileDiffs };
+  } catch (e) {
+    return { error: "git 실행 실패: " + e.message };
+  }
+}
+
+function apiGitDiffRange(dir, fromCommit, toCommit) {
+  const validated = validateGitDir(dir);
+  if (!validated) return { error: "접근 불가 경로" };
+  try {
+    const raw = execSync(
+      `git -C ${JSON.stringify(validated)} diff ${JSON.stringify(fromCommit)}..${JSON.stringify(toCommit)} 2>/dev/null`,
+      { encoding: "utf-8", maxBuffer: 20 * 1024 * 1024 }
+    );
+
+    // 파일별로 분리
+    const fileDiffs = [];
+    const parts = raw.split(/^(?=diff --git)/m);
+    for (const part of parts) {
+      if (!part.trim()) continue;
+      const pathMatch = part.match(/^diff --git a\/(.*?) b\/(.*)/m);
+      if (!pathMatch) continue;
+      const filePath = pathMatch[2];
+      let status = "modified";
+      if (part.includes("new file mode")) status = "added";
+      else if (part.includes("deleted file mode")) status = "deleted";
+      else if (part.includes("rename from")) status = "renamed";
+      const am = part.match(/^\+[^+]/gm);
+      const dm = part.match(/^-[^-]/gm);
+      fileDiffs.push({
+        path: filePath,
+        status,
+        diff_text: part,
+        additions: am ? am.length : 0,
+        deletions: dm ? dm.length : 0,
+      });
+    }
+    return { file_diffs: fileDiffs };
+  } catch (e) {
+    return { error: "git 실행 실패: " + e.message };
+  }
+}
+
+// ─── File browsing ───────────────────────────────────
+
 function apiBrowse(relDir) {
   // 보안: 허용된 프로젝트 디렉토리 하위만 접근 가능
   let baseDir = null;
@@ -1309,6 +1507,41 @@ document.addEventListener('click', e => {
 
     res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
     res.end(html);
+  }
+  // Git API: /api/git/repos — 디렉토리에서 git 리포 스캔
+  else if (pathname === "/api/git/repos" && req.method === "GET") {
+    const dir = url.searchParams.get("dir");
+    if (!dir) return json({ error: "dir 파라미터 필요" }, 400);
+    json(apiGitRepos(dir));
+  }
+  // Git API: /api/git/branches — 리포의 브랜치 목록
+  else if (pathname === "/api/git/branches" && req.method === "GET") {
+    const dir = url.searchParams.get("dir");
+    if (!dir) return json({ error: "dir 파라미터 필요" }, 400);
+    json(apiGitBranches(dir));
+  }
+  // Git API: /api/git/commits — 커밋 목록
+  else if (pathname === "/api/git/commits" && req.method === "GET") {
+    const dir = url.searchParams.get("dir");
+    const branch = url.searchParams.get("branch") || "HEAD";
+    const limit = parseInt(url.searchParams.get("limit") || "30");
+    if (!dir) return json({ error: "dir 파라미터 필요" }, 400);
+    json(apiGitCommits(dir, branch, limit));
+  }
+  // Git API: /api/git/diff — 커밋의 diff 데이터
+  else if (pathname === "/api/git/diff" && req.method === "GET") {
+    const dir = url.searchParams.get("dir");
+    const commit = url.searchParams.get("commit");
+    if (!dir || !commit) return json({ error: "dir, commit 파라미터 필요" }, 400);
+    json(apiGitDiff(dir, commit));
+  }
+  // Git API: /api/git/diff-range — 커밋 범위의 diff 데이터
+  else if (pathname === "/api/git/diff-range" && req.method === "GET") {
+    const dir = url.searchParams.get("dir");
+    const from = url.searchParams.get("from");
+    const to = url.searchParams.get("to");
+    if (!dir || !from || !to) return json({ error: "dir, from, to 파라미터 필요" }, 400);
+    json(apiGitDiffRange(dir, from, to));
   }
   else if (pathname === "/api/publish" && req.method === "POST") {
     readBody().then(body => json(execPublish(body)));
