@@ -8,6 +8,54 @@ from daemon.api import api_request
 from daemon.supabase import fetch_prompt_from_supabase
 
 
+def _build_branch_relay_guide(project_id: str, branch_id: int) -> str:
+    """Build relay (agent-to-agent communication) guide for a branch."""
+    return f"""## 릴레이 (에이전트 간 통신)
+다른 프로젝트/브랜치에 메시지를 보내거나, 다른 에이전트로부터 메시지를 받을 수 있습니다.
+
+### 메시지 보내기
+```bash
+API_URL=$(python3 -c "import json; c=json.load(open('$HOME/.claude-daemon/config.json')); print(c.get('api_url', 'https://peter-voice.vercel.app'))")
+API_KEY=$(python3 -c "import json; print(json.load(open('$HOME/.claude-daemon/config.json'))['api_key'])")
+
+curl -X POST "$API_URL/api/relay/message" \\
+  -H "X-Api-Key: $API_KEY" \\
+  -H "Content-Type: application/json" \\
+  -d '{{
+    "from_project": "{project_id}",
+    "from_branch_id": {branch_id},
+    "to_project": "대상_프로젝트_ID",
+    "to_branch_id": null,
+    "text": "메시지 내용",
+    "attachments": []
+  }}'
+```
+- `to_project`: **필수** — 대상 프로젝트 ID. 보내기 전 프로젝트 목록 조회 필수.
+- `to_branch_id`: 특정 브랜치에 보내려면 브랜치 ID(숫자). 프로젝트 본체에 보내려면 생략 또는 null.
+- `from_project`, `from_branch_id`: 자기 정보 — 수신 에이전트가 응답을 보낼 수 있도록 반드시 포함.
+- `attachments`: 파일 절대 경로 배열 (선택). 상대가 Read로 읽음.
+
+### 프로젝트 목록 조회 (릴레이 전 필수)
+```bash
+curl -s "$API_URL/api/projects" -H "X-Api-Key: $API_KEY" | python3 -c "
+import sys, json
+for p in json.load(sys.stdin).get('projects', []):
+    print(f'  {{p[\"id\"]}} — {{p[\"name\"]}}')
+"
+```
+
+### 대상 프로젝트의 브랜치 목록 조회
+```bash
+curl -s "$API_URL/api/branches?project_id=대상_프로젝트_ID" -H "X-Api-Key: $API_KEY"
+```
+
+### [relay] 메시지 수신 시
+- `[relay from:프로젝트명 branch:N]` 형식으로 수신됨
+- 📎 첨부 문서가 있으면 **반드시 Read로 읽고** 응답
+- 응답이 필요하면 `from_project`와 `from_branch_id`(있으면)로 릴레이 회신
+"""
+
+
 def fetch_branch(branch_id: int) -> dict | None:
     """Fetch branch data via GET /api/bot/branch?id=N."""
     api_key = config.get("api_key", "")
@@ -66,18 +114,22 @@ def build_branch_prompt(branch: dict) -> str:
     # 이전 대화 조회 시 사용할 project ID (kanban 카드가 아닌 branch ID)
     conversation_hint = f"\n## 이전 대화 조회\n이 세션의 대화 기록은 `project=branch:{branch_id}`로 조회하세요. 칸반 카드 ID가 아닌 **branch:{branch_id}**를 사용할 것.\n"
 
+    # 릴레이 가이드 (모든 브랜치 공통)
+    relay_guide = _build_branch_relay_guide(project_id, branch_id)
+
     kanban_card_full = branch.get("kanban_card_full")
     if kanban_card_full:
         # 칸반 카드가 연결된 브랜치 → 기존 카드 규칙 사용
         from daemon.kanban import build_kanban_prompt
         kanban_combined = build_kanban_prompt(kanban_card_full)
-        combined = "\n\n".join(p for p in [system_prompt_pv, kanban_combined, conversation_hint] if p)
+        combined = "\n\n".join(p for p in [system_prompt_pv, kanban_combined, relay_guide, conversation_hint] if p)
         return combined
     else:
         # 순수 브랜치 → 간결한 브랜치 규칙
         branch_num = branch.get("branch_number", branch.get("id"))
         branch_id = branch.get("id")
         branch_rules = f"""# 브랜치 #{branch_num}: {branch.get('title', '')} (내부ID: {branch_id})
+소속 프로젝트: {project_id}
 
 ## 규칙
 - 이 브랜치의 작업에 집중하세요.
@@ -98,7 +150,7 @@ curl -X PATCH "$API_URL/api/branches/{branch_id}" \\
   -d '{{"status": "archived"}}'
 ```
 """
-        combined = "\n\n".join(p for p in [system_prompt_pv, common_prompt, project_prompt, branch_rules, conversation_hint] if p)
+        combined = "\n\n".join(p for p in [system_prompt_pv, common_prompt, project_prompt, branch_rules, relay_guide, conversation_hint] if p)
         return combined
 
 
