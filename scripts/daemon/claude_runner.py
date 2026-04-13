@@ -313,6 +313,17 @@ def run_claude(prompt: str, project: str, _retry_count: int = 0, _overload_retry
                             time.sleep(wait)
                             return run_claude(prompt, project, _retry_count, _overload_retry + 1)
                         return ("(Anthropic 서버 과부하 - 잠시 후 다시 시도해주세요)", new_session_id, tool_lines)
+                    if "could not process image" in error_text.lower() or "invalid_request_error" in error_text.lower():
+                        logger.warning(f"[{bot_name}] Image/request error for {project}, resetting session (retry {_retry_count + 1})")
+                        conv = _fetch_recent_conversation(project, limit=10)
+                        if conv:
+                            _save_session_summary(project, f"[이미지 처리 오류로 자동 리셋 — 최근 대화 원본]\n\n{conv}")
+                        reset_session(project)
+                        proc.wait(timeout=5)
+                        g.claude_semaphore.release()
+                        if _retry_count >= MAX_CONTEXT_OVERFLOW_RETRIES:
+                            return ("(이미지 처리 오류 - 세션이 초기화되었습니다. 다시 말씀해주세요.)", None, tool_lines)
+                        return run_claude(prompt, project, _retry_count + 1)
                     if "context" in error_text.lower():
                         logger.warning(f"[{bot_name}] Context overflow for {project}, resetting (retry {_retry_count + 1})")
                         conv = _fetch_recent_conversation(project, limit=10)
