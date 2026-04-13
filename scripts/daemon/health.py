@@ -1,6 +1,7 @@
-"""Session health checker thread."""
+"""Session health checker thread with stall detection."""
 
 from datetime import datetime
+import time
 import threading
 
 import daemon.globals as g
@@ -13,9 +14,10 @@ from daemon.api import api_request
 
 
 class SessionHealthChecker(threading.Thread):
-    """Periodically checks session health via a dedicated 'session-manager' project."""
+    """Periodically checks session health and detects stalled conversations."""
 
-    CHECK_INTERVAL = 2 * 3600  # 2 hours
+    HEALTH_CHECK_INTERVAL = 2 * 3600  # 2 hours
+    STALL_CHECK_INTERVAL = 1800       # 30 minutes
 
     def __init__(self):
         super().__init__(daemon=True, name="session-health-checker")
@@ -119,15 +121,72 @@ class SessionHealthChecker(threading.Thread):
         else:
             logger.error("[session-health] Failed to send report")
 
+    def _check_stalls(self):
+        """Collect conversation snippets and ask session-manager to judge stalls."""
+        infos = self._get_all_sessions_info()
+        if not infos:
+            return
+
+        session_lines = []
+        for info in infos:
+            project = info["project"]
+            conv = _fetch_recent_conversation(project, limit=5)
+            recent = conv[:400] if conv else "(최근 대화 없음)"
+            session_lines.append(
+                f"### {project}\n"
+                f"- 미사용: {info['idle_hours']}시간\n"
+                f"- 최근 대화:\n```\n{recent}\n```"
+            )
+
+        report = (
+            f"[stall-check 리포트 — {datetime.now().strftime('%Y-%m-%d %H:%M')}]\n\n"
+            f"활성 세션 {len(infos)}개의 최근 대화입니다.\n"
+            f"에이전트가 응답해야 하는데 못 하고 있는 경우가 있으면 릴레이로 깨워주세요.\n"
+            f"없으면 '없음'으로 짧게 답하세요.\n\n"
+            + "\n\n".join(session_lines)
+        )
+
+        api_key = config.get("api_key", "")
+        if not api_key:
+            return
+
+        result = api_request(api_key, "POST", "/api/bot/message", body={
+            "project": SESSION_MANAGER_PROJECT,
+            "text": report,
+            "type": "user",
+            "subtype": "stall_check_report",
+            "processed": False,
+        }, timeout=10)
+
+        if result and result.get("id"):
+            logger.info(f"[stall-check] Report sent ({len(infos)} sessions)")
+        else:
+            logger.error("[stall-check] Failed to send report")
+
     def run(self):
-        logger.info("[session-health] Health checker started (interval=2h)")
-        shutdown_event.wait(1800)
+        logger.info("[session-health] Started (health=2h, stall=30m)")
+        shutdown_event.wait(1800)  # initial wait
+
+        last_health = 0.0
+        last_stall = 0.0
 
         while not shutdown_event.is_set():
-            try:
-                self._check_sessions()
-            except Exception as e:
-                logger.error(f"[session-health] Check error: {e}")
-            shutdown_event.wait(self.CHECK_INTERVAL)
+            now = time.time()
 
-        logger.info("[session-health] Health checker stopped")
+            if now - last_health >= self.HEALTH_CHECK_INTERVAL:
+                try:
+                    self._check_sessions()
+                except Exception as e:
+                    logger.error(f"[session-health] Check error: {e}")
+                last_health = now
+
+            if now - last_stall >= self.STALL_CHECK_INTERVAL:
+                try:
+                    self._check_stalls()
+                except Exception as e:
+                    logger.error(f"[stall-check] Error: {e}")
+                last_stall = now
+
+            shutdown_event.wait(60)  # tick every 60s
+
+        logger.info("[session-health] Stopped")
