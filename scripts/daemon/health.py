@@ -22,6 +22,7 @@ class SessionHealthChecker(threading.Thread):
     def __init__(self):
         super().__init__(daemon=True, name="session-health-checker")
         self.api_key = config["api_key"]
+        self._has_session_manager: bool | None = None  # lazy check
 
     def _get_all_sessions_info(self) -> list[dict]:
         infos = []
@@ -77,6 +78,21 @@ class SessionHealthChecker(threading.Thread):
             except Exception as e:
                 logger.error(f"[session-health] Pre-save failed for {project}: {e}")
 
+    def _check_session_manager_exists(self) -> bool:
+        """Check if session-manager project exists for this user. Cached after first check."""
+        if self._has_session_manager is not None:
+            return self._has_session_manager
+        result = api_request(self.api_key, "GET", "/api/projects", timeout=5)
+        if result and "projects" in result:
+            self._has_session_manager = any(
+                p.get("id") == SESSION_MANAGER_PROJECT for p in result["projects"]
+            )
+        else:
+            self._has_session_manager = False
+        if not self._has_session_manager:
+            logger.info(f"[session-health] '{SESSION_MANAGER_PROJECT}' project not found — health/stall checks disabled")
+        return self._has_session_manager
+
     def _check_sessions(self):
         infos = self._get_all_sessions_info()
         if not infos:
@@ -84,6 +100,9 @@ class SessionHealthChecker(threading.Thread):
             return
 
         self._presave_expiring_sessions(infos)
+
+        if not self._check_session_manager_exists():
+            return
 
         session_lines = []
         for info in infos:
@@ -123,6 +142,8 @@ class SessionHealthChecker(threading.Thread):
 
     def _check_stalls(self):
         """Collect conversation snippets and ask session-manager to judge stalls."""
+        if not self._check_session_manager_exists():
+            return
         infos = self._get_all_sessions_info()
         if not infos:
             return
