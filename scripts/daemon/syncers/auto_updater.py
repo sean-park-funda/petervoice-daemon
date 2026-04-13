@@ -52,6 +52,20 @@ class AutoUpdater(threading.Thread):
             except Exception as e:
                 logger.warning(f"[updater] Home Portal restart failed: {e}")
 
+    def _clear_pycache(self):
+        """Remove __pycache__ dirs under scripts/ to prevent stale .pyc issues."""
+        import shutil
+        scripts_dir = self._repo_dir / "scripts"
+        cleared = 0
+        for cache_dir in scripts_dir.rglob("__pycache__"):
+            try:
+                shutil.rmtree(cache_dir)
+                cleared += 1
+            except Exception:
+                pass
+        if cleared:
+            logger.info(f"[updater] Cleared {cleared} __pycache__ dirs")
+
     def _pip_install_if_changed(self, old_head: str, new_head: str):
         """Run pip install if requirements.txt changed between commits."""
         r = self._git("diff", "--name-only", old_head, new_head)
@@ -113,13 +127,16 @@ class AutoUpdater(threading.Thread):
         new_head = self._local_head()
         logger.info(f"[updater] Updated to {new_head[:8]}")
 
-        # 4. Install dependencies if changed
+        # 4. Clear __pycache__ to prevent stale bytecode
+        self._clear_pycache()
+
+        # 5. Install dependencies if changed
         self._pip_install_if_changed(old_head, new_head)
 
-        # 5. Restart Home Portal if home-portal.js changed
+        # 6. Restart Home Portal if home-portal.js changed
         self._restart_home_portal_if_changed(old_head, new_head)
 
-        # 6. Restart daemon
+        # 7. Restart daemon
         self._consecutive_failures = 0
         logger.info("[updater] Restarting daemon to apply updates...")
         import daemon.globals as g
