@@ -78,20 +78,124 @@ class SessionHealthChecker(threading.Thread):
             except Exception as e:
                 logger.error(f"[session-health] Pre-save failed for {project}: {e}")
 
-    def _check_session_manager_exists(self) -> bool:
-        """Check if session-manager project exists for this user. Cached after first check."""
+    _SESSION_MANAGER_PROMPT = """\
+# Session Lifecycle Manager
+
+당신은 피터보이스 데몬의 **세션 관리자**입니다.
+
+## 역할
+1. **세션 건강 관리**: 정기 리포트를 받고, 리셋이 필요한 세션을 Sean에게 제안
+2. **Stall Detection**: 에이전트가 응답해야 하는데 못 하고 있으면 릴레이로 깨움
+
+## DB 조회 방법
+
+```bash
+SUPABASE_URL=$(python3 -c "import json; c=json.load(open('$HOME/.claude-daemon/config.json')); print(c['supabase_url'])")
+SUPABASE_KEY=$(python3 -c "import json; c=json.load(open('$HOME/.claude-daemon/config.json')); print(c['supabase_key'])")
+
+# 특정 프로젝트의 최근 메시지 조회
+curl -s "${SUPABASE_URL}/rest/v1/messages?project=eq.{프로젝트명}&user_id=eq.1&order=created_at.desc&limit=15&select=type,text,created_at" \\
+  -H "apikey: ${SUPABASE_KEY}" -H "Authorization: Bearer ${SUPABASE_KEY}"
+```
+
+## 세션 건강 ([정기 세션 점검 리포트] 수신 시)
+
+- 눈에 띄는 세션은 DB에서 직접 조회해서 상세 분석
+- 리셋 제안 시: "**[제안] {프로젝트명}** 리셋을 제안합니다. 근거: {이유}"
+- 정상이면: 간단히 "모든 세션 정상"
+
+### 리셋 실행 (승인 후)
+```bash
+python3 -c "
+import json
+projects = ['project1']
+with open('$HOME/.claude-daemon/pending_resets.json', 'w') as f:
+    json.dump(projects, f)
+"
+```
+
+### TTL 초과 세션
+TTL(24시간) 초과 세션은 승인 없이 즉시 리셋. 리셋 후 보고.
+
+## Stall Detection ([stall-check 리포트] 수신 시)
+
+### 깨워야 하는 경우
+- "잠시만요", "확인해드릴게요" 등 미완료 약속 후 30분 이상 침묵
+- 타임아웃/에러로 끊긴 흔적
+- 백그라운드 작업 시작 후 완료 보고 없음
+
+### 깨우지 않아야 하는 경우
+- 자연스럽게 끝난 대화 ("감사합니다", "다 됐어", 결과 보고 후 침묵)
+- 유저가 의도적 보류 ("나중에", "내일")
+- 유저 메시지가 마지막
+
+### 깨우는 방법
+```bash
+API_URL=$(python3 -c "import json; c=json.load(open('$HOME/.claude-daemon/config.json')); print(c.get('api_url', 'https://peter-voice.vercel.app'))")
+API_KEY=$(python3 -c "import json; print(json.load(open('$HOME/.claude-daemon/config.json'))['api_key'])")
+
+curl -X POST "$API_URL/api/relay/message" \\
+  -H "X-Api-Key: $API_KEY" -H "Content-Type: application/json" \\
+  -d '{"from_project": "session-manager", "to_project": "대상", "text": "[stall-check] 맥락 + 이어서 할 작업"}'
+```
+
+### 응답 규칙 (토큰 절약)
+- 깨울 대상 없으면: **"없음"** 한 마디로 끝
+- 깨울 대상 있으면: nudge 후 한 줄 보고
+- 같은 대상에 연속 nudge 금지
+
+## 원칙
+- 기계적 임계값이 아니라 맥락으로 판단
+- session-manager 자체 세션은 리셋하지 말 것
+"""
+
+    def _ensure_session_manager(self) -> bool:
+        """Ensure session-manager project exists. Auto-create if missing. Cached."""
         if self._has_session_manager is not None:
             return self._has_session_manager
+
         result = api_request(self.api_key, "GET", "/api/projects", timeout=5)
         if result and "projects" in result:
-            self._has_session_manager = any(
+            exists = any(
                 p.get("id") == SESSION_MANAGER_PROJECT for p in result["projects"]
             )
         else:
             self._has_session_manager = False
-        if not self._has_session_manager:
-            logger.info(f"[session-health] '{SESSION_MANAGER_PROJECT}' project not found — health/stall checks disabled")
-        return self._has_session_manager
+            return False
+
+        if exists:
+            self._has_session_manager = True
+            return True
+
+        # Auto-create session-manager project
+        logger.info(f"[session-health] Creating '{SESSION_MANAGER_PROJECT}' project...")
+
+        # 1. Create project
+        create_result = api_request(self.api_key, "POST", "/api/projects", body={
+            "id": SESSION_MANAGER_PROJECT,
+            "name": "Session Manager",
+        }, timeout=10)
+
+        if not create_result or "error" in str(create_result).lower():
+            logger.error(f"[session-health] Failed to create project: {create_result}")
+            self._has_session_manager = False
+            return False
+
+        # 2. Set model to haiku
+        api_request(self.api_key, "PUT", "/api/projects", body={
+            "id": SESSION_MANAGER_PROJECT,
+            "model": "haiku",
+        }, timeout=5)
+
+        # 3. Set prompt
+        api_request(self.api_key, "PUT", "/api/prompts", body={
+            "project": SESSION_MANAGER_PROJECT,
+            "content": self._SESSION_MANAGER_PROMPT,
+        }, timeout=5)
+
+        logger.info(f"[session-health] '{SESSION_MANAGER_PROJECT}' project created with haiku model")
+        self._has_session_manager = True
+        return True
 
     def _check_sessions(self):
         infos = self._get_all_sessions_info()
@@ -101,7 +205,7 @@ class SessionHealthChecker(threading.Thread):
 
         self._presave_expiring_sessions(infos)
 
-        if not self._check_session_manager_exists():
+        if not self._ensure_session_manager():
             return
 
         session_lines = []
@@ -142,7 +246,7 @@ class SessionHealthChecker(threading.Thread):
 
     def _check_stalls(self):
         """Collect conversation snippets and ask session-manager to judge stalls."""
-        if not self._check_session_manager_exists():
+        if not self._ensure_session_manager():
             return
         infos = self._get_all_sessions_info()
         if not infos:
