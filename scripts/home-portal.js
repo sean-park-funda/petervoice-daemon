@@ -1474,6 +1474,7 @@ const server = http.createServer((req, res) => {
 <title>${title} — PeterVoice</title>
 ${isMarkdown ? `
 <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"><\/script>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"><\/script>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/github-markdown-css@5/github-markdown-light.min.css">
 ` : `
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/prismjs@1/themes/prism.min.css">
@@ -1507,6 +1508,16 @@ ${isMarkdown
 <script>
 const raw = ${JSON.stringify(content)};
 document.getElementById('md').innerHTML = marked.parse(raw);
+// Mermaid 다이어그램 렌더링
+mermaid.initialize({ startOnLoad: false, theme: 'default' });
+document.querySelectorAll('code.language-mermaid').forEach((el, i) => {
+  const pre = el.parentElement;
+  const div = document.createElement('div');
+  div.className = 'mermaid';
+  div.textContent = el.textContent;
+  pre.replaceWith(div);
+});
+mermaid.run();
 // 이미지 라이트박스
 document.addEventListener('click', e => {
   if (e.target.tagName === 'IMG' && e.target.closest('.markdown-body')) {
