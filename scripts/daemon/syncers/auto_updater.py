@@ -68,7 +68,7 @@ class AutoUpdater(threading.Thread):
                 logger.warning(f"[updater] pip install failed: {e}")
 
     def check_once(self):
-        if not config.get("auto_update_enabled", False):
+        if not config.get("auto_update_enabled", True):
             return
 
         if not self._repo_dir:
