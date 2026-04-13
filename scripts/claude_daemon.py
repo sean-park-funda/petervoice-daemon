@@ -440,9 +440,9 @@ def main():
         if session_health_config.get("enabled", True):
             health_checker = SessionHealthChecker()
             if session_health_config.get("interval_hours"):
-                health_checker.CHECK_INTERVAL = session_health_config["interval_hours"] * 3600
+                health_checker.HEALTH_CHECK_INTERVAL = session_health_config["interval_hours"] * 3600
             health_checker.start()
-            logger.info(f"Session health checker started (interval={health_checker.CHECK_INTERVAL // 3600}h)")
+            logger.info(f"Session health checker started (interval={health_checker.HEALTH_CHECK_INTERVAL // 3600}h)")
 
         # Heartbeat thread
         HeartbeatThread().start()
