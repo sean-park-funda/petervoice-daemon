@@ -23,7 +23,7 @@ from daemon.worker import Worker
 from daemon.health import SessionHealthChecker
 from daemon.syncers.secrets import SecretsSyncer
 from daemon.syncers.skills import SkillsSyncer
-from daemon.syncers.docs import DocsSyncer
+
 from daemon.syncers.auto_updater import AutoUpdater
 from daemon.summon import SummonManager
 from daemon.heartbeat import HeartbeatThread
@@ -165,6 +165,37 @@ def _save_config_fields(**fields):
     config.update(fields)
 
 
+def _fetch_tunnel_token_from_cf(tunnel_id: str) -> str | None:
+    """Cloudflare API에서 기존 터널의 토큰을 직접 가져온다."""
+    import urllib.request
+    cf_token = os.environ.get("CLOUDFLARE_API_TOKEN", "")
+    if not cf_token:
+        return None
+    try:
+        # 계정 ID 조회
+        req = urllib.request.Request(
+            "https://api.cloudflare.com/client/v4/accounts",
+            headers={"Authorization": f"Bearer {cf_token}"}
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            accounts = json.loads(resp.read())
+        account_id = accounts.get("result", [{}])[0].get("id")
+        if not account_id:
+            return None
+        # 터널 토큰 조회
+        req = urllib.request.Request(
+            f"https://api.cloudflare.com/client/v4/accounts/{account_id}/cfd_tunnel/{tunnel_id}/token",
+            headers={"Authorization": f"Bearer {cf_token}"}
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+        if data.get("success"):
+            return data["result"]
+    except Exception as e:
+        logger.warning(f"[tunnel] Failed to fetch token from Cloudflare API: {e}")
+    return None
+
+
 def _ensure_tunnel(api_key: str, username: str, cloudflared_path: str) -> str | None:
     """Cloudflare Tunnel이 설정되어 있는지 확인하고, 없으면 자동 생성.
     tunnel_id를 반환. 실패 시 None."""
@@ -176,18 +207,26 @@ def _ensure_tunnel(api_key: str, username: str, cloudflared_path: str) -> str | 
 
     # --- 1. 터널이 없으면 서버 API로 생성 ---
     if not tunnel_id or not tunnel_token:
-        logger.info(f"[tunnel] No tunnel configured, creating via API for user '{username}'...")
-        result = api_request(api_key, "POST", "/api/tunnel/create", body={"username": username})
-        if not result or not result.get("tunnelId"):
-            logger.error(f"[tunnel] Failed to create tunnel: {result}")
-            return None
-        tunnel_id = result["tunnelId"]
-        tunnel_token = result["tunnelToken"]
-        _save_config_fields(
-            cloudflare_tunnel_id=tunnel_id,
-            cloudflare_tunnel_token=tunnel_token,
-        )
-        logger.info(f"[tunnel] Created tunnel: pv-{username} ({tunnel_id[:8]}...)")
+        # 터널 ID는 있지만 토큰만 없는 경우: Cloudflare API에서 직접 가져오기
+        if tunnel_id and not tunnel_token:
+            tunnel_token = _fetch_tunnel_token_from_cf(tunnel_id)
+            if tunnel_token:
+                _save_config_fields(cloudflare_tunnel_token=tunnel_token)
+                logger.info(f"[tunnel] Token recovered from Cloudflare API for {tunnel_id[:8]}...")
+
+        if not tunnel_id or not tunnel_token:
+            logger.info(f"[tunnel] No tunnel configured, creating via API for user '{username}'...")
+            result = api_request(api_key, "POST", "/api/tunnel/create", body={"username": username})
+            if not result or not result.get("tunnelId"):
+                logger.error(f"[tunnel] Failed to create tunnel: {result}")
+                return None
+            tunnel_id = result["tunnelId"]
+            tunnel_token = result["tunnelToken"]
+            _save_config_fields(
+                cloudflare_tunnel_id=tunnel_id,
+                cloudflare_tunnel_token=tunnel_token,
+            )
+            logger.info(f"[tunnel] Created tunnel: pv-{username} ({tunnel_id[:8]}...)")
 
     # --- 2. cloudflared 프로세스 확인/시작 ---
     cf_running = False
@@ -260,6 +299,23 @@ def _ensure_dns_route(api_key: str, username: str, tunnel_id: str):
         logger.warning(f"[tunnel] DNS route registration result: {result}")
 
     return f"https://{hostname}"
+
+
+def _check_cloudflared_health():
+    """cloudflared가 죽었으면 _ensure_home_portal()을 다시 호출하여 복구."""
+    if not config.get("home_portal_enabled", True):
+        return
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", "cloudflared.*tunnel.*run"],
+            capture_output=True, text=True
+        )
+        if result.returncode != 0:
+            logger.warning("[tunnel] cloudflared not running, recovering...")
+            _ensure_home_portal()
+    except Exception:
+        pass
 
 
 def _ensure_home_portal():
@@ -371,10 +427,7 @@ def main():
         # Start syncer threads
         SecretsSyncer().start()
         SkillsSyncer().start()
-        if config.get("docs_sync_enabled", False):
-            DocsSyncer().start()
-        else:
-            logger.info("[docs] Syncer disabled (docs_sync_enabled=false)")
+        # DocsSyncer removed — docs are now served via Home Portal API directly
 
         AutoUpdater().start()
         SummonManager().start()
@@ -434,6 +487,12 @@ def main():
                     _process_pending_resets()
                 except Exception as e:
                     logger.warning(f"pending_resets check error: {e}")
+
+            if watchdog_tick % 60 == 0:
+                try:
+                    _check_cloudflared_health()
+                except Exception as e:
+                    logger.warning(f"cloudflared health check error: {e}")
 
             if watchdog_tick % 30 == 0 and user_id is not None:
                 try:

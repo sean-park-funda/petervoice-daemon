@@ -48,7 +48,7 @@ DOWNLOADS_DIR = DAEMON_DIR / "downloads"
 SECRETS_ENV_PATH = DAEMON_DIR / ".env.secrets"
 MANAGER_STATE_PATH = DAEMON_DIR / "manager_state.json"
 WORKFLOWS_DIR = DAEMON_DIR / "workflows"
-DOCS_STATE_PATH = DAEMON_DIR / "docs_state.json"
+DOCS_STATE_PATH = DAEMON_DIR / "docs_state.json"  # legacy, kept for cleanup
 RESTART_TRIGGER_PATH = DAEMON_DIR / "restart_trigger.json"
 
 # ─── Constants ──────────────────────────────────────────────────
