@@ -794,7 +794,10 @@ function validateDocsDir(dir) {
 function apiDocsList(docsDir) {
   const validated = validateDocsDir(docsDir);
   if (!validated) return { error: "접근 불가 경로" };
-  if (!fs.existsSync(validated)) return { documents: [] };
+  if (!fs.existsSync(validated)) {
+    try { fs.mkdirSync(validated, { recursive: true }); } catch {}
+    return { documents: [] };
+  }
 
   // 계층 구조로 반환 (DocumentsPanel Doc 인터페이스 호환)
   const foldersMap = {}; // relPath → folder doc
@@ -1325,6 +1328,22 @@ const server = http.createServer((req, res) => {
         }
         json({ ok: true });
       } catch (e) { json({ error: "삭제 실패: " + e.message }, 500); }
+    }).catch(e => json({ error: e.message }, 400));
+  }
+  // Docs API: /api/docs/write — 텍스트 파일 생성/수정
+  else if (pathname === "/api/docs/write" && req.method === "POST") {
+    readBody().then(body => {
+      const { dir, path: filePath, content } = body;
+      if (!dir || !filePath || content == null) return json({ error: "dir, path, content 필요" }, 400);
+      const base = validateDocsDir(dir);
+      if (!base) return json({ error: "접근 불가 경로" }, 403);
+      const full = path.resolve(base, filePath);
+      if (!full.startsWith(base)) return json({ error: "접근 불가 경로" }, 403);
+      try {
+        fs.mkdirSync(path.dirname(full), { recursive: true });
+        fs.writeFileSync(full, content, "utf-8");
+        json({ ok: true, path: filePath, size: Buffer.byteLength(content, "utf-8") });
+      } catch (e) { json({ error: "저장 실패: " + e.message }, 500); }
     }).catch(e => json({ error: e.message }, 400));
   }
   // Skills API: /api/skills — 설치된 스킬 목록
