@@ -458,7 +458,6 @@ class ManagerThread(threading.Thread):
         return task
 
     CHECKPOINT_INTERVAL = 5   # 매 N턴마다 매니저 판단
-    WARMUP_TURNS = 2          # 첫 N턴은 매니저 풀 판단
 
     def _run_deep_task(self, task_entry: dict):
         project = task_entry["project"]
@@ -474,21 +473,8 @@ class ManagerThread(threading.Thread):
         self.state["current_phase"] = f"deep_task:{project}"
         self._save_state()
 
-        context_block = ""
-        if context:
-            context_block = (
-                f"\n\n## 프로젝트 최근 대화 (맥락)\n"
-                f"{context}\n"
-                f"---\n"
-            )
-
-        step = self._ask_manager(
-            f"유저가 '{project}' 프로젝트에 다음 작업을 요청했다:\n\n"
-            f"{task_text}"
-            f"{context_block}\n\n"
-            f"위 대화 맥락을 참고하여, 프로젝트 Claude가 1턴(약 2분)에 완료할 수 있는 첫 번째 단계를 구체적 지시로 만들어라.\n"
-            f"지시만 출력해라."
-        )
+        # 첫 지시는 유저 원문 그대로 전달 (매니저가 가공하지 않음)
+        step = task_text
 
         turn = 0
         timeout_streak = 0
@@ -502,12 +488,10 @@ class ManagerThread(threading.Thread):
                     break
                 continue
 
-            is_warmup = (turn <= self.WARMUP_TURNS)
-            is_checkpoint = (turn > self.WARMUP_TURNS and turn % self.CHECKPOINT_INTERVAL == 0)
+            is_checkpoint = (turn > 1 and turn % self.CHECKPOINT_INTERVAL == 0)
 
             logger.info(
                 f"[manager] Deep task turn {turn}/{max_turns}: {project}"
-                f"{' [warmup]' if is_warmup else ''}"
                 f"{' [checkpoint]' if is_checkpoint else ''}"
             )
 
@@ -516,50 +500,52 @@ class ManagerThread(threading.Thread):
             if not result:
                 timeout_streak += 1
                 logger.warning(f"[manager] Deep task timeout (turn {turn}, streak {timeout_streak}): {project}")
-                # 타임아웃이 3연속이면 중단
                 if timeout_streak >= 3:
                     self._post_to_user(
                         f"[{project}] 3턴 연속 응답 없음 (turn {turn}/{max_turns}). 작업을 중단합니다.\n"
                         f"→ {task_text[:100]}"
                     )
                     break
-                # 그 외에는 다음 턴 계속 (체크포인트에서 매니저가 판단)
                 step = "이전 작업이 타임아웃됐습니다. 이어서 다음 항목을 처리하세요."
                 continue
             else:
                 timeout_streak = 0
 
-            if is_warmup or is_checkpoint:
-                # ── 매니저 판단 턴 ──
+            if is_checkpoint:
+                # ── 체크포인트: 매니저는 감독관 역할만 ──
                 judgment = self._ask_manager(
                     f"[{project}] 원래 작업: {task_text}\n\n"
-                    f"현재 {turn}/{max_turns}턴. 최근 결과:\n{result[:2000]}\n\n"
-                    f"이 작업이 완료됐으면 'DONE'만 출력해라.\n"
-                    f"아직 할 일이 남았으면 다음 단계의 구체적 지시를 출력해라 (DONE이라는 단어 없이)."
+                    f"현재 {turn}/{max_turns}턴. 에이전트의 최근 결과:\n{result[:2000]}\n\n"
+                    f"너는 감독관이다. 프로젝트 에이전트가 전문가이므로 구체적 지시를 내리지 마라.\n"
+                    f"다음 중 하나만 출력해라:\n"
+                    f"1. 작업이 완료됐으면: DONE\n"
+                    f"2. 잘 진행 중이면: CONTINUE\n"
+                    f"3. 방향이 의심되면: QUESTION: (에이전트에게 되물을 질문 1개)"
                 )
 
-                if "DONE" in judgment.upper().split():
+                upper = judgment.upper().strip()
+                if "DONE" in upper.split():
                     logger.info(f"[manager] Deep task completed in {turn} turns: {project}")
-                    summary = self._ask_manager(
-                        f"[{project}] 작업 완료 보고.\n"
-                        f"원래 작업: {task_text}\n"
-                        f"총 {turn}턴 실행.\n"
-                        f"마지막 결과: {result[:2000]}\n\n"
-                        f"유저에게 완료 보고를 해라. 형식: '완료: ...'"
+                    self._post_to_user(
+                        f"**[{project}] /do 완료** ({turn}턴)\n→ {task_text[:100]}"
                     )
-                    self._post_to_user(summary)
                     break
 
-                step = judgment
+                # 유저에게 진행 보고
+                self._post_to_user(
+                    f"**[{turn}/{max_turns}] → {project}**\n"
+                    f"{judgment[:300]}"
+                )
 
-                # 체크포인트에서만 유저에게 진행 보고
-                if is_checkpoint:
-                    self._post_to_user(
-                        f"**[{turn}/{max_turns}] → {project}**\n"
-                        f"{judgment[:300]}"
-                    )
+                if "QUESTION:" in upper:
+                    # 매니저의 질문을 에이전트에게 전달
+                    question = judgment.split(":", 1)[-1].strip() if ":" in judgment else judgment
+                    step = question
+                else:
+                    # CONTINUE — 에이전트에게 계속 진행 지시
+                    step = "이어서 다음 항목을 처리하세요."
             else:
-                # ── 직접 주입 모드: 매니저 안 거침 ──
+                # ── 직접 주입: 매니저 안 거침 ──
                 step = "이어서 다음 항목을 처리하세요."
 
         else:
