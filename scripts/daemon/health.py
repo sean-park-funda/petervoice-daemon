@@ -160,7 +160,7 @@ curl -X POST "$API_URL/api/relay/message" \\
                 p.get("id") == SESSION_MANAGER_PROJECT for p in result["projects"]
             )
         else:
-            self._has_session_manager = False
+            logger.warning("[session-health] Failed to fetch projects — will retry next tick")
             return False
 
         if exists:
@@ -178,7 +178,6 @@ curl -X POST "$API_URL/api/relay/message" \\
 
         if not create_result or "error" in str(create_result).lower():
             logger.error(f"[session-health] Failed to create project: {create_result}")
-            self._has_session_manager = False
             return False
 
         # 2. Set model to haiku
