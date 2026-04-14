@@ -392,10 +392,25 @@ def _ensure_home_portal():
         logger.error(f"[home-portal] Error: {e}")
 
 
+def _get_git_version():
+    """Return short commit hash and date, or 'unknown'."""
+    try:
+        import subprocess
+        repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        result = subprocess.run(
+            ["git", "log", "-1", "--format=%h %ai"],
+            cwd=repo, capture_output=True, text=True, timeout=5
+        )
+        return result.stdout.strip() if result.returncode == 0 else "unknown"
+    except Exception:
+        return "unknown"
+
+
 def main():
     setup_logging()
     logger.info("=" * 60)
-    logger.info("Claude Daemon starting...")
+    version = _get_git_version()
+    logger.info(f"Claude Daemon starting... (version: {version})")
 
     cleanup_stale_state()
 
