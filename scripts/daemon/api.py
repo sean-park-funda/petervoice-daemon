@@ -15,6 +15,7 @@ def api_request(api_key: str, method: str, path: str, body: dict | None = None, 
     data = json.dumps(body).encode("utf-8") if body else None
     req = urllib.request.Request(url, data=data, method=method)
     req.add_header("Authorization", f"Bearer {api_key}")
+    req.add_header("X-Api-Key", api_key)
     req.add_header("Content-Type", "application/json")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
