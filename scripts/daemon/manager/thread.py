@@ -437,10 +437,11 @@ class ManagerThread(threading.Thread):
 
     # ── Deep task queue ──
 
-    def enqueue_deep_task(self, project: str, task: str, context: str = ""):
+    def enqueue_deep_task(self, project: str, task: str, context: str = "", max_turns: int = 50):
         task_entry = {
             "project": project, "task": task,
-            "context": context, "queued_at": datetime.now().isoformat(),
+            "context": context, "max_turns": max_turns,
+            "queued_at": datetime.now().isoformat(),
         }
         self.state.setdefault("task_queue", []).append(task_entry)
         self._save_state()
@@ -456,14 +457,16 @@ class ManagerThread(threading.Thread):
         self._save_state()
         return task
 
+    CHECKPOINT_INTERVAL = 5   # 매 N턴마다 매니저 판단
+    WARMUP_TURNS = 2          # 첫 N턴은 매니저 풀 판단
+
     def _run_deep_task(self, task_entry: dict):
         project = task_entry["project"]
         task_text = task_entry["task"]
         context = task_entry.get("context", "")
-        wf = self._get_workflow(project)
-        max_turns = wf.get("agent", {}).get("max_turns", 10)
+        max_turns = task_entry.get("max_turns", 50)
 
-        logger.info(f"[manager] ═══ Deep task: {project} ═══")
+        logger.info(f"[manager] ═══ Deep task: {project} (max {max_turns} turns) ═══")
         logger.info(f"[manager] Task: {task_text}")
         if context:
             logger.info(f"[manager] Context: {len(context)} chars from recent conversation")
@@ -488,9 +491,9 @@ class ManagerThread(threading.Thread):
         )
 
         turn = 0
+        timeout_streak = 0
         while turn < max_turns:
             turn += 1
-            logger.info(f"[manager] Deep task turn {turn}/{max_turns}: {project}")
 
             if self._is_project_busy(project):
                 logger.info(f"[manager] {project} busy, waiting 30s...")
@@ -499,57 +502,72 @@ class ManagerThread(threading.Thread):
                     break
                 continue
 
-            turn_start = time.time()
+            is_warmup = (turn <= self.WARMUP_TURNS)
+            is_checkpoint = (turn > self.WARMUP_TURNS and turn % self.CHECKPOINT_INTERVAL == 0)
+
+            logger.info(
+                f"[manager] Deep task turn {turn}/{max_turns}: {project}"
+                f"{' [warmup]' if is_warmup else ''}"
+                f"{' [checkpoint]' if is_checkpoint else ''}"
+            )
+
             result = self._inject_and_wait(project, step)
 
             if not result:
-                if self._check_stall(project, turn_start):
-                    self._post_to_user(f"[{project}] 작업 중 응답 없음 (turn {turn}). 나중에 재시도합니다.")
-                    self._schedule_retry(project, "deep task stalled")
-                else:
-                    self._post_to_user(f"[{project}] 작업 중 응답 없음 (turn {turn}).")
-                break
+                timeout_streak += 1
+                logger.warning(f"[manager] Deep task timeout (turn {turn}, streak {timeout_streak}): {project}")
+                # 타임아웃이 3연속이면 중단
+                if timeout_streak >= 3:
+                    self._post_to_user(
+                        f"[{project}] 3턴 연속 응답 없음 (turn {turn}/{max_turns}). 작업을 중단합니다.\n"
+                        f"→ {task_text[:100]}"
+                    )
+                    break
+                # 그 외에는 다음 턴 계속 (체크포인트에서 매니저가 판단)
+                step = "이전 작업이 타임아웃됐습니다. 이어서 다음 항목을 처리하세요."
+                continue
+            else:
+                timeout_streak = 0
 
-            progress = self._ask_manager(
-                f"[{project}] 작업 진행 보고 (turn {turn}/{max_turns}).\n\n"
-                f"지시: {step[:500]}\n\n"
-                f"결과: {result[:2000]}\n\n"
-                f"유저에게 한 줄로 진행상황을 알려줘. 형식: '[{turn}/{max_turns}] ...'")
-            result_preview = result[:500] + ('...' if len(result) > 500 else '')
-            self._post_to_user(
-                f"**[Turn {turn}/{max_turns}] → {project}**\n\n"
-                f"**지시:**\n{step}\n\n"
-                f"**결과 요약:** {progress}\n\n"
-                f"**응답 앞부분:**\n{result_preview}"
-            )
-
-            judgment = self._ask_manager(
-                f"[{project}] 원래 작업: {task_text}\n\n"
-                f"지금까지 {turn}턴 실행했고, 마지막 결과:\n{result[:2000]}\n\n"
-                f"이 작업이 완료됐으면 'DONE'만 출력해라.\n"
-                f"아직 할 일이 남았으면 다음 단계의 구체적 지시를 출력해라 (DONE이라는 단어 없이)."
-            )
-
-            if "DONE" in judgment.upper().split():
-                logger.info(f"[manager] Deep task completed in {turn} turns: {project}")
-                summary = self._ask_manager(
-                    f"[{project}] 작업 완료 보고.\n"
-                    f"원래 작업: {task_text}\n"
-                    f"총 {turn}턴 실행.\n"
-                    f"마지막 결과: {result[:2000]}\n\n"
-                    f"유저에게 완료 보고를 해라. 형식: '완료: ...'"
+            if is_warmup or is_checkpoint:
+                # ── 매니저 판단 턴 ──
+                judgment = self._ask_manager(
+                    f"[{project}] 원래 작업: {task_text}\n\n"
+                    f"현재 {turn}/{max_turns}턴. 최근 결과:\n{result[:2000]}\n\n"
+                    f"이 작업이 완료됐으면 'DONE'만 출력해라.\n"
+                    f"아직 할 일이 남았으면 다음 단계의 구체적 지시를 출력해라 (DONE이라는 단어 없이)."
                 )
-                self._post_to_user(summary)
-                break
 
-            step = judgment
+                if "DONE" in judgment.upper().split():
+                    logger.info(f"[manager] Deep task completed in {turn} turns: {project}")
+                    summary = self._ask_manager(
+                        f"[{project}] 작업 완료 보고.\n"
+                        f"원래 작업: {task_text}\n"
+                        f"총 {turn}턴 실행.\n"
+                        f"마지막 결과: {result[:2000]}\n\n"
+                        f"유저에게 완료 보고를 해라. 형식: '완료: ...'"
+                    )
+                    self._post_to_user(summary)
+                    break
+
+                step = judgment
+
+                # 체크포인트에서만 유저에게 진행 보고
+                if is_checkpoint:
+                    self._post_to_user(
+                        f"**[{turn}/{max_turns}] → {project}**\n"
+                        f"{judgment[:300]}"
+                    )
+            else:
+                # ── 직접 주입 모드: 매니저 안 거침 ──
+                step = "이어서 다음 항목을 처리하세요."
 
         else:
             logger.info(f"[manager] Deep task max turns ({max_turns}) reached: {project}")
             self._post_to_user(
-                f"[{project}] 작업이 {max_turns}턴 내에 완료되지 않았습니다.\n"
+                f"[{project}] 작업이 {max_turns}턴 완료.\n"
                 f"→ {task_text[:100]}\n"
-                f"필요하면 /do 로 다시 시작해주세요."
+                f"이어서 하려면 /do 로 다시 시작해주세요."
             )
 
         self.state["current_phase"] = "idle"

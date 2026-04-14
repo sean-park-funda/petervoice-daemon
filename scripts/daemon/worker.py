@@ -198,16 +198,25 @@ class Worker(threading.Thread):
         if text.startswith("/do "):
             task_text = text[4:].strip()
             if not task_text:
-                self.reply("사용법: /do <작업 지시>", reply_to=[msg_id], project=project)
+                self.reply("사용법: /do <작업 지시> 또는 /do <턴수> <작업 지시>", reply_to=[msg_id], project=project)
                 dequeue_message(msg_id)
                 return
             if g._manager_instance is None:
                 self.reply("매니저가 비활성화 상태입니다.", reply_to=[msg_id], project=project)
                 dequeue_message(msg_id)
                 return
+            max_turns = 50
+            parts = task_text.split(None, 1)
+            if parts and parts[0].isdigit():
+                max_turns = int(parts[0])
+                task_text = parts[1] if len(parts) > 1 else ""
+                if not task_text:
+                    self.reply("사용법: /do <턴수> <작업 지시>", reply_to=[msg_id], project=project)
+                    dequeue_message(msg_id)
+                    return
             context = _fetch_recent_conversation(project, limit=10)
-            g._manager_instance.enqueue_deep_task(project, task_text, context=context)
-            self.reply(f"매니저에 작업을 등록했습니다. 완료되면 알려드릴게요.\n→ {task_text[:100]}", reply_to=[msg_id], project=project)
+            g._manager_instance.enqueue_deep_task(project, task_text, context=context, max_turns=max_turns)
+            self.reply(f"매니저에 작업을 등록했습니다 (최대 {max_turns}턴). 완료되면 알려드릴게요.\n→ {task_text[:100]}", reply_to=[msg_id], project=project)
             dequeue_message(msg_id)
             return
 
