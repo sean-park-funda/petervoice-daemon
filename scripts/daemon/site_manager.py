@@ -22,6 +22,13 @@ PORT_MAX = 3099
 SITE_DOMAIN = "peter-voice.site"
 
 
+def _resolve_username(username: str = None) -> str:
+    """username fallback: 명시적 값 → customer → bot_name → 'user'"""
+    if username:
+        return username
+    return config.get("customer") or config.get("bot_name", "user")
+
+
 def _sites_state_path() -> Path:
     return SITES_DIR / "sites.json"
 
@@ -221,8 +228,7 @@ def publish(project_id: str, project_dir: str, username: str = None) -> dict:
     프로젝트를 로컬에서 빌드 & 서빙 + Cloudflare 라우팅 등록.
     Returns: { url, port, hostname } on success, { error } on failure.
     """
-    if not username:
-        username = config.get("bot_name", "user")
+    username = _resolve_username(username)
 
     # 프레임워크 감지
     framework = _detect_framework(project_dir)
@@ -288,8 +294,7 @@ def publish(project_id: str, project_dir: str, username: str = None) -> dict:
 
 def unpublish(project_id: str, username: str = None) -> dict:
     """사이트 중지 + Cloudflare 라우팅 제거"""
-    if not username:
-        username = config.get("bot_name", "user")
+    username = _resolve_username(username)
 
     sites = _load_sites()
     site = sites.get(project_id)
@@ -372,8 +377,7 @@ HOME_PORTAL_LABEL = "com.petervoice.home-portal"
 def start_home_portal(username: str = None) -> dict:
     """홈 포탈 웹서버 시작 + Cloudflare 라우팅 등록.
     username: 유저 고유 아이디 (DB username). 터널 hostname에 사용."""
-    if not username:
-        username = config.get("bot_name", "user")
+    username = _resolve_username(username)
     # username은 이미 [a-z0-9_] 형식이지만 안전하게 정리
     username_slug = username.lower().replace(" ", "-").replace("_", "-")
     username_slug = "".join(c for c in username_slug if c.isalnum() or c == "-")
