@@ -351,6 +351,13 @@ def run_claude(prompt: str, project: str, _retry_count: int = 0, _overload_retry
                 if _retry_count >= MAX_CONTEXT_OVERFLOW_RETRIES:
                     return ("(컨텍스트 초과 - 최대 재시도 횟수 초과)", None, tool_lines)
                 return run_claude(prompt, project, _retry_count + 1)
+            if "no conversation found" in stderr_output.lower():
+                logger.warning(f"[{bot_name}] Invalid session for {project}, clearing and retrying")
+                reset_session(project)
+                claude_semaphore.release()
+                if _retry_count >= MAX_CONTEXT_OVERFLOW_RETRIES:
+                    return ("(세션 오류 - 최대 재시도 횟수 초과)", None, tool_lines)
+                return run_claude(prompt, project, _retry_count + 1)
             return (f"(Claude 오류: exit {proc.returncode})", new_session_id, tool_lines)
 
         if not response_text:
