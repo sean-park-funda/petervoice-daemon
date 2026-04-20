@@ -128,6 +128,8 @@ def build_branch_prompt(branch: dict) -> str:
         # 순수 브랜치 → 간결한 브랜치 규칙
         branch_num = branch.get("branch_number", branch.get("id"))
         branch_id = branch.get("id")
+        # 브랜치 추가 프롬프트 (유저가 웹 UI에서 설정)
+        branch_prompt = branch.get("prompt") or ""
         branch_rules = f"""# 브랜치 #{branch_num}: {branch.get('title', '')} (내부ID: {branch_id})
 소속 프로젝트: {project_id}
 
@@ -150,7 +152,7 @@ curl -X PATCH "$API_URL/api/branches/{branch_id}" \\
   -d '{{"status": "archived"}}'
 ```
 """
-        combined = "\n\n".join(p for p in [system_prompt_pv, common_prompt, project_prompt, branch_rules, relay_guide, conversation_hint] if p)
+        combined = "\n\n".join(p for p in [system_prompt_pv, common_prompt, project_prompt, branch_prompt, branch_rules, relay_guide, conversation_hint] if p)
         return combined
 
 
