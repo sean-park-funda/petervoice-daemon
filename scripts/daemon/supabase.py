@@ -22,6 +22,16 @@ def resolve_user_id() -> int | None:
     result = api_request(api_key, "GET", "/api/bot/me", timeout=5)
     if result and "userId" in result:
         g._cached_user_id = result["userId"]
+        # 기존 고객 config에 username이 없으면 서버에서 받아 저장
+        if result.get("username") and not config.get("username"):
+            config["username"] = result["username"]
+            try:
+                g.CONFIG_PATH.write_text(
+                    json.dumps(config, indent=2, ensure_ascii=False)
+                )
+                logger.info(f"Synced username to config: {result['username']}")
+            except Exception as e:
+                logger.warning(f"Failed to save username to config: {e}")
         return g._cached_user_id
     logger.warning("Failed to resolve user_id from api_key")
     return None
