@@ -23,10 +23,11 @@ SITE_DOMAIN = "peter-voice.site"
 
 
 def _resolve_username(username: str = None) -> str:
-    """username fallback: 명시적 값 → customer → bot_name → 'user'"""
+    """username fallback: 명시적 값 → config username → customer → 'user'
+    bot_name은 에이전트 이름이라 유저 고유값이 아니므로 사용하지 않음."""
     if username:
         return username
-    return config.get("customer") or config.get("bot_name", "user")
+    return config.get("username") or config.get("customer") or "user"
 
 
 def _sites_state_path() -> Path:

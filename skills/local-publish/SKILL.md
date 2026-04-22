@@ -49,7 +49,7 @@ if c.get("cloudflare_tunnel_id"):
 else:
     api_url = c.get("api_url", "https://peter-voice.vercel.app")
     api_key = c["api_key"]
-    username = c.get("bot_name", "user").lower().replace(" ", "-")
+    username = (c.get("username") or c.get("customer") or "user").lower().replace(" ", "-")
 
     data = json.dumps({"username": username}).encode()
     req = urllib.request.Request(
@@ -146,11 +146,11 @@ python3 "$PUBLISH_SCRIPT" publish <project_id> <project_dir> --username <usernam
 
 - `project_id`: 프로젝트명 (URL에 사용됨)
 - `project_dir`: 프로젝트 절대 경로
-- `--username`: config의 bot_name에서 추출
+- `--username`: config의 username에서 추출 (유저 고유 ID)
 
 username 추출:
 ```bash
-python3 -c "import json; c=json.load(open('$HOME/.claude-daemon/config.json')); print(c.get('bot_name','user').lower().replace(' ','-'))"
+python3 -c "import json; c=json.load(open('$HOME/.claude-daemon/config.json')); print((c.get('username') or c.get('customer') or 'user').lower().replace(' ','-'))"
 ```
 
 ## 재빌드 (코드 수정 후)
