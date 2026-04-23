@@ -16,6 +16,7 @@ from daemon.api import api_request, mark_message_processed
 from daemon.supabase import (
     resolve_user_id, get_project_dir, fetch_prompt_from_supabase,
     _fetch_recent_conversation, clear_stop_requested,
+    sync_null_directories,
 )
 from daemon.sessions import (
     get_session_id, session_key, reset_session, save_session_context,
@@ -331,6 +332,7 @@ class Worker(threading.Thread):
                 now = time.time()
                 if now - last_heartbeat > 30:
                     self.heartbeat(is_working=False)
+                    sync_null_directories()
                     last_heartbeat = now
 
                 messages = self.poll()

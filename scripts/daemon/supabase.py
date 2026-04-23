@@ -72,6 +72,25 @@ def _update_project_directory(project: str, directory: str):
         logger.warning(f"[project] Failed to register directory for {project}: {e}")
 
 
+def sync_null_directories():
+    """directory가 null인 프로젝트를 찾아 자동 설정. heartbeat 주기로 호출."""
+    from daemon.globals import DAEMON_DIR
+    api_key = config.get("api_key", "")
+    if not api_key:
+        return
+    try:
+        result = api_request(api_key, "GET", "/api/projects", timeout=5)
+        if not result or "projects" not in result:
+            return
+        for p in result["projects"]:
+            if not p.get("directory"):
+                auto_dir = str(DAEMON_DIR / "projects" / p["id"])
+                os.makedirs(auto_dir, exist_ok=True)
+                _update_project_directory(p["id"], auto_dir)
+    except Exception as e:
+        logger.warning(f"[project] sync_null_directories error: {e}")
+
+
 def get_project_dir(project: str) -> str:
     from daemon.globals import DAEMON_DIR
     # 1) API에서 directory 조회
