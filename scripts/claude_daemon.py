@@ -13,7 +13,7 @@ import signal
 
 import daemon.globals as g
 from daemon.globals import config, shutdown_event, logger
-from daemon.config import setup_logging, load_config, acquire_pid_lock, release_pid_lock, cleanup_stale_state
+from daemon.config import setup_logging, load_config, acquire_pid_lock, release_pid_lock, cleanup_stale_state, ensure_default_projects
 from daemon.sessions import load_sessions, _process_pending_resets
 from daemon.tasks import load_tasks
 from daemon.prompts import ensure_template
@@ -438,6 +438,9 @@ def main():
             logger.info(f"User ID: {uid}")
         else:
             logger.warning("Could not resolve user_id from api_key — force_restart/project queries may fail")
+
+        # Ensure default projects (sysadmin, manager) exist
+        ensure_default_projects()
 
         # Start syncer threads
         SecretsSyncer().start()
