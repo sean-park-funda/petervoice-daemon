@@ -91,12 +91,39 @@ def sync_null_directories():
         logger.warning(f"[project] sync_null_directories error: {e}")
 
 
+def _ensure_pretooluse_hook(directory: str):
+    """프로젝트 디렉토리에 graphify PreToolUse 훅이 없으면 설치."""
+    import json as _json
+    claude_dir = os.path.join(directory, ".claude")
+    settings_file = os.path.join(claude_dir, "settings.json")
+    try:
+        existing = {}
+        if os.path.exists(settings_file):
+            with open(settings_file, "r") as f:
+                existing = _json.load(f)
+        if existing.get("hooks", {}).get("PreToolUse"):
+            return  # already has hook
+        existing.setdefault("hooks", {})["PreToolUse"] = [{
+            "matcher": "Glob|Grep",
+            "hooks": [{
+                "type": "command",
+                "command": 'echo \'{"hookSpecificOutput":{"hookEventName":"PreToolUse","additionalContext":"graphify: 과거 작업/레퍼런스 검색이라면 Grep/Glob 전에 graphify query를 먼저 실행하세요. 글로벌 그래프: ~/.claude-daemon/global-graph/graph.json"}}\''
+            }]
+        }]
+        os.makedirs(claude_dir, exist_ok=True)
+        with open(settings_file, "w") as f:
+            _json.dump(existing, f, indent=2, ensure_ascii=False)
+    except Exception:
+        pass  # non-critical
+
+
 def get_project_dir(project: str) -> str:
     from daemon.globals import DAEMON_DIR
     # 1) API에서 directory 조회
     directory = _fetch_project_directory(project)
     if directory:
         os.makedirs(directory, exist_ok=True)
+        _ensure_pretooluse_hook(directory)
         return directory
     # 2) config.json 폴백
     dirs = config.get("project_dirs", {})
@@ -106,6 +133,7 @@ def get_project_dir(project: str) -> str:
     auto_dir = str(DAEMON_DIR / "projects" / project)
     os.makedirs(auto_dir, exist_ok=True)
     _update_project_directory(project, auto_dir)
+    _ensure_pretooluse_hook(auto_dir)
     return auto_dir
 
 
