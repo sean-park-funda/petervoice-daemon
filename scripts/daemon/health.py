@@ -28,8 +28,8 @@ class SessionHealthChecker(threading.Thread):
         infos = []
         with sessions_lock:
             for key, sess in g.sessions.items():
-                parts = key.split(":", 1)
-                project = parts[0] if parts else key
+                # key = "{project}:{task}" — project itself may contain colons (e.g. "branch:135")
+                project = key.rsplit(":", 1)[0] if ":" in key else key
                 if project == SESSION_MANAGER_PROJECT:
                     continue
                 age_h = 0.0
@@ -243,6 +243,31 @@ curl -X POST "$API_URL/api/relay/message" \\
         else:
             logger.error("[session-health] Failed to send report")
 
+    MAX_REPORT_CHARS = 3000  # session-manager가 꼼꼼히 읽을 수 있는 크기
+    SNIPPET_CHARS = 1200     # 세션별 대화 스니펫 최대 길이
+
+    def _build_session_block(self, info: dict) -> str:
+        """Build a single session block for the stall report."""
+        project = info["project"]
+        conv = _fetch_recent_conversation(project, limit=5)
+        recent = conv[-self.SNIPPET_CHARS:] if conv else "(최근 대화 없음)"
+        return (
+            f"### {project}\n"
+            f"- 미사용: {info['idle_hours']}시간\n"
+            f"- 최근 대화:\n```\n{recent}\n```"
+        )
+
+    def _make_report_header(self, batch_num: int, total_batches: int, total_sessions: int) -> str:
+        ts = datetime.now().strftime('%Y-%m-%d %H:%M')
+        batch_label = f" ({batch_num}/{total_batches})" if total_batches > 1 else ""
+        return (
+            f"[stall-check 리포트{batch_label} — {ts}]\n\n"
+            f"활성 세션 {total_sessions}개 중 아래 세션들의 최근 대화입니다.\n"
+            f"중단된 세션이 있으면 릴레이로 깨워주세요.\n"
+            f"단, 릴레이는 '이어서 진행해주세요' 정도만 — 구체적 작업 지시는 절대 금지.\n"
+            f"없으면 '없음' 한 마디로.\n\n"
+        )
+
     def _check_stalls(self):
         """Collect conversation snippets and ask session-manager to judge stalls."""
         if not self._ensure_session_manager():
@@ -251,41 +276,54 @@ curl -X POST "$API_URL/api/relay/message" \\
         if not infos:
             return
 
-        session_lines = []
+        # Build blocks per session
+        blocks = []
         for info in infos:
-            project = info["project"]
-            conv = _fetch_recent_conversation(project, limit=5)
-            recent = conv[:400] if conv else "(최근 대화 없음)"
-            session_lines.append(
-                f"### {project}\n"
-                f"- 미사용: {info['idle_hours']}시간\n"
-                f"- 최근 대화:\n```\n{recent}\n```"
-            )
+            block = self._build_session_block(info)
+            blocks.append(block)
 
-        report = (
-            f"[stall-check 리포트 — {datetime.now().strftime('%Y-%m-%d %H:%M')}]\n\n"
-            f"활성 세션 {len(infos)}개의 최근 대화입니다.\n"
-            f"에이전트가 응답해야 하는데 못 하고 있는 경우가 있으면 릴레이로 깨워주세요.\n"
-            f"없으면 '없음'으로 짧게 답하세요.\n\n"
-            + "\n\n".join(session_lines)
-        )
+        # Pack blocks into batches that fit within MAX_REPORT_CHARS
+        batches: list[list[str]] = []
+        current_batch: list[str] = []
+        current_size = 0
+        header_size = len(self._make_report_header(1, 1, len(infos)))
 
+        for block in blocks:
+            block_size = len(block) + 2  # +2 for "\n\n" separator
+            if current_batch and current_size + block_size > self.MAX_REPORT_CHARS - header_size:
+                batches.append(current_batch)
+                current_batch = []
+                current_size = 0
+            current_batch.append(block)
+            current_size += block_size
+
+        if current_batch:
+            batches.append(current_batch)
+
+        # Send each batch
         api_key = config.get("api_key", "")
         if not api_key:
             return
 
-        result = api_request(api_key, "POST", "/api/bot/message", body={
-            "project": SESSION_MANAGER_PROJECT,
-            "text": report,
-            "type": "user",
-            "subtype": "stall_check_report",
-            "processed": False,
-        }, timeout=10)
+        sent = 0
+        for i, batch in enumerate(batches):
+            header = self._make_report_header(i + 1, len(batches), len(infos))
+            report = header + "\n\n".join(batch)
 
-        if result and result.get("id"):
-            logger.info(f"[stall-check] Report sent ({len(infos)} sessions)")
-        else:
-            logger.error("[stall-check] Failed to send report")
+            result = api_request(api_key, "POST", "/api/bot/message", body={
+                "project": SESSION_MANAGER_PROJECT,
+                "text": report,
+                "type": "user",
+                "subtype": "stall_check_report",
+                "processed": False,
+            }, timeout=10)
+
+            if result and result.get("id"):
+                sent += 1
+            else:
+                logger.error(f"[stall-check] Failed to send batch {i+1}/{len(batches)}")
+
+        logger.info(f"[stall-check] Sent {sent}/{len(batches)} batches ({len(infos)} sessions)")
 
     def run(self):
         logger.info("[session-health] Started (health=2h, stall=30m)")
