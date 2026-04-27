@@ -1346,6 +1346,68 @@ const server = http.createServer((req, res) => {
       } catch (e) { json({ error: "저장 실패: " + e.message }, 500); }
     }).catch(e => json({ error: e.message }, 400));
   }
+  // Graph API: /api/graph — graphify 지식 그래프 HTML 서빙
+  else if (pathname === "/api/graph" && req.method === "GET") {
+    const dir = url.searchParams.get("dir");
+    const type = url.searchParams.get("type") || "html"; // html | report | stats
+    if (!dir) return json({ error: "dir 파라미터 필요" }, 400);
+    const base = validateDocsDir(dir);
+    if (!base) return json({ error: "접근 불가 경로" }, 403);
+    const graphDir = path.join(base, "graphify-out");
+    if (!fs.existsSync(graphDir)) return json({ error: "그래프 없음" }, 404);
+
+    if (type === "html") {
+      const htmlPath = path.join(graphDir, "graph.html");
+      if (!fs.existsSync(htmlPath)) return json({ error: "graph.html 없음" }, 404);
+      const content = fs.readFileSync(htmlPath);
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Content-Length": content.length, "Cache-Control": "no-cache" });
+      res.end(content);
+    } else if (type === "report") {
+      const reportPath = path.join(graphDir, "GRAPH_REPORT.md");
+      if (!fs.existsSync(reportPath)) return json({ error: "GRAPH_REPORT.md 없음" }, 404);
+      json({ content: fs.readFileSync(reportPath, "utf-8") });
+    } else if (type === "stats") {
+      const graphPath = path.join(graphDir, "graph.json");
+      if (!fs.existsSync(graphPath)) return json({ error: "graph.json 없음" }, 404);
+      try {
+        const g = JSON.parse(fs.readFileSync(graphPath, "utf-8"));
+        const nodes = g.nodes ? g.nodes.length : 0;
+        const edges = (g.links || g.edges || []).length;
+        const stat = fs.statSync(graphPath);
+        json({ nodes, edges, updated: stat.mtime.toISOString() });
+      } catch (e) { json({ error: "파싱 실패" }, 500); }
+    } else {
+      json({ error: "type은 html, report, stats 중 하나" }, 400);
+    }
+  }
+  // Graph API: /api/graph/list — graphify가 빌드된 프로젝트 목록
+  else if (pathname === "/api/graph/list" && req.method === "GET") {
+    const projectsDir = path.join(os.homedir(), "Projects");
+    const globalDir = path.join(os.homedir(), ".claude-daemon", "global-graph");
+    const results = [];
+    // 글로벌 그래프
+    if (fs.existsSync(path.join(globalDir, "graph.json"))) {
+      try {
+        const g = JSON.parse(fs.readFileSync(path.join(globalDir, "graph.json"), "utf-8"));
+        const stat = fs.statSync(path.join(globalDir, "graph.json"));
+        results.push({ id: "_global", name: "글로벌 (전체 프로젝트)", dir: globalDir, nodes: g.nodes ? g.nodes.length : 0, edges: (g.links || g.edges || []).length, updated: stat.mtime.toISOString() });
+      } catch (e) {}
+    }
+    // 프로젝트별
+    if (fs.existsSync(projectsDir)) {
+      for (const entry of fs.readdirSync(projectsDir, { withFileTypes: true })) {
+        if (!entry.isDirectory()) continue;
+        const graphJson = path.join(projectsDir, entry.name, "graphify-out", "graph.json");
+        if (!fs.existsSync(graphJson)) continue;
+        try {
+          const g = JSON.parse(fs.readFileSync(graphJson, "utf-8"));
+          const stat = fs.statSync(graphJson);
+          results.push({ id: entry.name, name: entry.name, dir: path.join(projectsDir, entry.name), nodes: g.nodes ? g.nodes.length : 0, edges: (g.links || g.edges || []).length, updated: stat.mtime.toISOString() });
+        } catch (e) {}
+      }
+    }
+    json({ graphs: results });
+  }
   // Skills API: /api/skills — 설치된 스킬 목록
   else if (pathname === "/api/skills" && req.method === "GET") {
     const skillsDir = path.join(os.homedir(), ".claude", "skills");
