@@ -1376,8 +1376,27 @@ const server = http.createServer((req, res) => {
         const stat = fs.statSync(graphPath);
         json({ nodes, edges, updated: stat.mtime.toISOString() });
       } catch (e) { json({ error: "파싱 실패" }, 500); }
+    } else if (type === "json") {
+      const graphPath = path.join(graphDir, "graph.json");
+      if (!fs.existsSync(graphPath)) return json({ error: "graph.json 없음" }, 404);
+      try {
+        const raw = fs.readFileSync(graphPath, "utf-8");
+        const g = JSON.parse(raw);
+        const nodes = g.nodes || [];
+        const links = g.links || g.edges || [];
+        const hyperedges = g.hyperedges || (g.graph && g.graph.hyperedges) || [];
+        // degree 계산
+        const degreeMap = {};
+        links.forEach(l => {
+          degreeMap[l.source] = (degreeMap[l.source] || 0) + 1;
+          degreeMap[l.target] = (degreeMap[l.target] || 0) + 1;
+        });
+        nodes.forEach(n => { n.degree = degreeMap[n.id] || 0; });
+        const stat = fs.statSync(graphPath);
+        json({ nodes, links, hyperedges, updated: stat.mtime.toISOString() });
+      } catch (e) { json({ error: "파싱 ��패: " + e.message }, 500); }
     } else {
-      json({ error: "type은 html, report, stats 중 하나" }, 400);
+      json({ error: "type은 html, report, stats, json 중 하나" }, 400);
     }
   }
   // Graph API: /api/graph/list — graphify가 빌드된 프로젝트 목록
