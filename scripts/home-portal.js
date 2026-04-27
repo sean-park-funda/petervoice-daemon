@@ -1392,8 +1392,25 @@ const server = http.createServer((req, res) => {
           degreeMap[l.target] = (degreeMap[l.target] || 0) + 1;
         });
         nodes.forEach(n => { n.degree = degreeMap[n.id] || 0; });
+        // Surprising Connections from GRAPH_REPORT.md
+        let surprisingConnections = [];
+        const reportPath = path.join(graphDir, "GRAPH_REPORT.md");
+        if (fs.existsSync(reportPath)) {
+          const report = fs.readFileSync(reportPath, "utf-8");
+          const scMatch = report.match(/## Surprising Connections.*?\n([\s\S]*?)(?=\n## |\n$)/);
+          if (scMatch) {
+            const lines = scMatch[1].split("\n").filter(l => l.startsWith("- "));
+            for (let i = 0; i < lines.length; i++) {
+              const m = lines[i].match(/`([^`]+)`\s+--([^-]+)-->\s+`([^`]+)`\s+\[(\w+)\]/);
+              if (m) {
+                const detail = lines[i + 1]?.trim() || "";
+                surprisingConnections.push({ from: m[1], relation: m[2].trim(), to: m[3], confidence: m[4], detail });
+              }
+            }
+          }
+        }
         const stat = fs.statSync(graphPath);
-        json({ nodes, links, hyperedges, updated: stat.mtime.toISOString() });
+        json({ nodes, links, hyperedges, surprisingConnections, updated: stat.mtime.toISOString() });
       } catch (e) { json({ error: "파싱 ��패: " + e.message }, 500); }
     } else {
       json({ error: "type은 html, report, stats, json 중 하나" }, 400);
