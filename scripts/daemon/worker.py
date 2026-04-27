@@ -251,6 +251,13 @@ class Worker(threading.Thread):
             dequeue_message(msg_id)
             return
 
+        # Reply context: 댓글 기능 — 원본 메시지 맥락을 프롬프트에 포함
+        reply_context = msg.get("reply_context")
+        if reply_context:
+            orig_type = "봇" if reply_context.get("type") == "bot" else "유저"
+            orig_text = reply_context.get("text", "")[:500]
+            text = f"[이전 메시지에 대한 댓글입니다]\n> 원본 ({orig_type}): {orig_text}\n\n댓글: {text}"
+
         # Append file paths to prompt
         prompt_text = text
         if downloaded_paths:
