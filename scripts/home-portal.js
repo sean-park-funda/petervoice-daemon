@@ -791,6 +791,37 @@ function validateDocsDir(dir) {
   return resolved;
 }
 
+function apiDocsAll() {
+  const projectsMap = {};
+  const daemonProjects = path.join(CONFIG_DIR, "projects");
+  if (fs.existsSync(daemonProjects)) {
+    for (const e of fs.readdirSync(daemonProjects, { withFileTypes: true })) {
+      if (!e.isDirectory() || e.name.startsWith(".")) continue;
+      projectsMap[e.name] = { name: e.name, dir: path.join(daemonProjects, e.name) };
+    }
+  }
+  const homeProjects = path.join(os.homedir(), "Projects");
+  if (fs.existsSync(homeProjects)) {
+    for (const e of fs.readdirSync(homeProjects, { withFileTypes: true })) {
+      if (!e.isDirectory() || e.name.startsWith(".")) continue;
+      const docsDir = path.join(homeProjects, e.name, "docs");
+      if (fs.existsSync(docsDir) && !projectsMap[e.name]) {
+        projectsMap[e.name] = { name: e.name, dir: path.join(homeProjects, e.name) };
+      }
+    }
+  }
+  const result = [];
+  for (const [id, info] of Object.entries(projectsMap)) {
+    const docsDir = path.join(info.dir, "docs");
+    if (!fs.existsSync(docsDir)) continue;
+    const tree = apiDocsList(docsDir);
+    if (!tree.documents || tree.documents.length === 0) continue;
+    result.push({ id, name: id, docsDir, documents: tree.documents });
+  }
+  result.sort((a, b) => a.name.localeCompare(b.name));
+  return { projects: result };
+}
+
 function apiDocsList(docsDir) {
   const validated = validateDocsDir(docsDir);
   if (!validated) return { error: "접근 불가 경로" };
@@ -1021,9 +1052,28 @@ function parseMultipart(req) {
 
 // ─── Auth ────────────────────────────────────────────
 
-// 세션 스토어 (메모리 — 재시작 시 초기화, 재인증이면 충분)
-const sessions = new Map(); // sessionToken → { createdAt, expiresAt }
-const SESSION_MAX_AGE = 86400; // 24시간
+// 세션 스토어 (파일 영속 — 재시작 후에도 유지)
+const SESSION_FILE = path.join(CONFIG_DIR, "portal-sessions.json");
+const SESSION_MAX_AGE = 86400 * 7; // 7일
+const sessions = new Map();
+
+function loadSessions() {
+  try {
+    const raw = JSON.parse(fs.readFileSync(SESSION_FILE, "utf-8"));
+    const now = Date.now();
+    for (const [k, v] of Object.entries(raw)) {
+      if (v.expiresAt > now) sessions.set(k, v);
+    }
+  } catch {}
+}
+function saveSessions() {
+  try {
+    const obj = {};
+    for (const [k, v] of sessions) obj[k] = v;
+    fs.writeFileSync(SESSION_FILE, JSON.stringify(obj), { mode: 0o600 });
+  } catch {}
+}
+loadSessions();
 
 function generateSessionToken() {
   return crypto.randomBytes(32).toString("hex");
@@ -1077,12 +1127,16 @@ function verifyAuth(req) {
   const apiKey = config.api_key;
   if (!apiKey) return false;
 
-  // 1. 세션 쿠키 인증
+  // 1. 세션 쿠키 인증 (접속 시마다 만료 연장)
   const cookies = parseCookies(req);
   const sessionToken = cookies["pv_session"];
   if (sessionToken && sessions.has(sessionToken)) {
     const session = sessions.get(sessionToken);
-    if (session.expiresAt > Date.now()) return true;
+    if (session.expiresAt > Date.now()) {
+      session.expiresAt = Date.now() + SESSION_MAX_AGE * 1000;
+      saveSessions();
+      return true;
+    }
     sessions.delete(sessionToken); // 만료된 세션 정리
   }
 
@@ -1134,6 +1188,7 @@ function handleAuthCallback(req, res, url) {
     createdAt: Date.now(),
     expiresAt: Date.now() + SESSION_MAX_AGE * 1000,
   });
+  saveSessions();
 
   // 쿠키 세팅 + 깨끗한 URL로 리다이렉트
   const redirectUrl = url.pathname || "/";
@@ -1148,9 +1203,11 @@ function handleAuthCallback(req, res, url) {
 // 만료 세션 정리 (1시간마다)
 setInterval(() => {
   const now = Date.now();
+  let changed = false;
   for (const [token, session] of sessions) {
-    if (session.expiresAt <= now) sessions.delete(token);
+    if (session.expiresAt <= now) { sessions.delete(token); changed = true; }
   }
+  if (changed) saveSessions();
 }, 3600000);
 
 // ─── Server ──────────────────────────────────────────
@@ -1219,6 +1276,10 @@ const server = http.createServer((req, res) => {
   else if (pathname.startsWith("/api/logs/") && req.method === "GET") {
     const id = pathname.split("/api/logs/")[1];
     json(apiLogs(decodeURIComponent(id)));
+  }
+  // Docs API: /api/docs/all — 전체 프로젝트 docs 트리
+  else if (pathname === "/api/docs/all" && req.method === "GET") {
+    json(apiDocsAll());
   }
   // Docs API: /api/docs — 문서 목록 (dir 쿼리 파라미터)
   else if (pathname === "/api/docs" && req.method === "GET") {
@@ -1313,19 +1374,14 @@ const server = http.createServer((req, res) => {
   else if (pathname === "/api/docs/delete" && req.method === "POST") {
     readBody().then(body => {
       const { dir, filePath } = body;
-      if (!dir || !filePath) return json({ error: "dir, filePath 필요" }, 400);
+      if (!dir) return json({ error: "dir 필요" }, 400);
       const base = validateDocsDir(dir);
       if (!base) return json({ error: "접근 불가 경로" }, 403);
-      const full = path.resolve(base, filePath);
-      if (!full.startsWith(base)) return json({ error: "접근 불가 경로" }, 403);
+      const full = (filePath === '' || filePath == null) ? base : path.resolve(base, filePath);
+      if (full !== base && !full.startsWith(base)) return json({ error: "접근 불가 경로" }, 403);
       if (!fs.existsSync(full)) return json({ error: "파일 없음" }, 404);
       try {
-        const stat = fs.statSync(full);
-        if (stat.isDirectory()) {
-          fs.rmSync(full, { recursive: true, force: true });
-        } else {
-          fs.unlinkSync(full);
-        }
+        fs.rmSync(full, { recursive: true, force: true });
         json({ ok: true });
       } catch (e) { json({ error: "삭제 실패: " + e.message }, 500); }
     }).catch(e => json({ error: e.message }, 400));
