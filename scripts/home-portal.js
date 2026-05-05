@@ -1538,7 +1538,7 @@ const server = http.createServer((req, res) => {
   }
   // Skills API: /api/skills/read — 스킬 SKILL.md 전체 내용
   else if (pathname === "/api/skills/read" && req.method === "GET") {
-    const id = params.get("id");
+    const id = url.searchParams.get("id");
     if (!id) return json({ error: "id 필요" }, 400);
     const skillMd = path.join(os.homedir(), ".claude", "skills", id, "SKILL.md");
     if (!skillMd.startsWith(path.join(os.homedir(), ".claude", "skills"))) return json({ error: "접근 불가" }, 403);
