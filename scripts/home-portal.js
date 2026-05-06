@@ -734,7 +734,7 @@ function execPublish(body) {
   const config = loadConfig();
   const username = config.tunnel_url
     ? new URL(config.tunnel_url).hostname.split(".")[0]
-    : (config.bot_name || "user").toLowerCase().replace(/\s/g, "-");
+    : (config.username || "user").toLowerCase().replace(/\s/g, "-");
   try {
     const script = path.join(__dirname, "publish.py");
     const out = execSync(
@@ -768,7 +768,7 @@ function execUnpublish(body) {
   const config = loadConfig();
   const username = config.tunnel_url
     ? new URL(config.tunnel_url).hostname.split(".")[0]
-    : (config.bot_name || "user").toLowerCase().replace(/\s/g, "-");
+    : (config.username || "user").toLowerCase().replace(/\s/g, "-");
   try {
     const script = path.join(__dirname, "publish.py");
     const out = execSync(
