@@ -125,6 +125,11 @@ class AutoUpdater(threading.Thread):
             return
 
         new_head = self._local_head()
+        if new_head == old_head:
+            # Local is ahead of remote (dev machine) — nothing changed
+            self._consecutive_failures = 0
+            return
+
         logger.info(f"[updater] Updated to {new_head[:8]}")
 
         # 4. Clear __pycache__ to prevent stale bytecode
