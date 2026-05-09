@@ -29,6 +29,19 @@ def _find_claude_cmd() -> str:
 
 CLAUDE_CMD = _find_claude_cmd()
 
+# ─── Resolve codex CLI path ────────────────────────────────────
+def _find_codex_cmd() -> str:
+    found = shutil.which("codex")
+    if found:
+        return found
+    if IS_WINDOWS:
+        npm_codex = Path.home() / "AppData" / "Roaming" / "npm" / "codex.cmd"
+        if npm_codex.exists():
+            return str(npm_codex)
+    return "codex"
+
+CODEX_CMD = _find_codex_cmd()
+
 # ─── Parse --config-dir before path setup ────────────────────────
 _parser = argparse.ArgumentParser(add_help=False)
 _parser.add_argument("--config-dir", default=None)
@@ -50,6 +63,7 @@ MANAGER_STATE_PATH = DAEMON_DIR / "manager_state.json"
 WORKFLOWS_DIR = DAEMON_DIR / "workflows"
 DOCS_STATE_PATH = DAEMON_DIR / "docs_state.json"  # legacy, kept for cleanup
 RESTART_TRIGGER_PATH = DAEMON_DIR / "restart_trigger.json"
+CODEX_SESSIONS_PATH = DAEMON_DIR / "codex_sessions.json"
 
 # ─── Constants ──────────────────────────────────────────────────
 MAX_CONTEXT_OVERFLOW_RETRIES = 2

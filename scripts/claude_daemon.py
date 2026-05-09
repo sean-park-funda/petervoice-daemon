@@ -14,7 +14,7 @@ import signal
 import daemon.globals as g
 from daemon.globals import config, shutdown_event, logger
 from daemon.config import setup_logging, load_config, acquire_pid_lock, release_pid_lock, cleanup_stale_state, ensure_default_projects
-from daemon.sessions import load_sessions, _process_pending_resets
+from daemon.sessions import load_sessions, load_codex_sessions, _process_pending_resets
 from daemon.tasks import load_tasks
 from daemon.prompts import ensure_template
 from daemon.queue import load_queue
@@ -421,6 +421,7 @@ def main():
     try:
         load_config()
         load_sessions()
+        load_codex_sessions()
         load_tasks()
         ensure_template()
 
@@ -430,8 +431,9 @@ def main():
 
         logger.info(f"API URL: {config['api_url']}")
         logger.info(f"Bot: {config.get('bot_name', '?')}")
-        from daemon.globals import CLAUDE_CMD
+        from daemon.globals import CLAUDE_CMD, CODEX_CMD
         logger.info(f"Claude CLI: {CLAUDE_CMD}")
+        logger.info(f"Codex CLI: {CODEX_CMD}")
 
         uid = resolve_user_id()
         if uid:

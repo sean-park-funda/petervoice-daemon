@@ -1,4 +1,4 @@
-"""Claude CLI execution: run_claude() and rewrite_for_voice()."""
+"""Claude/Codex CLI execution: run_claude(), run_codex(), and rewrite_for_voice()."""
 
 import os
 import json
@@ -7,8 +7,10 @@ import select
 import subprocess
 from pathlib import Path
 
+import re
+
 from daemon.globals import (
-    IS_WINDOWS, CLAUDE_CMD, PROMPTS_DIR, SECRETS_ENV_PATH,
+    IS_WINDOWS, CLAUDE_CMD, CODEX_CMD, PROMPTS_DIR, SECRETS_ENV_PATH,
     MAX_CONTEXT_OVERFLOW_RETRIES,
     config, sessions_lock, shutdown_event, logger,
 )
@@ -22,6 +24,7 @@ from daemon.supabase import (
 from daemon.sessions import (
     get_session_id, update_session, reset_session, session_key,
     save_session_context, _save_session_summary, _build_session_context_prompt,
+    get_codex_session_id, update_codex_session, reset_codex_session,
 )
 from daemon.tasks import get_current_task, get_task_description
 from daemon.prompts import get_prompt_file, build_system_prompt
@@ -433,3 +436,301 @@ def rewrite_for_voice(text: str) -> str:
     except Exception as e:
         logger.warning(f"Rewriter error: {e}, using original text")
         return text
+
+
+# ─── Codex CLI execution ───────────────────────────────────────
+
+_AGENTS_MD_MARKER_START = "<!-- PETERVOICE-DAEMON-PROMPT-START -->"
+_AGENTS_MD_MARKER_END = "<!-- PETERVOICE-DAEMON-PROMPT-END -->"
+
+
+def _prepare_agents_md(project_dir: str, prompt_content: str):
+    """Write daemon prompt into AGENTS.md in the project directory.
+
+    If AGENTS.md already exists, the daemon section (between markers) is
+    replaced while preserving the rest of the file.
+    """
+    agents_path = os.path.join(project_dir, "AGENTS.md")
+    existing = ""
+    if os.path.exists(agents_path):
+        try:
+            with open(agents_path, "r", encoding="utf-8") as f:
+                existing = f.read()
+        except Exception:
+            existing = ""
+
+    daemon_block = f"{_AGENTS_MD_MARKER_START}\n{prompt_content}\n{_AGENTS_MD_MARKER_END}"
+
+    if _AGENTS_MD_MARKER_START in existing:
+        pattern = re.escape(_AGENTS_MD_MARKER_START) + r".*?" + re.escape(_AGENTS_MD_MARKER_END)
+        merged = re.sub(pattern, daemon_block, existing, flags=re.DOTALL)
+    elif existing.strip():
+        merged = f"{existing}\n\n{daemon_block}"
+    else:
+        merged = daemon_block
+
+    with open(agents_path, "w", encoding="utf-8") as f:
+        f.write(merged)
+
+
+def run_codex(prompt: str, project: str, _retry_count: int = 0) -> tuple[str, str | None, list[str]]:
+    """Run Codex CLI and return (response_text, session_id, tool_lines)."""
+    api_key = config["api_key"]
+
+    # Resolve project directory (same logic as run_claude)
+    is_branch = project.startswith("branch:")
+    is_kanban = project.startswith("kanban:")
+    if is_branch:
+        from daemon.branches import fetch_branch, build_branch_prompt, build_branch_context
+        branch_id = int(project.split(":")[1])
+        branch_data = fetch_branch(branch_id)
+        real_project = branch_data.get("project_id", "general") if branch_data else "general"
+        project_dir = get_project_dir(real_project)
+    elif is_kanban:
+        from daemon.kanban import build_kanban_prompt, _fetch_kanban_card
+        kanban_card_id = int(project.split(":")[1])
+        kanban_card = _fetch_kanban_card(kanban_card_id)
+        real_project = kanban_card.get("project_id", "general") if kanban_card else "general"
+        project_dir = get_project_dir(real_project)
+    else:
+        project_dir = get_project_dir(project)
+
+    sid = get_codex_session_id(project)
+
+    settings_project = real_project if (is_branch or is_kanban) else project
+    proj_settings = _fetch_project_settings(settings_project)
+
+    # Build system prompt (reuse existing logic)
+    if is_branch and branch_data:
+        combined = build_branch_prompt(branch_data)
+        if not sid:
+            context_block = build_branch_context(branch_data)
+            prompt = f"{context_block}\n\n---\n\n{prompt}"
+    elif is_kanban and kanban_card:
+        from daemon.kanban import build_kanban_card_context
+        combined = build_kanban_prompt(kanban_card)
+        if not sid:
+            card_context = build_kanban_card_context(kanban_card)
+            prompt = f"{card_context}\n\n---\n\n{prompt}"
+    else:
+        current_task = get_current_task(project)
+        task_desc = get_task_description(project, current_task)
+        sys_prompt = build_system_prompt(project, current_task, task_desc)
+        system_prompt_pv = fetch_prompt_from_supabase("_petervoice_system", user_id_override=0) or ""
+        common_prompt = fetch_prompt_from_supabase("_common") or ""
+        if common_prompt and "{동적으로 키 목록 삽입}" in common_prompt:
+            secret_keys = []
+            if SECRETS_ENV_PATH.exists():
+                for line in SECRETS_ENV_PATH.read_text(encoding="utf-8").splitlines():
+                    if "=" in line:
+                        secret_keys.append(line.split("=", 1)[0])
+            key_list = "\n".join(f"- {k}" for k in secret_keys) if secret_keys else "(없음)"
+            common_prompt = common_prompt.replace("{동적으로 키 목록 삽입}", key_list)
+        prompt_file = get_prompt_file(project)
+        prompt_content = prompt_file.read_text(encoding="utf-8") if prompt_file and prompt_file.exists() else ""
+        session_context = ""
+        if not sid:
+            session_context = _build_session_context_prompt(project)
+        combined = "\n\n".join(p for p in [sys_prompt, system_prompt_pv, common_prompt, prompt_content, session_context] if p)
+
+    # Write AGENTS.md with daemon prompt
+    if combined:
+        _prepare_agents_md(project_dir, combined)
+
+    # Build command
+    model = proj_settings.get("codex_model") or proj_settings.get("model") or config.get("codex_default_model", "o3")
+    bot_name = config.get("bot_name", "bot")
+
+    if sid:
+        # Resume mode — -C is not supported, Codex uses stored cwd
+        cmd = [
+            CODEX_CMD, "exec",
+            "--json",
+            "--dangerously-bypass-approvals-and-sandbox",
+            "--skip-git-repo-check",
+            "-m", model,
+            "resume", sid,
+            prompt,
+        ]
+    else:
+        # New session
+        cmd = [
+            CODEX_CMD, "exec",
+            "--json",
+            "--dangerously-bypass-approvals-and-sandbox",
+            "--skip-git-repo-check",
+            "-C", project_dir,
+            "-m", model,
+            prompt,
+        ]
+
+    logger.info(f"[{bot_name}] Codex: project={project}, dir={project_dir}, session={sid or 'new'}, model={model}")
+
+    try:
+        g.claude_semaphore.acquire()
+        codex_env = {
+            **os.environ,
+            "LANG": "en_US.UTF-8",
+        }
+        # Inject OpenAI API key from daemon config if available
+        openai_key = config.get("openai_api_key")
+        if openai_key:
+            codex_env["OPENAI_API_KEY"] = openai_key
+
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd=project_dir,
+            env=codex_env,
+            shell=IS_WINDOWS,
+        )
+
+        response_text = ""
+        new_session_id = sid
+        tool_lines = []
+        last_stream_time = time.time()
+        last_activity_time = time.time()
+        process_start_time = time.time()
+        stdout_timeout = config.get("claude_stdout_timeout_sec", 600)
+        hard_timeout = config.get("claude_hard_timeout_sec", 900)
+        stream_interval = config.get("stream_interval_sec", 2.0)
+
+        while True:
+            if shutdown_event.is_set():
+                proc.terminate()
+                return ("(데몬 종료 중)", new_session_id, tool_lines)
+
+            elapsed = time.time() - process_start_time
+            if elapsed > hard_timeout:
+                logger.error(f"[{bot_name}] Codex hard timeout ({hard_timeout}s, elapsed {elapsed:.0f}s) for {project}, killing")
+                proc.kill()
+                return (f"(Codex 실행 시간 초과 - {elapsed:.0f}초 경과)", sid, tool_lines)
+
+            if IS_WINDOWS:
+                import threading as _thr
+                _line_ready = _thr.Event()
+                def _check_readable():
+                    try:
+                        if proc.stdout.readable():
+                            _line_ready.set()
+                    except Exception:
+                        _line_ready.set()
+                _t = _thr.Thread(target=_check_readable, daemon=True)
+                _t.start()
+                _t.join(timeout=10)
+                ready = _line_ready.is_set()
+            else:
+                ready_list, _, _ = select.select([proc.stdout], [], [], 10)
+                ready = bool(ready_list)
+
+            if not ready:
+                if proc.poll() is not None:
+                    break
+                if time.time() - last_activity_time > stdout_timeout:
+                    logger.error(f"[{bot_name}] Codex stdout timeout ({stdout_timeout}s) for {project}, killing")
+                    proc.kill()
+                    return (f"(Codex 응답 시간 초과 - {stdout_timeout}초 동안 출력 없음)", sid, tool_lines)
+                # Check stop request
+                uid = resolve_user_id()
+                if uid and check_stop_requested(uid):
+                    logger.info(f"[{bot_name}] Stop requested for {project}, terminating codex process")
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                    clear_stop_requested(uid)
+                    partial = response_text.strip()
+                    result = partial + "\n\n(작업이 중단되었습니다)" if partial else "(작업이 중단되었습니다)"
+                    return (result, new_session_id, tool_lines)
+                continue
+
+            raw = proc.stdout.readline()
+            if not raw:
+                break
+
+            last_activity_time = time.time()
+            line = raw.decode("utf-8", errors="replace").strip()
+            if not line:
+                continue
+
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            etype = event.get("type", "")
+
+            if etype == "thread.started":
+                new_session_id = event.get("thread_id")
+
+            elif etype == "item.completed":
+                item = event.get("item", {})
+                item_type = item.get("type", "")
+
+                if item_type == "agent_message":
+                    response_text = item.get("text", "")
+                    # Stream the message as it arrives
+                    streaming = "\n".join(tool_lines) + "\n\n" + response_text if tool_lines else response_text
+                    api_request(api_key, "POST", "/api/bot/reply", {
+                        "text": streaming, "project": project, "is_final": False,
+                    })
+                    last_stream_time = time.time()
+
+                elif item_type == "command":
+                    cmd_str = item.get("exec_command", "")
+                    tool_lines.append(f"🔧 Shell: {cmd_str[:80]}")
+                    api_request(api_key, "POST", "/api/bot/reply", {
+                        "text": "\n".join(tool_lines), "project": project, "is_final": False,
+                    })
+
+                elif item_type == "file_change":
+                    fp = item.get("file_path", "")
+                    tool_lines.append(f"🔧 FileChange: {fp}")
+
+            elif etype == "turn.completed":
+                usage = event.get("usage", {})
+                logger.info(f"[{bot_name}] Codex turn done for {project}: input={usage.get('input_tokens', '?')}, output={usage.get('output_tokens', '?')}")
+
+            elif etype == "error":
+                error_msg = event.get("message", str(event))
+                logger.error(f"[{bot_name}] Codex error for {project}: {error_msg}")
+                if not response_text:
+                    response_text = f"(Codex 오류: {error_msg[:200]})"
+
+        proc.wait(timeout=300)
+
+        stderr_output = proc.stderr.read().decode("utf-8", errors="replace").strip()
+        if proc.returncode != 0 and not response_text:
+            logger.error(f"[{bot_name}] Codex exited {proc.returncode}: {stderr_output[:500]}")
+            # On session error, reset and retry
+            if "session" in stderr_output.lower() or "not found" in stderr_output.lower():
+                logger.warning(f"[{bot_name}] Invalid codex session for {project}, resetting (retry {_retry_count + 1})")
+                reset_codex_session(project)
+                g.claude_semaphore.release()
+                if _retry_count >= MAX_CONTEXT_OVERFLOW_RETRIES:
+                    return ("(Codex 세션 오류 - 최대 재시도 횟수 초과)", None, tool_lines)
+                return run_codex(prompt, project, _retry_count + 1)
+            return (f"(Codex 오류: exit {proc.returncode})", new_session_id, tool_lines)
+
+        if not response_text:
+            response_text = "(작업 완료)" if tool_lines else "(응답 없음)"
+
+        if new_session_id:
+            update_codex_session(project, new_session_id)
+
+        return (response_text, new_session_id, tool_lines)
+
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        logger.error(f"[{bot_name}] Codex timed out for {project}")
+        return ("(Codex 응답 시간 초과)", sid, [])
+    except Exception as e:
+        logger.error(f"[{bot_name}] Codex error: {e}")
+        return (f"(Codex 실행 오류: {e})", sid, [])
+    finally:
+        try:
+            g.claude_semaphore.release()
+        except ValueError:
+            pass

@@ -3,6 +3,7 @@
 import os
 import json
 import subprocess
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -10,7 +11,7 @@ from pathlib import Path
 import daemon.globals as g
 from daemon.globals import (
     config, sessions_lock, shutdown_event, logger,
-    DAEMON_DIR, SESSIONS_PATH, PENDING_RESETS_PATH,
+    DAEMON_DIR, SESSIONS_PATH, PENDING_RESETS_PATH, CODEX_SESSIONS_PATH,
     CLAUDE_CMD, IS_WINDOWS,
 )
 from daemon.supabase import resolve_user_id, get_project_dir, _fetch_project_settings, _fetch_recent_conversation
@@ -195,6 +196,58 @@ def save_session_context(project: str) -> bool:
         _save_session_summary(project, fallback)
         return True
     return False
+
+
+# ─── Codex session management ──────────────────────────────────
+
+_codex_sessions: dict = {}
+_codex_sessions_lock = threading.Lock()
+
+
+def load_codex_sessions():
+    global _codex_sessions
+    try:
+        if CODEX_SESSIONS_PATH.exists():
+            data = json.loads(CODEX_SESSIONS_PATH.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                _codex_sessions = data
+                logger.info(f"Codex sessions loaded: {len(data)} active")
+                return
+    except Exception as e:
+        logger.warning(f"Failed to load codex sessions: {e}")
+    _codex_sessions = {}
+
+
+def _save_codex_sessions():
+    try:
+        with _codex_sessions_lock:
+            data = dict(_codex_sessions)
+        CODEX_SESSIONS_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as e:
+        logger.warning(f"Failed to save codex sessions: {e}")
+
+
+def get_codex_session_id(project: str) -> str | None:
+    with _codex_sessions_lock:
+        return _codex_sessions.get(project, {}).get("session_id")
+
+
+def update_codex_session(project: str, session_id: str):
+    now = datetime.now().isoformat()
+    with _codex_sessions_lock:
+        sess = _codex_sessions.setdefault(project, {"created_at": now, "message_count": 0})
+        sess["session_id"] = session_id
+        sess["last_used"] = now
+        sess["message_count"] = sess.get("message_count", 0) + 1
+    _save_codex_sessions()
+
+
+def reset_codex_session(project: str, reason: str = ""):
+    with _codex_sessions_lock:
+        removed = _codex_sessions.pop(project, None)
+    if removed:
+        _save_codex_sessions()
+        logger.info(f"Codex session reset for {project}" + (f" ({reason})" if reason else ""))
 
 
 def _build_session_context_prompt(project: str) -> str:

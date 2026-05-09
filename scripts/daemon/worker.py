@@ -25,7 +25,7 @@ from daemon.tasks import (
     get_current_task, get_task_description, set_current_task, list_tasks,
 )
 from daemon.prompts import get_prompt_file, build_system_prompt
-from daemon.claude_runner import run_claude, rewrite_for_voice
+from daemon.claude_runner import run_claude, run_codex, rewrite_for_voice
 from daemon.queue import enqueue_message, dequeue_message
 from daemon.utils import download_files, cleanup_downloads, _split_text_chunks, _read_json, _write_json
 # kanban messages now flow through messages table — no separate kanban import needed
@@ -109,6 +109,9 @@ class Worker(threading.Thread):
             self.reply("세션 맥락을 저장 중...", reply_to=[msg_id], project=project, is_final=False)
             save_session_context(project)
             reset_session(project)
+            # Also reset Codex session if exists
+            from daemon.sessions import reset_codex_session
+            reset_codex_session(project)
             self.reply(f"세션을 초기화했습니다. 이전 맥락이 저장되었습니다. (작업: {current_task_name})", reply_to=[msg_id], project=project)
             dequeue_message(msg_id)
             return
@@ -277,7 +280,23 @@ class Worker(threading.Thread):
         if uid:
             clear_stop_requested(uid)
 
-        response, sid, tool_lines = run_claude(prompt_text, project)
+        # Engine selection: claude (default) or codex
+        from daemon.supabase import _fetch_project_settings
+        _proj = project
+        if project.startswith("branch:"):
+            from daemon.branches import fetch_branch
+            _bd = fetch_branch(int(project.split(":")[1]))
+            _proj = _bd.get("project_id", "general") if _bd else "general"
+        elif project.startswith("kanban:"):
+            from daemon.kanban import _fetch_kanban_card
+            _kc = _fetch_kanban_card(int(project.split(":")[1]))
+            _proj = _kc.get("project_id", "general") if _kc else "general"
+        _engine = _fetch_project_settings(_proj).get("engine", "claude")
+
+        if _engine == "codex":
+            response, sid, tool_lines = run_codex(prompt_text, project)
+        else:
+            response, sid, tool_lines = run_claude(prompt_text, project)
 
         if tool_lines:
             self.reply("\n".join(tool_lines), reply_to=[msg_id], project=project, is_final=True, subtype="tool_log")
