@@ -538,33 +538,35 @@ def run_codex(prompt: str, project: str, _retry_count: int = 0) -> tuple[str, st
         _prepare_agents_md(project_dir, combined)
 
     # Build command
-    model = proj_settings.get("codex_model") or proj_settings.get("model") or config.get("codex_default_model", "o3")
+    # ChatGPT OAuth doesn't support -m flag; only set model when using API key
+    model = proj_settings.get("codex_model") or config.get("codex_default_model")
+    openai_key = config.get("openai_api_key")
+    use_model_flag = bool(model and openai_key)
     bot_name = config.get("bot_name", "bot")
 
     if sid:
-        # Resume mode — -C is not supported, Codex uses stored cwd
         cmd = [
             CODEX_CMD, "exec",
             "--json",
             "--dangerously-bypass-approvals-and-sandbox",
             "--skip-git-repo-check",
-            "-m", model,
-            "resume", sid,
-            prompt,
         ]
+        if use_model_flag:
+            cmd.extend(["-m", model])
+        cmd.extend(["resume", sid, prompt])
     else:
-        # New session
         cmd = [
             CODEX_CMD, "exec",
             "--json",
             "--dangerously-bypass-approvals-and-sandbox",
             "--skip-git-repo-check",
             "-C", project_dir,
-            "-m", model,
-            prompt,
         ]
+        if use_model_flag:
+            cmd.extend(["-m", model])
+        cmd.append(prompt)
 
-    logger.info(f"[{bot_name}] Codex: project={project}, dir={project_dir}, session={sid or 'new'}, model={model}")
+    logger.info(f"[{bot_name}] Codex: project={project}, dir={project_dir}, session={sid or 'new'}, model={model or 'default'}")
 
     try:
         g.claude_semaphore.acquire()

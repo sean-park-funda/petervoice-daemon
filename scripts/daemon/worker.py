@@ -291,7 +291,7 @@ class Worker(threading.Thread):
             from daemon.kanban import _fetch_kanban_card
             _kc = _fetch_kanban_card(int(project.split(":")[1]))
             _proj = _kc.get("project_id", "general") if _kc else "general"
-        _engine = _fetch_project_settings(_proj).get("engine", "claude")
+        _engine = _fetch_project_settings(_proj).get("engine") or "claude"
 
         if _engine == "codex":
             response, sid, tool_lines = run_codex(prompt_text, project)
