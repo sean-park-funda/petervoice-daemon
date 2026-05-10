@@ -957,6 +957,7 @@ const MIME_TYPES = {
   ".webm": "video/webm", ".mp3": "audio/mpeg", ".wav": "audio/wav",
   ".json": "application/json", ".txt": "text/plain", ".csv": "text/csv",
   ".py": "text/plain", ".js": "text/plain", ".ts": "text/plain",
+  ".html": "text/html", ".htm": "text/html",
 };
 
 function serveDocsFile(res, docsDir, filePath) {
