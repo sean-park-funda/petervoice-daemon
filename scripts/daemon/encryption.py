@@ -4,9 +4,14 @@ import os
 import base64
 import stat
 
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-
 from daemon.globals import logger
+
+try:
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    _HAS_CRYPTO = True
+except ImportError:
+    _HAS_CRYPTO = False
+    logger.warning("[encryption] cryptography package not installed — encryption disabled")
 
 DEFAULT_KEY_PATH = os.path.join(os.path.expanduser("~"), ".claude-daemon", "encryption.key")
 IV_SIZE = 12
@@ -51,7 +56,9 @@ class MessageEncryptor:
 _instance: MessageEncryptor | None = None
 
 
-def get_encryptor(key_path: str = DEFAULT_KEY_PATH) -> MessageEncryptor:
+def get_encryptor(key_path: str = DEFAULT_KEY_PATH) -> MessageEncryptor | None:
+    if not _HAS_CRYPTO:
+        return None
     global _instance
     if _instance is None:
         _instance = MessageEncryptor(key_path)
@@ -61,9 +68,12 @@ def get_encryptor(key_path: str = DEFAULT_KEY_PATH) -> MessageEncryptor:
 def decrypt_message(msg: dict) -> dict:
     if not msg.get("encrypted"):
         return msg
+    if not _HAS_CRYPTO:
+        return msg
     try:
         enc = get_encryptor()
-        msg["text"] = enc.decrypt(msg["text"])
+        if enc:
+            msg["text"] = enc.decrypt(msg["text"])
     except Exception as e:
         logger.error("Failed to decrypt message %s: %s", msg.get("id"), e)
     return msg
