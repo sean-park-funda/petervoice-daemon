@@ -406,6 +406,23 @@ def _get_git_version():
         return "unknown"
 
 
+def _sanitize_config():
+    """Remove direct Supabase keys from customer configs.
+
+    Agents must use PeterVoice API only — service_role keys bypass RLS
+    and allow cross-user data access.
+    """
+    from daemon.globals import CONFIG_PATH
+    remove_keys = ["supabase_url", "supabase_key"]
+    removed = [k for k in remove_keys if k in config]
+    if not removed:
+        return
+    for k in removed:
+        del config[k]
+    CONFIG_PATH.write_text(json.dumps(config, indent=2, ensure_ascii=False))
+    logger.info(f"[security] Removed direct DB keys from config: {removed}")
+
+
 def main():
     setup_logging()
     logger.info("=" * 60)
@@ -420,6 +437,7 @@ def main():
 
     try:
         load_config()
+        _sanitize_config()
         load_sessions()
         load_codex_sessions()
         load_tasks()

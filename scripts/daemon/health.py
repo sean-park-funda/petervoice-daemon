@@ -17,7 +17,7 @@ class SessionHealthChecker(threading.Thread):
     """Periodically checks session health and detects stalled conversations."""
 
     HEALTH_CHECK_INTERVAL = 2 * 3600  # 2 hours
-    STALL_CHECK_INTERVAL = 1800       # 30 minutes
+    STALL_CHECK_INTERVAL = 3600       # 60 minutes
 
     def __init__(self):
         super().__init__(daemon=True, name="session-health-checker")
@@ -87,20 +87,22 @@ class SessionHealthChecker(threading.Thread):
 1. **세션 건강 관리**: 정기 리포트를 받고, 리셋이 필요한 세션을 Sean에게 제안
 2. **Stall Detection**: 에이전트가 응답해야 하는데 못 하고 있으면 릴레이로 깨움
 
-## DB 조회 방법
+## 대화 조회 방법
 
 ```bash
-SUPABASE_URL=$(python3 -c "import json; c=json.load(open('$HOME/.claude-daemon/config.json')); print(c['supabase_url'])")
-SUPABASE_KEY=$(python3 -c "import json; c=json.load(open('$HOME/.claude-daemon/config.json')); print(c['supabase_key'])")
+API_URL=$(python3 -c "import json; c=json.load(open('$HOME/.claude-daemon/config.json')); print(c.get('api_url', 'https://peter-voice.vercel.app'))")
+API_KEY=$(python3 -c "import json; print(json.load(open('$HOME/.claude-daemon/config.json'))['api_key'])")
 
 # 특정 프로젝트의 최근 메시지 조회
-curl -s "${SUPABASE_URL}/rest/v1/messages?project=eq.{프로젝트명}&user_id=eq.1&order=created_at.desc&limit=15&select=type,text,created_at" \\
-  -H "apikey: ${SUPABASE_KEY}" -H "Authorization: Bearer ${SUPABASE_KEY}"
+curl -s "$API_URL/api/bot/conversation?project={프로젝트명}&limit=15" \\
+  -H "Authorization: Bearer $API_KEY"
 ```
+
+**주의: Supabase REST API 직접 호출 금지. 반드시 PeterVoice API만 사용할 것.**
 
 ## 세션 건강 ([정기 세션 점검 리포트] 수신 시)
 
-- 눈에 띄는 세션은 DB에서 직접 조회해서 상세 분석
+- 눈에 띄는 세션은 API로 조회해서 상세 분석
 - 리셋 제안 시: "**[제안] {프로젝트명}** 리셋을 제안합니다. 근거: {이유}"
 - 정상이면: 간단히 "모든 세션 정상"
 
