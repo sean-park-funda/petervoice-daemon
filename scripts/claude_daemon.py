@@ -462,6 +462,10 @@ def main():
         # Ensure default projects (sysadmin, manager) exist
         ensure_default_projects()
 
+        # Initialize encryption key (creates if not exists)
+        from daemon.encryption import get_encryptor
+        get_encryptor()
+
         # Start syncer threads
         SecretsSyncer().start()
         SkillsSyncer().start()

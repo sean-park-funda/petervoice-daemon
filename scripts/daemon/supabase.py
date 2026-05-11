@@ -212,10 +212,12 @@ def _fetch_recent_conversation(project: str, limit: int = 10) -> str:
                          timeout=10)
     if not result or not result.get("messages"):
         return ""
+    from daemon.encryption import decrypt_message
     rows = result["messages"]
     rows.reverse()
     lines = []
     for r in rows:
+        r = decrypt_message(r)
         role = "유저" if r.get("type") == "user" else "클로드"
         text = r.get("text", "").strip()
         if text and not text.startswith("🔧"):

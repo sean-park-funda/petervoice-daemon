@@ -1579,6 +1579,19 @@ const server = http.createServer((req, res) => {
       } catch (e) { json({ error: "제거 실패: " + e.message }, 500); }
     }).catch(e => json({ error: e.message }, 400));
   }
+  // Encryption: /api/encryption-key — 브라우저에 암호화 키 전달 (localhost only)
+  else if (pathname === "/api/encryption-key" && req.method === "GET") {
+    const keyPath = path.join(os.homedir(), ".claude-daemon", "encryption.key");
+    if (!fs.existsSync(keyPath)) {
+      return json({ error: "No encryption key found" }, 404);
+    }
+    try {
+      const key = fs.readFileSync(keyPath, "utf-8").trim();
+      json({ key });
+    } catch (e) {
+      json({ error: "Failed to read key" }, 500);
+    }
+  }
   // Share: /share — 문서 공유 뷰어 (HTML 렌더링)
   else if (pathname === "/share" && req.method === "GET") {
     const dir = url.searchParams.get("dir");

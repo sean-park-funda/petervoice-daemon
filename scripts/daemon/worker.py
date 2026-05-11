@@ -28,6 +28,7 @@ from daemon.prompts import get_prompt_file, build_system_prompt
 from daemon.claude_runner import run_claude, run_codex, rewrite_for_voice
 from daemon.queue import enqueue_message, dequeue_message
 from daemon.utils import download_files, cleanup_downloads, _split_text_chunks, _read_json, _write_json
+from daemon.encryption import decrypt_message, get_encryptor
 # kanban messages now flow through messages table — no separate kanban import needed
 
 
@@ -67,6 +68,7 @@ class Worker(threading.Thread):
         api_request(self.api_key, "POST", "/api/bot/heartbeat", payload)
 
     def process_message(self, msg: dict):
+        msg = decrypt_message(msg)
         msg_id = msg.get("id")
         text = msg.get("text", "").strip()
         project = msg.get("project", "general") or "general"
