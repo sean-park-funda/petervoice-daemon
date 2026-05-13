@@ -282,18 +282,20 @@ class Worker(threading.Thread):
         if uid:
             clear_stop_requested(uid)
 
-        # Engine selection: claude (default) or codex
+        # Engine selection: branch own setting → parent project → "claude"
         from daemon.supabase import _fetch_project_settings
         _proj = project
+        _branch_engine = None
         if project.startswith("branch:"):
             from daemon.branches import fetch_branch
             _bd = fetch_branch(int(project.split(":")[1]))
             _proj = _bd.get("project_id", "general") if _bd else "general"
+            _branch_engine = (_bd or {}).get("engine")
         elif project.startswith("kanban:"):
             from daemon.kanban import _fetch_kanban_card
             _kc = _fetch_kanban_card(int(project.split(":")[1]))
             _proj = _kc.get("project_id", "general") if _kc else "general"
-        _engine = _fetch_project_settings(_proj).get("engine") or "claude"
+        _engine = _branch_engine or _fetch_project_settings(_proj).get("engine") or "claude"
 
         if _engine == "codex":
             response, sid, tool_lines = run_codex(prompt_text, project)

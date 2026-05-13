@@ -67,7 +67,8 @@ def run_claude(prompt: str, project: str, _retry_count: int = 0, _overload_retry
     if proj_settings.get("chrome"):
         cmd.append("--chrome")
 
-    model = proj_settings.get("model") or config.get("claude_model")
+    branch_model = branch_data.get("model") if is_branch and branch_data else None
+    model = branch_model or proj_settings.get("model") or config.get("claude_model")
     if model:
         cmd.extend(["--model", model])
     effort = config.get("claude_effort")
@@ -539,7 +540,8 @@ def run_codex(prompt: str, project: str, _retry_count: int = 0) -> tuple[str, st
 
     # Build command
     # ChatGPT OAuth doesn't support -m flag; only set model when using API key
-    model = proj_settings.get("codex_model") or config.get("codex_default_model")
+    branch_model = branch_data.get("model") if is_branch and branch_data else None
+    model = branch_model or proj_settings.get("codex_model") or config.get("codex_default_model")
     openai_key = config.get("openai_api_key")
     use_model_flag = bool(model and openai_key)
     bot_name = config.get("bot_name", "bot")
@@ -672,8 +674,8 @@ def run_codex(prompt: str, project: str, _retry_count: int = 0) -> tuple[str, st
                 item_type = item.get("type", "")
 
                 if item_type == "agent_message":
-                    response_text = item.get("text", "")
-                    # Stream the message as it arrives
+                    msg = item.get("text", "")
+                    response_text = response_text + "\n\n" + msg if response_text else msg
                     streaming = "\n".join(tool_lines) + "\n\n" + response_text if tool_lines else response_text
                     api_request(api_key, "POST", "/api/bot/reply", {
                         "text": streaming, "project": project, "is_final": False,
