@@ -23,6 +23,23 @@ def session_key(project: str, task: str = "default") -> str:
     return f"{project}:{task}"
 
 
+def team_session_key(project: str, member_key: str, branch_id: int | None = None) -> str:
+    suffix = f"branch-{branch_id}" if branch_id else "main"
+    return f"{project}:{member_key}:{suffix}"
+
+
+def update_session_by_key(key: str, session_id: str, account: str = "default"):
+    now = datetime.now().isoformat()
+    with sessions_lock:
+        sess = g.sessions.setdefault(key, {"created_at": now, "message_count": 0})
+        sess["session_id"] = session_id
+        sess["last_used"] = now
+        sess["message_count"] = sess.get("message_count", 0) + 1
+        if account and account != "default":
+            sess["account"] = account
+    save_sessions()
+
+
 def get_session_id(project: str, task: str = "default") -> str | None:
     key = session_key(project, task)
     with sessions_lock:

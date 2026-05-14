@@ -48,10 +48,17 @@ class Worker(threading.Thread):
             return None
         return result.get("pending", [])
 
-    def reply(self, text: str, reply_to=None, project="general", is_final=True, subtype=None):
+    def reply(self, text: str, reply_to=None, project="general", is_final=True, subtype=None,
+              member_id=None, member_name=None, member_icon=None):
         payload = {"text": text, "reply_to": reply_to, "project": project, "is_final": is_final}
         if subtype:
             payload["subtype"] = subtype
+        if member_id:
+            payload["member_id"] = member_id
+        if member_name:
+            payload["member_name"] = member_name
+        if member_icon:
+            payload["member_icon"] = member_icon
         api_request(self.api_key, "POST", "/api/bot/reply", payload)
 
     def heartbeat(self, is_working=False, current_task=None, project=None):
@@ -297,23 +304,40 @@ class Worker(threading.Thread):
             _proj = _kc.get("project_id", "general") if _kc else "general"
         _engine = _branch_engine or _fetch_project_settings(_proj).get("engine") or "claude"
 
-        if _engine == "codex":
+        # D10/D8: team branch with lazy import fallback
+        try:
+            from daemon.team import is_team_project, process_team_message
+        except ImportError:
+            is_team_project = lambda _: False
+            process_team_message = None
+
+        _check_project = _proj
+        _branch_id = int(project.split(":")[1]) if project.startswith("branch:") else None
+        _is_team = is_team_project(_check_project)
+
+        if _is_team and process_team_message:
+            response, tool_lines = process_team_message(
+                prompt_text, project, self, msg_id, _branch_id
+            )
+        elif _engine == "codex":
             response, sid, tool_lines = run_codex(prompt_text, project)
         else:
             response, sid, tool_lines = run_claude(prompt_text, project)
 
-        if tool_lines:
-            self.reply("\n".join(tool_lines), reply_to=[msg_id], project=project, is_final=True, subtype="tool_log")
+        # D8: skip post-processing for team projects (already handled inside process_team_message)
+        if not _is_team:
+            if tool_lines:
+                self.reply("\n".join(tool_lines), reply_to=[msg_id], project=project, is_final=True, subtype="tool_log")
 
-        # Rewriter — skip for manager-injected messages
-        from daemon.manager.thread import ManagerThread
-        is_manager_msg = text.startswith(ManagerThread.MANAGER_PREFIX)
-        if not text.startswith("/") and not is_manager_msg:
-            response = rewrite_for_voice(response)
+            # Rewriter — skip for manager-injected messages
+            from daemon.manager.thread import ManagerThread
+            is_manager_msg = text.startswith(ManagerThread.MANAGER_PREFIX)
+            if not text.startswith("/") and not is_manager_msg:
+                response = rewrite_for_voice(response)
 
-        chunks = _split_text_chunks(response)
-        for chunk in chunks:
-            self.reply(chunk, reply_to=[msg_id], project=project, is_final=True)
+            chunks = _split_text_chunks(response)
+            for chunk in chunks:
+                self.reply(chunk, reply_to=[msg_id], project=project, is_final=True)
 
         self.reply("", reply_to=None, project=project, is_final=False)
 
@@ -322,7 +346,8 @@ class Worker(threading.Thread):
 
         dequeue_message(msg_id)
 
-        logger.info(f"[{self.bot_name}] Replied msg #{msg_id}: {len(response)} chars, {len(chunks)} chunk(s)")
+        chunk_count = len(chunks) if not _is_team else 0
+        logger.info(f"[{self.bot_name}] Replied msg #{msg_id}: {len(response)} chars, {chunk_count} chunk(s)")
 
     def _get_project_lock(self, project: str) -> threading.Lock:
         with project_locks_lock:

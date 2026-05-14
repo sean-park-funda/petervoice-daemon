@@ -22,7 +22,8 @@ from daemon.supabase import (
     get_project_dir, fetch_prompt_from_supabase, check_stop_requested, clear_stop_requested,
 )
 from daemon.sessions import (
-    get_session_id, update_session, reset_session, session_key,
+    get_session_id, update_session, update_session_by_key,
+    reset_session, session_key,
     save_session_context, _save_session_summary, _build_session_context_prompt,
     get_codex_session_id, update_codex_session, reset_codex_session,
 )
@@ -30,7 +31,81 @@ from daemon.tasks import get_current_task, get_task_description
 from daemon.prompts import get_prompt_file, build_system_prompt
 
 
-def run_claude(prompt: str, project: str, _retry_count: int = 0, _overload_retry: int = 0) -> tuple[str, str | None, list[str]]:
+def _load_wiki_index(project: str) -> str:
+    """Load wiki/index.md for auto-memory injection. Returns empty string if not found."""
+    project_dir = get_project_dir(project)
+    if not project_dir:
+        return ""
+    wiki_index = Path(project_dir) / "wiki" / "index.md"
+    if not wiki_index.exists():
+        return ""
+    try:
+        content = wiki_index.read_text(encoding="utf-8").strip()
+        if not content:
+            return ""
+        return f"## 프로젝트 지식 인덱스 (자동 주입)\n\n{content}"
+    except Exception:
+        return ""
+
+
+def build_project_prompt(project: str) -> str:
+    """Build the full system prompt for a project (extracted for team reuse)."""
+    current_task = get_current_task(project)
+    task_desc = get_task_description(project, current_task)
+    sys_prompt = build_system_prompt(project, current_task, task_desc)
+
+    system_prompt_pv = fetch_prompt_from_supabase("_petervoice_system", user_id_override=0) or ""
+
+    is_demo = project.startswith("demo_")
+    if is_demo:
+        common_prompt = ""
+    else:
+        common_prompt = fetch_prompt_from_supabase("_common") or ""
+        if common_prompt and "{동적으로 키 목록 삽입}" in common_prompt:
+            secret_keys = []
+            if SECRETS_ENV_PATH.exists():
+                for line in SECRETS_ENV_PATH.read_text(encoding="utf-8").splitlines():
+                    if "=" in line:
+                        secret_keys.append(line.split("=", 1)[0])
+            key_list = "\n".join(f"- {k}" for k in secret_keys) if secret_keys else "(없음)"
+            common_prompt = common_prompt.replace("{동적으로 키 목록 삽입}", key_list)
+
+    global_wiki = ""
+    if not is_demo:
+        global_wiki_path = Path.home() / ".claude-daemon" / "global-graph" / "wiki" / "index.md"
+        if global_wiki_path.exists():
+            try:
+                gw = global_wiki_path.read_text(encoding="utf-8").strip()
+                if gw:
+                    global_wiki = f"## 글로벌 지식 인덱스 (전 프로젝트, 자동 주입)\n\n{gw}"
+            except Exception:
+                pass
+
+    if is_demo:
+        prompt_file = get_prompt_file("_demo")
+    else:
+        prompt_file = get_prompt_file(project)
+    prompt_content = prompt_file.read_text(encoding="utf-8") if prompt_file and prompt_file.exists() else ""
+
+    session_context = ""
+    if not get_session_id(project) and not is_demo:
+        session_context = _build_session_context_prompt(project)
+
+    wiki_index = _load_wiki_index(project)
+
+    return "\n\n".join(p for p in [sys_prompt, system_prompt_pv, common_prompt, global_wiki, prompt_content, wiki_index, session_context] if p)
+
+
+def run_claude(
+    prompt: str,
+    project: str,
+    _retry_count: int = 0,
+    _overload_retry: int = 0,
+    # ── Team support (D7) ──
+    session_key_override: str | None = None,
+    prompt_override: str | None = None,
+    stream_to_chat: bool = True,
+) -> tuple[str, str | None, list[str]]:
     api_key = config["api_key"]
 
     # branch:{branch_id} → 부모 프로젝트 디렉토리 사용
@@ -51,7 +126,10 @@ def run_claude(prompt: str, project: str, _retry_count: int = 0, _overload_retry
     else:
         project_dir = get_project_dir(project)
 
-    sid = get_session_id(project)
+    # D7: session key override for team members
+    _sid_key = session_key_override or session_key(project)
+    with sessions_lock:
+        sid = g.sessions.get(_sid_key, {}).get("session_id")
 
     is_demo = project.startswith("demo_")
     cmd = [
@@ -75,7 +153,10 @@ def run_claude(prompt: str, project: str, _retry_count: int = 0, _overload_retry
     if effort:
         cmd.extend(["--effort", effort])
 
-    if is_branch and branch_data:
+    if prompt_override is not None:
+        # D7: externally assembled prompt (team lead / team member)
+        combined = prompt_override
+    elif is_branch and branch_data:
         # 브랜치: 시스템 프롬프트 + 새 세션이면 부모 맥락/브랜치 정보를 첫 메시지에 prepend
         combined = build_branch_prompt(branch_data)
         if not sid:
@@ -90,42 +171,17 @@ def run_claude(prompt: str, project: str, _retry_count: int = 0, _overload_retry
             card_context = build_kanban_card_context(kanban_card)
             prompt = f"{card_context}\n\n---\n\n{prompt}"
     else:
-        current_task = get_current_task(project)
-        task_desc = get_task_description(project, current_task)
-        sys_prompt = build_system_prompt(project, current_task, task_desc)
-
-        # System-wide prompt shared across ALL users (user_id=0)
-        system_prompt_pv = fetch_prompt_from_supabase("_petervoice_system", user_id_override=0) or ""
-
-        if is_demo:
-            common_prompt = ""
-        else:
-            common_prompt = fetch_prompt_from_supabase("_common") or ""
-            if common_prompt and "{동적으로 키 목록 삽입}" in common_prompt:
-                secret_keys = []
-                if SECRETS_ENV_PATH.exists():
-                    for line in SECRETS_ENV_PATH.read_text(encoding="utf-8").splitlines():
-                        if "=" in line:
-                            secret_keys.append(line.split("=", 1)[0])
-                key_list = "\n".join(f"- {k}" for k in secret_keys) if secret_keys else "(없음)"
-                common_prompt = common_prompt.replace("{동적으로 키 목록 삽입}", key_list)
-
-        if is_demo:
-            prompt_file = get_prompt_file("_demo")
-        else:
-            prompt_file = get_prompt_file(project)
-        prompt_content = prompt_file.read_text(encoding="utf-8") if prompt_file and prompt_file.exists() else ""
-
-        session_context = ""
-        if not sid and not is_demo:
-            session_context = _build_session_context_prompt(project)
-            if session_context:
-                logger.info(f"Injecting session context for {project} ({len(session_context)} chars)")
-
-        combined = "\n\n".join(p for p in [sys_prompt, system_prompt_pv, common_prompt, prompt_content, session_context] if p)
+        combined = build_project_prompt(project)
+        if not sid and not project.startswith("demo_"):
+            sc = _build_session_context_prompt(project)
+            if sc:
+                logger.info(f"Injecting session context for {project} ({len(sc)} chars)")
+                combined = combined + "\n\n" + sc if combined else sc
 
     if combined:
-        combined_file = PROMPTS_DIR / f"_combined_{project}.md"
+        # D9-A: unique file per session key to avoid race condition with parallel team members
+        _safe_key = _sid_key.replace(":", "_")
+        combined_file = PROMPTS_DIR / f"_combined_{_safe_key}.md"
         combined_file.write_text(combined, encoding="utf-8")
         cmd.extend(["--append-system-prompt-file", str(combined_file)])
 
@@ -134,9 +190,9 @@ def run_claude(prompt: str, project: str, _retry_count: int = 0, _overload_retry
     # Resolve account — auto-reset session if account changed (must happen before --resume)
     account_name = proj_settings.get("account") or "default"
     if sid:
-        key = session_key(project)
+        # D9-C: use _sid_key (not hardcoded session_key) for account lookup
         with sessions_lock:
-            prev_account = g.sessions.get(key, {}).get("account") or "default"
+            prev_account = g.sessions.get(_sid_key, {}).get("account") or "default"
         if prev_account != account_name:
             logger.info(f"Account changed for {project}: {prev_account} → {account_name}, auto-resetting session")
             save_session_context(project)
@@ -277,9 +333,10 @@ def run_claude(prompt: str, project: str, _retry_count: int = 0, _overload_retry
                             tool_detail = f": {u[:60]}" if u else ""
                         if tool_name:
                             tool_lines.append(f"🔧 {tool_name}{tool_detail}")
-                            api_request(api_key, "POST", "/api/bot/reply", {
-                                "text": "\n".join(tool_lines), "project": project, "is_final": False,
-                            })
+                            if stream_to_chat:
+                                api_request(api_key, "POST", "/api/bot/reply", {
+                                    "text": "\n".join(tool_lines), "project": project, "is_final": False,
+                                })
                 if response_text and not response_text.endswith("\n\n"):
                     response_text += "\n\n"
 
@@ -289,7 +346,7 @@ def run_claude(prompt: str, project: str, _retry_count: int = 0, _overload_retry
                     response_text += delta.get("text", "")
 
             now = time.time()
-            if response_text and (now - last_stream_time) >= stream_interval:
+            if stream_to_chat and response_text and (now - last_stream_time) >= stream_interval:
                 streaming = "\n".join(tool_lines) + "\n\n" + response_text if tool_lines else response_text
                 api_request(api_key, "POST", "/api/bot/reply", {
                     "text": streaming, "project": project, "is_final": False,
@@ -309,13 +366,16 @@ def run_claude(prompt: str, project: str, _retry_count: int = 0, _overload_retry
                         if _overload_retry < MAX_OVERLOAD_RETRIES:
                             wait = wait_times[_overload_retry]
                             logger.warning(f"[{bot_name}] Overloaded (529) for {project}, retry {_overload_retry + 1}/{MAX_OVERLOAD_RETRIES} in {wait}s")
-                            api_request(api_key, "POST", "/api/bot/reply", {
-                                "text": f"(Anthropic 서버 과부하, {wait}초 후 재시도 {_overload_retry + 1}/{MAX_OVERLOAD_RETRIES}...)", "project": project, "is_final": False,
-                            })
+                            if stream_to_chat:
+                                api_request(api_key, "POST", "/api/bot/reply", {
+                                    "text": f"(Anthropic 서버 과부하, {wait}초 후 재시도 {_overload_retry + 1}/{MAX_OVERLOAD_RETRIES}...)", "project": project, "is_final": False,
+                                })
                             proc.wait(timeout=5)
                             g.claude_semaphore.release()
                             time.sleep(wait)
-                            return run_claude(prompt, project, _retry_count, _overload_retry + 1)
+                            # D9-B: forward team params on retry
+                            return run_claude(prompt, project, _retry_count, _overload_retry + 1,
+                                session_key_override=session_key_override, prompt_override=prompt_override, stream_to_chat=stream_to_chat)
                         return ("(Anthropic 서버 과부하 - 잠시 후 다시 시도해주세요)", new_session_id, tool_lines)
                     if "could not process image" in error_text.lower() or "invalid_request_error" in error_text.lower():
                         logger.warning(f"[{bot_name}] Image/request error for {project}, resetting session (retry {_retry_count + 1})")
@@ -327,7 +387,8 @@ def run_claude(prompt: str, project: str, _retry_count: int = 0, _overload_retry
                         g.claude_semaphore.release()
                         if _retry_count >= MAX_CONTEXT_OVERFLOW_RETRIES:
                             return ("(이미지 처리 오류 - 세션이 초기화되었습니다. 다시 말씀해주세요.)", None, tool_lines)
-                        return run_claude(prompt, project, _retry_count + 1)
+                        return run_claude(prompt, project, _retry_count + 1, 0,
+                            session_key_override=session_key_override, prompt_override=prompt_override, stream_to_chat=stream_to_chat)
                     if "context" in error_text.lower():
                         logger.warning(f"[{bot_name}] Context overflow for {project}, resetting (retry {_retry_count + 1})")
                         conv = _fetch_recent_conversation(project, limit=10)
@@ -338,7 +399,8 @@ def run_claude(prompt: str, project: str, _retry_count: int = 0, _overload_retry
                         g.claude_semaphore.release()
                         if _retry_count >= MAX_CONTEXT_OVERFLOW_RETRIES:
                             return ("(컨텍스트 초과 - 최대 재시도 횟수 초과)", None, tool_lines)
-                        return run_claude(prompt, project, _retry_count + 1)
+                        return run_claude(prompt, project, _retry_count + 1, 0,
+                            session_key_override=session_key_override, prompt_override=prompt_override, stream_to_chat=stream_to_chat)
 
         proc.wait(timeout=300)
 
@@ -351,17 +413,19 @@ def run_claude(prompt: str, project: str, _retry_count: int = 0, _overload_retry
                 if conv:
                     _save_session_summary(project, f"[컨텍스트 오버플로우(stderr)로 자동 리셋 — 최근 대화 원본]\n\n{conv}")
                 reset_session(project)
-                claude_semaphore.release()
+                g.claude_semaphore.release()
                 if _retry_count >= MAX_CONTEXT_OVERFLOW_RETRIES:
                     return ("(컨텍스트 초과 - 최대 재시도 횟수 초과)", None, tool_lines)
-                return run_claude(prompt, project, _retry_count + 1)
+                return run_claude(prompt, project, _retry_count + 1, 0,
+                    session_key_override=session_key_override, prompt_override=prompt_override, stream_to_chat=stream_to_chat)
             if "no conversation found" in stderr_output.lower():
                 logger.warning(f"[{bot_name}] Invalid session for {project}, clearing and retrying")
                 reset_session(project)
-                claude_semaphore.release()
+                g.claude_semaphore.release()
                 if _retry_count >= MAX_CONTEXT_OVERFLOW_RETRIES:
                     return ("(세션 오류 - 최대 재시도 횟수 초과)", None, tool_lines)
-                return run_claude(prompt, project, _retry_count + 1)
+                return run_claude(prompt, project, _retry_count + 1, 0,
+                    session_key_override=session_key_override, prompt_override=prompt_override, stream_to_chat=stream_to_chat)
             return (f"(Claude 오류: exit {proc.returncode})", new_session_id, tool_lines)
 
         if not response_text:
@@ -370,9 +434,11 @@ def run_claude(prompt: str, project: str, _retry_count: int = 0, _overload_retry
         response_text = _strip_ansi(response_text)
 
         if new_session_id:
-            update_session(project, new_session_id, account=account_name)
+            # D7: save session by overridden key when team member
+            _save_key = session_key_override or session_key(project)
+            update_session_by_key(_save_key, new_session_id, account=account_name)
             # 브랜치 세션 ID를 DB에도 동기화
-            if is_branch and new_session_id != sid:
+            if is_branch and new_session_id != sid and not session_key_override:
                 from daemon.branches import update_branch_session
                 update_branch_session(int(project.split(":")[1]), new_session_id)
 

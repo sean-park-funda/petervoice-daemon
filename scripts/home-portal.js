@@ -1211,6 +1211,101 @@ setInterval(() => {
   if (changed) saveSessions();
 }, 3600000);
 
+// ─── Docs Search ────────────────────────────────────
+
+function apiDocsSearch(docsDir, query) {
+  const validated = validateDocsDir(docsDir);
+  if (!validated) return { error: "접근 불가 경로" };
+  if (!fs.existsSync(validated)) return { results: [], total: 0 };
+  if (!query || !query.trim()) return { results: [], total: 0 };
+
+  const q = query.trim().toLowerCase();
+  const TEXT_EXTS = new Set([
+    ".md", ".txt", ".csv", ".json", ".yaml", ".yml", ".toml",
+    ".py", ".js", ".ts", ".tsx", ".jsx", ".css", ".html", ".xml",
+    ".sh", ".bash", ".zsh", ".sql", ".env", ".ini", ".cfg",
+    ".rs", ".go", ".java", ".c", ".cpp", ".h", ".rb", ".php",
+    ".swift", ".kt", ".r", ".lua", ".pl", ".ex", ".exs",
+  ]);
+  const MAX_FILE_SIZE = 1024 * 1024;
+  const MAX_RESULTS = 100;
+  const SNIPPET_CONTEXT = 60;
+
+  const results = [];
+
+  function scan(dir, prefix) {
+    if (results.length >= MAX_RESULTS) return;
+    try {
+      const entries = fs.readdirSync(dir, { withFileTypes: true });
+      for (const entry of entries) {
+        if (results.length >= MAX_RESULTS) return;
+        if (entry.name.startsWith(".")) continue;
+        const fullPath = path.join(dir, entry.name);
+        const relPath = prefix ? `${prefix}/${entry.name}` : entry.name;
+
+        if (entry.isDirectory()) {
+          scan(fullPath, relPath);
+          continue;
+        }
+
+        const ext = path.extname(entry.name).toLowerCase();
+        const titleMatch = entry.name.toLowerCase().includes(q);
+        const canReadContent = TEXT_EXTS.has(ext);
+        const contentMatches = [];
+
+        if (canReadContent) {
+          try {
+            const stat = fs.statSync(fullPath);
+            if (stat.size <= MAX_FILE_SIZE) {
+              const content = fs.readFileSync(fullPath, "utf-8");
+              const lines = content.split("\n");
+              for (let i = 0; i < lines.length; i++) {
+                if (contentMatches.length >= 3) break;
+                const idx = lines[i].toLowerCase().indexOf(q);
+                if (idx !== -1) {
+                  const line = lines[i];
+                  const start = Math.max(0, idx - SNIPPET_CONTEXT);
+                  const end = Math.min(line.length, idx + q.length + SNIPPET_CONTEXT);
+                  contentMatches.push({
+                    line: i + 1,
+                    text: (start > 0 ? "..." : "") + line.slice(start, end) + (end < line.length ? "..." : ""),
+                  });
+                }
+              }
+            }
+          } catch { /* skip unreadable files */ }
+        }
+
+        if (titleMatch || contentMatches.length > 0) {
+          let fileType = "file";
+          const IMAGE_EXTS = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp"]);
+          if (ext === ".md") fileType = "doc";
+          else if (IMAGE_EXTS.has(ext)) fileType = "image";
+          else if (TEXT_EXTS.has(ext)) fileType = "text";
+
+          const stat = fs.statSync(fullPath);
+          results.push({
+            title: ext === ".md" ? entry.name.replace(/\.md$/, "") : entry.name,
+            file_path: relPath,
+            type: fileType,
+            title_match: titleMatch,
+            matches: contentMatches,
+            modified: stat.mtime.toISOString(),
+          });
+        }
+      }
+    } catch { /* skip unreadable dirs */ }
+  }
+
+  scan(validated, "");
+  results.sort((a, b) => {
+    if (a.title_match !== b.title_match) return a.title_match ? -1 : 1;
+    return new Date(b.modified).getTime() - new Date(a.modified).getTime();
+  });
+
+  return { results, total: results.length };
+}
+
 // ─── Server ──────────────────────────────────────────
 
 const server = http.createServer((req, res) => {
@@ -1229,6 +1324,7 @@ const server = http.createServer((req, res) => {
   }
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-Api-Key, Authorization");
+  res.setHeader("Access-Control-Allow-Private-Network", "true");
   if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
 
   // JSON helper
@@ -1281,6 +1377,14 @@ const server = http.createServer((req, res) => {
   // Docs API: /api/docs/all — 전체 프로젝트 docs 트리
   else if (pathname === "/api/docs/all" && req.method === "GET") {
     json(apiDocsAll());
+  }
+  // Docs API: /api/docs/search — 문서 검색 (dir + q 쿼리 파라미터)
+  else if (pathname === "/api/docs/search" && req.method === "GET") {
+    const dir = url.searchParams.get("dir");
+    const q = url.searchParams.get("q");
+    if (!dir) return json({ error: "dir 파라미터 필요" }, 400);
+    if (!q) return json({ results: [], total: 0 });
+    json(apiDocsSearch(dir, q));
   }
   // Docs API: /api/docs — 문서 목록 (dir 쿼리 파라미터)
   else if (pathname === "/api/docs" && req.method === "GET") {

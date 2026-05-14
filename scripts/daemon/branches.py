@@ -117,12 +117,22 @@ def build_branch_prompt(branch: dict) -> str:
     # 릴레이 가이드 (모든 브랜치 공통)
     relay_guide = _build_branch_relay_guide(project_id, branch_id)
 
+    # Team project: load lead_prompt_patch for both kanban and pure branches
+    lead_patch = ""
+    try:
+        from daemon.team import load_team
+        team = load_team(project_id)
+        if team and team.get("lead_prompt_patch"):
+            lead_patch = team["lead_prompt_patch"]
+    except ImportError:
+        pass
+
     kanban_card_full = branch.get("kanban_card_full")
     if kanban_card_full:
         # 칸반 카드가 연결된 브랜치 → 기존 카드 규칙 사용
         from daemon.kanban import build_kanban_prompt
         kanban_combined = build_kanban_prompt(kanban_card_full)
-        combined = "\n\n".join(p for p in [system_prompt_pv, kanban_combined, relay_guide, conversation_hint] if p)
+        combined = "\n\n".join(p for p in [system_prompt_pv, kanban_combined, lead_patch, relay_guide, conversation_hint] if p)
         return combined
     else:
         # 순수 브랜치 → 간결한 브랜치 규칙
@@ -152,7 +162,7 @@ curl -X PATCH "$API_URL/api/branches/{branch_id}" \\
   -d '{{"status": "archived"}}'
 ```
 """
-        combined = "\n\n".join(p for p in [system_prompt_pv, common_prompt, project_prompt, branch_prompt, branch_rules, relay_guide, conversation_hint] if p)
+        combined = "\n\n".join(p for p in [system_prompt_pv, common_prompt, project_prompt, branch_prompt, branch_rules, lead_patch, relay_guide, conversation_hint] if p)
         return combined
 
 
