@@ -49,7 +49,7 @@ class Worker(threading.Thread):
         return result.get("pending", [])
 
     def reply(self, text: str, reply_to=None, project="general", is_final=True, subtype=None,
-              member_id=None, member_name=None, member_icon=None):
+              member_id=None, member_name=None, member_icon=None, to_member_name=None):
         payload = {"text": text, "reply_to": reply_to, "project": project, "is_final": is_final}
         if subtype:
             payload["subtype"] = subtype
@@ -59,6 +59,8 @@ class Worker(threading.Thread):
             payload["member_name"] = member_name
         if member_icon:
             payload["member_icon"] = member_icon
+        if to_member_name:
+            payload["to_member_name"] = to_member_name
         api_request(self.api_key, "POST", "/api/bot/reply", payload)
 
     def heartbeat(self, is_working=False, current_task=None, project=None):

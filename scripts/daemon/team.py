@@ -69,6 +69,17 @@ def build_lead_prompt(project: str, team: dict) -> str:
     return base
 
 
+_CROSSTALK_INSTRUCTIONS = """## 팀원 간 소통 규칙
+- 다른 팀원의 전문성이 필요하면 [msg:member-key]로 직접 메시지를 보낼 수 있습니다.
+- 사용 가능한 팀원: {member_list}
+- 메시지 형식:
+  [msg:genre-expert]
+  질문이나 데이터 공유 내용
+  [/msg]
+- 꼭 필요할 때만 사용하세요. 불필요한 대화는 비용과 시간을 낭비합니다.
+- 메시지를 받으면 자신의 전문성 관점에서 답변하고, [msg:상대key]로 회신하세요.
+"""
+
 _GROWTH_INSTRUCTIONS = """## 지식 축적 규칙
 - 분석 중 새로운 패턴, 방법론, 인사이트를 발견하면 docs/team-memory/{member_key}/ 에 마크다운으로 기록하세요.
 - 파일명 형식: YYYY-MM-DD-{주제}.md (예: 2026-05-16-character-arc-patterns.md)
@@ -79,16 +90,23 @@ _GROWTH_INSTRUCTIONS = """## 지식 축적 규칙
 """
 
 
-def build_member_prompt(member: dict, project: str) -> str:
+def build_member_prompt(member: dict, project: str, team_members: list[dict] | None = None) -> str:
     from daemon.claude_runner import _load_wiki_index
     system_prompt_pv = fetch_prompt_from_supabase("_petervoice_system", user_id_override=0) or ""
     persona = member.get("persona_prompt", "")
     wiki_index = _load_wiki_index(project)
     knowledge = _load_knowledge_docs(member, project)
-    memory = _load_member_memory(member.get("member_key", ""), project)
     member_key = member.get("member_key", "unknown")
+    memory = _load_member_memory(member_key, project)
     growth = _GROWTH_INSTRUCTIONS.replace("{member_key}", member_key)
-    parts = [p for p in [system_prompt_pv, persona, wiki_index, knowledge, memory, growth] if p]
+    crosstalk = ""
+    if team_members:
+        others = [f"  - `{m['member_key']}` — {m.get('icon', '')} {m.get('name', m['member_key'])}"
+                  for m in team_members if m["member_key"] != member_key]
+        if others:
+            member_list = "\n".join(others)
+            crosstalk = _CROSSTALK_INSTRUCTIONS.replace("{member_list}", member_list)
+    parts = [p for p in [system_prompt_pv, persona, wiki_index, knowledge, memory, growth, crosstalk] if p]
     return "\n\n".join(parts)
 
 
@@ -152,6 +170,64 @@ DELEGATE_PATTERN = re.compile(
     re.DOTALL,
 )
 
+# ─── Cross-talk parsing ─────────────────────────────────
+
+MSG_PATTERN = re.compile(
+    r'\[msg:([a-z0-9_-]+)\](.*?)\[/msg\]',
+    re.DOTALL,
+)
+
+
+def parse_crosstalk(text: str) -> list[dict]:
+    return [
+        {"to": m.group(1), "content": m.group(2).strip()}
+        for m in MSG_PATTERN.finditer(text)
+    ]
+
+
+def strip_crosstalk(text: str) -> str:
+    return MSG_PATTERN.sub("", text).strip()
+
+
+def format_crosstalk_for_display(text: str, from_member: dict, member_map: dict) -> str:
+    def _replace(m):
+        to_key = m.group(1)
+        content = m.group(2).strip()
+        to_m = member_map.get(to_key, {})
+        to_icon = to_m.get("icon", "👤")
+        to_name = to_m.get("name", to_key)
+        quoted = "\n".join(f"> {line}" for line in content.splitlines())
+        return f"\n\n💬 → {to_icon} **{to_name}:**\n{quoted}\n"
+    return MSG_PATTERN.sub(_replace, text).strip()
+
+
+def format_incoming_messages(messages: list[dict], member_map: dict, round_num: int) -> str:
+    lines = [f"## 팀 대화 (라운드 {round_num})", ""]
+    for msg in messages:
+        from_m = member_map.get(msg["from_key"], {})
+        icon = from_m.get("icon", "👤")
+        name = from_m.get("name", msg["from_key"])
+        quoted = "\n".join(f"> {line}" for line in msg["content"].splitlines())
+        lines.append(f"{icon} **{name}** → 나:")
+        lines.append(quoted)
+        lines.append("")
+    lines.append("위 메시지에 답변하세요. 필요하면 다른 팀원에게도 [msg:member-key]로 메시지를 보낼 수 있습니다.")
+    return "\n".join(lines)
+
+
+def format_conversation_log(log: list[dict], member_map: dict) -> str:
+    lines = ["[팀원 간 대화 기록]", ""]
+    for msg in log:
+        from_m = member_map.get(msg["from_key"], {})
+        to_m = member_map.get(msg["to_key"], {})
+        lines.append(
+            f"{from_m.get('icon', '👤')} {from_m.get('name', msg['from_key'])} → "
+            f"{to_m.get('icon', '👤')} {to_m.get('name', msg['to_key'])}:"
+        )
+        lines.append(msg["content"])
+        lines.append("")
+    return "\n".join(lines)
+
 
 def parse_delegates(text: str) -> list[dict]:
     return [
@@ -196,10 +272,11 @@ def run_team_member(
     project: str,
     branch_id: int | None,
     team_project: str | None = None,
+    team_members: list[dict] | None = None,
 ) -> tuple[str, str | None, list]:
     from daemon.claude_runner import run_claude
 
-    member_prompt = build_member_prompt(member, team_project or project)
+    member_prompt = build_member_prompt(member, team_project or project, team_members)
     sk = team_session_key(project, member["member_key"], branch_id)
     full_prompt = f"{task}\n\n[맥락]\nCEO 요청: {original_message}"
 
@@ -223,6 +300,7 @@ def run_members_parallel(
     team_project: str | None = None,
 ) -> list[dict]:
     member_map = {m["member_key"]: m for m in team["members"]}
+    team_members = team["members"]
     results = []
 
     icons = " ".join(
@@ -245,7 +323,8 @@ def run_members_parallel(
                 logger.warning(f"[team] Unknown member_key: {d['member_key']}")
                 continue
             future = pool.submit(
-                run_team_member, member, d["task"], original_message, project, branch_id, team_project
+                run_team_member, member, d["task"], original_message,
+                project, branch_id, team_project, team_members,
             )
             futures[future] = member
 
@@ -257,8 +336,14 @@ def run_members_parallel(
                 logger.error(f"[team] Member {member['member_key']} failed: {e}")
                 response = f"(응답 실패: {e})"
 
+            display = format_crosstalk_for_display(
+                strip_crosstalk(response) if not parse_crosstalk(response) else response,
+                member, member_map,
+            )
+            clean = strip_crosstalk(display)
+
             worker.reply(
-                response,
+                clean,
                 reply_to=[msg_id],
                 project=project,
                 is_final=True,
@@ -270,10 +355,103 @@ def run_members_parallel(
                 "member_key": member["member_key"],
                 "name": member["name"],
                 "icon": member["icon"],
-                "response": response,
+                "response": strip_crosstalk(response),
+                "raw_response": response,
             })
 
     return results
+
+
+# ─── Cross-talk round execution ─────────────────────────
+
+def run_crosstalk_round(
+    round_num: int,
+    pending: list[dict],
+    team: dict,
+    original_message: str,
+    project: str,
+    branch_id: int | None,
+    worker,
+    msg_id: int,
+    team_project: str | None = None,
+) -> tuple[list[dict], list[dict]]:
+    member_map = {m["member_key"]: m for m in team["members"]}
+    team_members = team["members"]
+
+    by_recipient: dict[str, list[dict]] = {}
+    for msg in pending:
+        by_recipient.setdefault(msg["to_key"], []).append(msg)
+
+    icons = " ".join(
+        member_map[k]["icon"] for k in by_recipient if k in member_map
+    )
+    worker.reply(
+        f"💬 라운드 {round_num}: {icons} 팀원 간 대화 중...",
+        reply_to=[msg_id], project=project, is_final=False,
+    )
+
+    results = []
+    new_pending = []
+
+    with ThreadPoolExecutor(max_workers=max(len(by_recipient), 1)) as pool:
+        futures = {}
+        for recipient_key, messages in by_recipient.items():
+            member = member_map.get(recipient_key)
+            if not member:
+                continue
+            context = format_incoming_messages(messages, member_map, round_num)
+            future = pool.submit(
+                run_team_member, member, context, original_message,
+                project, branch_id, team_project, team_members,
+            )
+            futures[future] = (member, recipient_key)
+
+        for future in as_completed(futures):
+            member, recipient_key = futures[future]
+            try:
+                response, _, _ = future.result()
+            except Exception as e:
+                logger.error(f"[team] Crosstalk member {recipient_key} failed: {e}")
+                response = f"(응답 실패: {e})"
+
+            outgoing = parse_crosstalk(response)
+            for out in outgoing:
+                if out["to"] != recipient_key:
+                    new_pending.append({
+                        "round": round_num,
+                        "from_key": recipient_key,
+                        "to_key": out["to"],
+                        "content": out["content"],
+                    })
+
+            clean = strip_crosstalk(response)
+            from_m = member_map.get(recipient_key, {})
+            to_keys = [out["to"] for out in outgoing]
+            to_names = []
+            for tk in to_keys:
+                tm = member_map.get(tk, {})
+                to_names.append(f"{tm.get('icon', '👤')} {tm.get('name', tk)}")
+
+            worker.reply(
+                clean,
+                reply_to=[msg_id],
+                project=project,
+                is_final=True,
+                member_id=recipient_key,
+                member_name=member["name"],
+                member_icon=member["icon"],
+                to_member_name=", ".join(to_names) if to_names else None,
+            )
+            results.append({
+                "member_key": recipient_key,
+                "name": member["name"],
+                "icon": member["icon"],
+                "response": clean,
+                "raw_response": response,
+            })
+
+    logger.info(f"[team] Crosstalk round {round_num}: {len(results)} responses, {len(new_pending)} new messages")
+    return results, new_pending
 
 
 # ─── Graphify integration ────────────────────────────────
@@ -358,12 +536,40 @@ def process_team_message(
     if not member_results:
         return (display_response, all_tool_lines)
 
+    # Step 3.5: cross-talk loop
+    max_ct_rounds = team.get("config", {}).get("max_crosstalk_rounds", 3)
+    conversation_log: list[dict] = []
+
+    pending_msgs: list[dict] = []
+    for r in member_results:
+        for ct in parse_crosstalk(r.get("raw_response", "")):
+            if ct["to"] != r["member_key"]:
+                pending_msgs.append({
+                    "round": 1, "from_key": r["member_key"],
+                    "to_key": ct["to"], "content": ct["content"],
+                })
+    conversation_log.extend(pending_msgs)
+
+    ct_round = 2
+    while pending_msgs and ct_round <= max_ct_rounds + 1:
+        if uid and check_stop_requested(uid):
+            break
+        ct_results, new_pending = run_crosstalk_round(
+            ct_round, pending_msgs, team, prompt, project,
+            branch_id, worker, msg_id, _team_proj,
+        )
+        conversation_log.extend(new_pending)
+        pending_msgs = new_pending
+        ct_round += 1
+
     # Step 4: check stop
     if uid and check_stop_requested(uid):
         return (display_response + "\n\n(팀원 결과 취합 전 중단됨)", all_tool_lines)
 
     # Step 5: team lead consolidation — stream_to_chat=True (no delegate blocks)
     summary_prompt = format_member_results(member_results)
+    if conversation_log:
+        summary_prompt += "\n\n" + format_conversation_log(conversation_log, member_map)
     summary_response, _, summary_tools = run_claude(
         summary_prompt,
         project,
