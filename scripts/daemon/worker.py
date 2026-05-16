@@ -317,7 +317,8 @@ class Worker(threading.Thread):
 
         if _is_team and process_team_message:
             response, tool_lines = process_team_message(
-                prompt_text, project, self, msg_id, _branch_id
+                prompt_text, project, self, msg_id, _branch_id,
+                team_project=_check_project,
             )
         elif _engine == "codex":
             response, sid, tool_lines = run_codex(prompt_text, project)
@@ -346,8 +347,7 @@ class Worker(threading.Thread):
 
         dequeue_message(msg_id)
 
-        chunk_count = len(chunks) if not _is_team else 0
-        logger.info(f"[{self.bot_name}] Replied msg #{msg_id}: {len(response)} chars, {chunk_count} chunk(s)")
+        logger.info(f"[{self.bot_name}] Replied msg #{msg_id}: {len(response)} chars, team={_is_team}")
 
     def _get_project_lock(self, project: str) -> threading.Lock:
         with project_locks_lock:
