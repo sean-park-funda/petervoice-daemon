@@ -1427,7 +1427,7 @@ const server = http.createServer((req, res) => {
       const fileName = subpath ? path.basename(subpath) : file.filename;
       const targetPath = path.resolve(targetDir, fileName);
       if (!targetPath.startsWith(validated)) return json({ error: "접근 불가 경로" }, 403);
-      if (file.data.length > 50 * 1024 * 1024) return json({ error: "50MB 초과" }, 413);
+      if (file.data.length > 500 * 1024 * 1024) return json({ error: "500MB 초과" }, 413);
       try {
         fs.mkdirSync(targetDir, { recursive: true });
         fs.writeFileSync(targetPath, file.data);
