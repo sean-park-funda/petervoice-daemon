@@ -1051,6 +1051,104 @@ function parseMultipart(req) {
   });
 }
 
+function parseMultipartStreaming(req, maxFileSize) {
+  return new Promise((resolve, reject) => {
+    const contentType = req.headers["content-type"] || "";
+    const bMatch = contentType.match(/boundary=(?:"([^"]+)"|([^\s;]+))/);
+    if (!bMatch) return reject(new Error("No boundary"));
+    const boundary = (bMatch[1] || bMatch[2]).trim();
+    const boundaryBuf = Buffer.from("--" + boundary);
+    const DELIM = Buffer.from("\r\n--" + boundary);
+    const HEADER_END = Buffer.from("\r\n\r\n");
+    const HOLD_BACK = DELIM.length + 4;
+
+    const fields = {};
+    let fileFilename = null;
+    let fileSize = 0;
+    let tempPath = null;
+    let writeStream = null;
+    let fileStarted = false;
+    let done = false;
+    let buf = Buffer.alloc(0);
+    let held = Buffer.alloc(0);
+
+    function cleanup() {
+      if (writeStream) { try { writeStream.destroy(); } catch {} writeStream = null; }
+      if (tempPath) { try { fs.unlinkSync(tempPath); } catch {} tempPath = null; }
+    }
+    function fail(msg) {
+      if (done) return;
+      done = true; cleanup(); reject(new Error(msg));
+      try { req.destroy(); } catch {}
+    }
+    function flushToFile(data) {
+      if (done || !writeStream) return;
+      fileSize += data.length;
+      if (fileSize > maxFileSize) { fail(`${Math.round(maxFileSize / (1024 * 1024))}MB 초과`); return; }
+      writeStream.write(data);
+    }
+    function parseFieldParts(segment) {
+      let pos = 0;
+      while (pos < segment.length) {
+        const bStart = segment.indexOf(boundaryBuf, pos);
+        if (bStart === -1) break;
+        const afterB = bStart + boundaryBuf.length;
+        if (afterB >= segment.length) break;
+        if (segment[afterB] === 0x2D && segment[afterB + 1] === 0x2D) break;
+        const hStart = afterB + 2;
+        const hEnd = segment.indexOf(HEADER_END, hStart);
+        if (hEnd === -1) break;
+        const header = segment.slice(hStart, hEnd).toString("utf-8");
+        if (header.includes("filename")) { pos = segment.indexOf(boundaryBuf, hEnd); if (pos === -1) break; continue; }
+        const bdy = hEnd + 4;
+        const nextB = segment.indexOf(boundaryBuf, bdy);
+        const bdyEnd = nextB !== -1 ? nextB - 2 : segment.length;
+        const nm = header.match(/name="([^"]+)"/);
+        if (nm) fields[nm[1]] = segment.slice(bdy, bdyEnd).toString("utf-8");
+        pos = nextB !== -1 ? nextB : segment.length;
+      }
+    }
+
+    req.on("data", (chunk) => {
+      if (done) return;
+      if (!fileStarted) {
+        buf = Buffer.concat([buf, chunk]);
+        if (buf.length > 2 * 1024 * 1024) { fail("요청 헤더가 너무 큼"); return; }
+        const fnIdx = buf.indexOf(Buffer.from("filename"));
+        if (fnIdx === -1) return;
+        const hEnd = buf.indexOf(HEADER_END, fnIdx);
+        if (hEnd === -1) return;
+        const hdr = buf.slice(fnIdx, hEnd).toString("utf-8");
+        const m1 = hdr.match(/filename\*=UTF-8''([^\s;\r]+)/);
+        const m2 = hdr.match(/filename="([^"]*)"/);
+        fileFilename = m1 ? decodeURIComponent(m1[1]) : (m2 ? m2[1] : "unknown");
+        parseFieldParts(buf.slice(0, hEnd + 4));
+        tempPath = path.join(os.tmpdir(), `pv-upload-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+        writeStream = fs.createWriteStream(tempPath);
+        writeStream.on("error", (e) => fail("디스크 쓰기 실패: " + e.message));
+        fileStarted = true;
+        held = buf.slice(hEnd + 4);
+        buf = null;
+        if (held.length > HOLD_BACK) { flushToFile(held.slice(0, held.length - HOLD_BACK)); held = held.slice(held.length - HOLD_BACK); }
+        return;
+      }
+      held = Buffer.concat([held, chunk]);
+      if (held.length > HOLD_BACK) { flushToFile(held.slice(0, held.length - HOLD_BACK)); held = held.slice(held.length - HOLD_BACK); }
+    });
+
+    req.on("end", () => {
+      if (done) return;
+      if (!fileStarted) { parseFieldParts(buf); resolve({ fields, file: null }); return; }
+      const dIdx = held.indexOf(DELIM);
+      if (dIdx > 0) flushToFile(held.slice(0, dIdx));
+      else if (dIdx === -1 && held.length > 0) flushToFile(held);
+      if (done) return;
+      writeStream.end(() => { resolve({ fields, file: { filename: fileFilename, tempPath, size: fileSize } }); });
+    });
+    req.on("error", (e) => fail("네트워크 오류: " + e.message));
+  });
+}
+
 // ─── Auth ────────────────────────────────────────────
 
 // 세션 스토어 (파일 영속 — 재시작 후에도 유지)
@@ -1414,28 +1512,57 @@ const server = http.createServer((req, res) => {
       json(apiDocsMkdir(dir, name));
     });
   }
-  // Docs API: /api/docs/upload — 파일 업로드
+  // Docs API: /api/docs/upload — 파일 업로드 (스트리밍 + 청크 지원)
   else if (pathname === "/api/docs/upload" && req.method === "POST") {
-    parseMultipart(req).then(parts => {
-      const dir = parts.dir;
-      const subpath = parts.path || "";
-      const file = parts.file;
-      if (!dir || !file) return json({ error: "dir, file 필요" }, 400);
-      const validated = validateDocsDir(dir);
-      if (!validated) return json({ error: "접근 불가 경로" }, 403);
+    const MAX_FILE_SIZE = 500 * 1024 * 1024;
+    parseMultipartStreaming(req, MAX_FILE_SIZE).then(({ fields, file }) => {
+      if (!fields.dir || !file) return json({ error: "dir, file 필요" }, 400);
+      const validated = validateDocsDir(fields.dir);
+      if (!validated) { if (file.tempPath) try { fs.unlinkSync(file.tempPath); } catch {} return json({ error: "접근 불가 경로" }, 403); }
+      const subpath = fields.path || "";
+
+      // ── 청크 업로드 모드 ──
+      if (fields.uploadId) {
+        const chunkIdx = parseInt(fields.chunkIndex || "0");
+        const totalChunks = parseInt(fields.totalChunks || "1");
+        const chunkDir = path.join(os.tmpdir(), "pv-chunks");
+        fs.mkdirSync(chunkDir, { recursive: true });
+        const chunkFile = path.join(chunkDir, `${fields.uploadId}.part`);
+        try {
+          if (chunkIdx === 0) fs.copyFileSync(file.tempPath, chunkFile);
+          else fs.appendFileSync(chunkFile, fs.readFileSync(file.tempPath));
+          fs.unlinkSync(file.tempPath);
+          if (chunkIdx < totalChunks - 1) return json({ ok: true, chunk: chunkIdx });
+          // 마지막 청크 — 최종 위치로 이동
+          const stat = fs.statSync(chunkFile);
+          if (stat.size > MAX_FILE_SIZE) { fs.unlinkSync(chunkFile); return json({ error: "500MB 초과" }, 413); }
+          const targetDir = subpath ? path.join(validated, path.dirname(subpath)) : validated;
+          const fileName = subpath ? path.basename(subpath) : file.filename;
+          const targetPath = path.resolve(targetDir, fileName);
+          if (!targetPath.startsWith(validated)) { fs.unlinkSync(chunkFile); return json({ error: "접근 불가 경로" }, 403); }
+          fs.mkdirSync(targetDir, { recursive: true });
+          fs.renameSync(chunkFile, targetPath);
+          return json({ ok: true, path: path.relative(validated, targetPath), size: stat.size });
+        } catch (e) {
+          try { fs.unlinkSync(file.tempPath); } catch {}
+          return json({ error: "청크 저장 실패: " + e.message }, 500);
+        }
+      }
+
+      // ── 일반 업로드 (스트리밍 완료) ──
       const targetDir = subpath ? path.join(validated, path.dirname(subpath)) : validated;
       const fileName = subpath ? path.basename(subpath) : file.filename;
       const targetPath = path.resolve(targetDir, fileName);
-      if (!targetPath.startsWith(validated)) return json({ error: "접근 불가 경로" }, 403);
-      if (file.data.length > 500 * 1024 * 1024) return json({ error: "500MB 초과" }, 413);
+      if (!targetPath.startsWith(validated)) { try { fs.unlinkSync(file.tempPath); } catch {} return json({ error: "접근 불가 경로" }, 403); }
       try {
         fs.mkdirSync(targetDir, { recursive: true });
-        fs.writeFileSync(targetPath, file.data);
-        json({ ok: true, path: path.relative(validated, targetPath), size: file.data.length });
+        fs.renameSync(file.tempPath, targetPath);
+        json({ ok: true, path: path.relative(validated, targetPath), size: file.size });
       } catch (e) {
+        try { fs.unlinkSync(file.tempPath); } catch {}
         json({ error: "저장 실패: " + e.message }, 500);
       }
-    }).catch(e => json({ error: "업로드 파싱 실패: " + e.message }, 400));
+    }).catch(e => json({ error: "업로드 실패: " + e.message }, 400));
   }
   // Docs API: /api/docs/copy — 파일/폴더 복사 (다른 프로젝트로)
   else if (pathname === "/api/docs/copy" && req.method === "POST") {
