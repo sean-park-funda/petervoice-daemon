@@ -389,7 +389,7 @@ def run_claude(
                             return ("(이미지 처리 오류 - 세션이 초기화되었습니다. 다시 말씀해주세요.)", None, tool_lines)
                         return run_claude(prompt, project, _retry_count + 1, 0,
                             session_key_override=session_key_override, prompt_override=prompt_override, stream_to_chat=stream_to_chat)
-                    if "context" in error_text.lower():
+                    if "context" in error_text.lower() or "prompt is too long" in error_text.lower():
                         logger.warning(f"[{bot_name}] Context overflow for {project}, resetting (retry {_retry_count + 1})")
                         conv = _fetch_recent_conversation(project, limit=10)
                         if conv:
@@ -407,7 +407,7 @@ def run_claude(
         stderr_output = proc.stderr.read().decode("utf-8", errors="replace").strip()
         if proc.returncode != 0 and not response_text:
             logger.error(f"[{bot_name}] Claude exited {proc.returncode}: {stderr_output[:500]}")
-            if "context" in stderr_output.lower():
+            if "context" in stderr_output.lower() or "prompt is too long" in stderr_output.lower():
                 logger.warning(f"[{bot_name}] Context overflow (stderr) for {project}, resetting (retry {_retry_count + 1})")
                 conv = _fetch_recent_conversation(project, limit=10)
                 if conv:
@@ -432,6 +432,16 @@ def run_claude(
             response_text = "(작업 완료)" if tool_lines else "(응답 없음)"
 
         response_text = _strip_ansi(response_text)
+
+        if response_text.strip().lower() == "prompt is too long" and _retry_count < MAX_CONTEXT_OVERFLOW_RETRIES:
+            logger.warning(f"[{bot_name}] Prompt too long for {project}, resetting (retry {_retry_count + 1})")
+            conv = _fetch_recent_conversation(project, limit=10)
+            if conv:
+                _save_session_summary(project, f"[프롬프트 초과로 자동 리셋 — 최근 대화 원본]\n\n{conv}")
+            reset_session(project)
+            g.claude_semaphore.release()
+            return run_claude(prompt, project, _retry_count + 1, 0,
+                session_key_override=session_key_override, prompt_override=prompt_override, stream_to_chat=stream_to_chat)
 
         if new_session_id:
             # D7: save session by overridden key when team member
@@ -605,11 +615,9 @@ def run_codex(prompt: str, project: str, _retry_count: int = 0) -> tuple[str, st
         _prepare_agents_md(project_dir, combined)
 
     # Build command
-    # ChatGPT OAuth doesn't support -m flag; only set model when using API key
     branch_model = branch_data.get("model") if is_branch and branch_data else None
     model = branch_model or proj_settings.get("codex_model") or config.get("codex_default_model")
-    openai_key = config.get("openai_api_key")
-    use_model_flag = bool(model and openai_key)
+    use_model_flag = bool(model)
     bot_name = config.get("bot_name", "bot")
 
     if sid:
