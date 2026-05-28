@@ -82,34 +82,33 @@ class AutoUpdater(threading.Thread):
                 logger.warning(f"[updater] pip install failed: {e}")
 
     def _update_cli_if_needed(self):
-        """Update Claude CLI if .claude-cli-version specifies a newer version."""
-        version_file = self._repo_dir / ".claude-cli-version"
-        if not version_file.exists():
-            return
-
+        """Update Claude CLI to latest if a newer version is available on npm."""
         try:
-            target = version_file.read_text().strip()
-            if not target:
-                return
+            _env = {**__import__("os").environ, "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"}
 
             r = subprocess.run(
                 ["claude", "--version"],
-                capture_output=True, text=True, timeout=10,
-                env={**__import__("os").environ, "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"},
+                capture_output=True, text=True, timeout=10, env=_env,
             )
             current = r.stdout.strip().split()[0] if r.returncode == 0 else ""
-
-            if not current or current == target:
+            if not current:
                 return
 
-            logger.info(f"[updater] Updating Claude CLI: {current} → {target}")
             r = subprocess.run(
-                ["npm", "install", "-g", f"@anthropic-ai/claude-code@{target}"],
-                capture_output=True, text=True, timeout=180,
-                env={**__import__("os").environ, "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"},
+                ["npm", "view", "@anthropic-ai/claude-code", "version"],
+                capture_output=True, text=True, timeout=15, env=_env,
+            )
+            latest = r.stdout.strip() if r.returncode == 0 else ""
+            if not latest or current == latest:
+                return
+
+            logger.info(f"[updater] Updating Claude CLI: {current} → {latest}")
+            r = subprocess.run(
+                ["npm", "install", "-g", f"@anthropic-ai/claude-code@{latest}"],
+                capture_output=True, text=True, timeout=180, env=_env,
             )
             if r.returncode == 0:
-                logger.info(f"[updater] Claude CLI updated to {target}")
+                logger.info(f"[updater] Claude CLI updated to {latest}")
             else:
                 logger.warning(f"[updater] Claude CLI update failed: {r.stderr.strip()[:200]}")
         except Exception as e:
@@ -122,6 +121,9 @@ class AutoUpdater(threading.Thread):
         if not self._repo_dir:
             logger.warning("[updater] Could not find git repository root")
             return
+
+        # CLI update — independent of git pull, runs every cycle
+        self._update_cli_if_needed()
 
         if self._consecutive_failures >= self.MAX_FAILURES:
             logger.warning("[updater] Paused after %d consecutive failures", self.MAX_FAILURES)
@@ -160,7 +162,6 @@ class AutoUpdater(threading.Thread):
 
         new_head = self._local_head()
         if new_head == old_head:
-            # Local is ahead of remote (dev machine) — nothing changed
             self._consecutive_failures = 0
             return
 
@@ -172,13 +173,10 @@ class AutoUpdater(threading.Thread):
         # 5. Install dependencies if changed
         self._pip_install_if_changed(old_head, new_head)
 
-        # 6. Update Claude CLI if .claude-cli-version changed
-        self._update_cli_if_needed()
-
-        # 7. Restart Home Portal if home-portal.js changed
+        # 6. Restart Home Portal if home-portal.js changed
         self._restart_home_portal_if_changed(old_head, new_head)
 
-        # 8. Restart daemon
+        # 7. Restart daemon
         self._consecutive_failures = 0
         logger.info("[updater] Restarting daemon to apply updates...")
         import daemon.globals as g
