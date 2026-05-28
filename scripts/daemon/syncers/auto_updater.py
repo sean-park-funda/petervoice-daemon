@@ -81,6 +81,40 @@ class AutoUpdater(threading.Thread):
             except Exception as e:
                 logger.warning(f"[updater] pip install failed: {e}")
 
+    def _update_cli_if_needed(self):
+        """Update Claude CLI if .claude-cli-version specifies a newer version."""
+        version_file = self._repo_dir / ".claude-cli-version"
+        if not version_file.exists():
+            return
+
+        try:
+            target = version_file.read_text().strip()
+            if not target:
+                return
+
+            r = subprocess.run(
+                ["claude", "--version"],
+                capture_output=True, text=True, timeout=10,
+                env={**__import__("os").environ, "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"},
+            )
+            current = r.stdout.strip().split()[0] if r.returncode == 0 else ""
+
+            if not current or current == target:
+                return
+
+            logger.info(f"[updater] Updating Claude CLI: {current} → {target}")
+            r = subprocess.run(
+                ["npm", "install", "-g", f"@anthropic-ai/claude-code@{target}"],
+                capture_output=True, text=True, timeout=180,
+                env={**__import__("os").environ, "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"},
+            )
+            if r.returncode == 0:
+                logger.info(f"[updater] Claude CLI updated to {target}")
+            else:
+                logger.warning(f"[updater] Claude CLI update failed: {r.stderr.strip()[:200]}")
+        except Exception as e:
+            logger.warning(f"[updater] CLI update check failed (non-blocking): {e}")
+
     def check_once(self):
         if not config.get("auto_update_enabled", True):
             return
@@ -138,10 +172,13 @@ class AutoUpdater(threading.Thread):
         # 5. Install dependencies if changed
         self._pip_install_if_changed(old_head, new_head)
 
-        # 6. Restart Home Portal if home-portal.js changed
+        # 6. Update Claude CLI if .claude-cli-version changed
+        self._update_cli_if_needed()
+
+        # 7. Restart Home Portal if home-portal.js changed
         self._restart_home_portal_if_changed(old_head, new_head)
 
-        # 7. Restart daemon
+        # 8. Restart daemon
         self._consecutive_failures = 0
         logger.info("[updater] Restarting daemon to apply updates...")
         import daemon.globals as g
