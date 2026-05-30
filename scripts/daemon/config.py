@@ -78,24 +78,40 @@ def load_config():
     logger.info(f"Config loaded: bot={g.config.get('bot_name', '?')}, {len(g.config.get('project_dirs', {}))} project dirs")
 
 
+def _is_daemon_process(pid: int) -> bool:
+    """Check if a PID belongs to an actual daemon process, not a reused PID."""
+    try:
+        r = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "command="],
+            capture_output=True, text=True, timeout=5,
+        )
+        return r.returncode == 0 and "claude_daemon" in r.stdout
+    except Exception:
+        return False
+
+
 def cleanup_stale_state():
     """Check for dead daemon PID files and recover stale state on startup."""
     if PID_PATH.exists():
         try:
             old_pid = int(PID_PATH.read_text().strip())
             os.kill(old_pid, 0)
-            logger.warning(f"Previous daemon still running (PID {old_pid}), waiting up to 30s...")
-            for i in range(30):
-                time.sleep(1)
-                try:
-                    os.kill(old_pid, 0)
-                except (ProcessLookupError, OSError):
-                    logger.info(f"Previous daemon exited after {i+1}s")
-                    PID_PATH.unlink(missing_ok=True)
-                    break
+            if not _is_daemon_process(old_pid):
+                logger.warning(f"PID {old_pid} is alive but not a daemon process — clearing stale PID file")
+                PID_PATH.unlink(missing_ok=True)
             else:
-                logger.error(f"Another daemon is still running (PID {old_pid})")
-                sys.exit(1)
+                logger.warning(f"Previous daemon still running (PID {old_pid}), waiting up to 30s...")
+                for i in range(30):
+                    time.sleep(1)
+                    try:
+                        os.kill(old_pid, 0)
+                    except (ProcessLookupError, OSError):
+                        logger.info(f"Previous daemon exited after {i+1}s")
+                        PID_PATH.unlink(missing_ok=True)
+                        break
+                else:
+                    logger.error(f"Another daemon is still running (PID {old_pid})")
+                    sys.exit(1)
         except (ValueError, ProcessLookupError, OSError):
             logger.warning(f"Cleaning up stale PID file (dead process)")
             PID_PATH.unlink(missing_ok=True)
