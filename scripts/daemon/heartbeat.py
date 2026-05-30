@@ -1,6 +1,7 @@
 """Heartbeat thread: periodically inject due task messages."""
 
 import json
+import os
 import time
 import threading
 from datetime import datetime, timedelta, timezone
@@ -8,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 import daemon.globals as g
 from daemon.globals import config, active_projects, active_projects_lock, shutdown_event, logger
 from daemon.api import api_request, inject_system_message
+from daemon.supabase import get_project_dir
 
 
 class HeartbeatThread(threading.Thread):
@@ -47,8 +49,36 @@ class HeartbeatThread(threading.Thread):
             return result["tasks"]
         return []
 
+    def _check_heartbeat_md(self, project: str) -> str | None:
+        """Check if docs/HEARTBEAT.md exists. Returns warning message or None."""
+        try:
+            project_dir = get_project_dir(project)
+            if not project_dir:
+                return "프로젝트 디렉토리를 찾을 수 없음"
+            heartbeat_path = os.path.join(project_dir, "docs", "HEARTBEAT.md")
+            if not os.path.exists(heartbeat_path):
+                return "HEARTBEAT.md 파일 없음 — 태스크가 실행되어도 할 일이 정의되지 않음"
+            content = open(heartbeat_path).read().strip()
+            if not content:
+                return "HEARTBEAT.md가 비어 있음"
+            if "[ ]" not in content:
+                return "HEARTBEAT.md에 미완료 항목 없음"
+            return None
+        except Exception:
+            return None
+
     def _process_task(self, task: dict):
         project = task["project"]
+
+        # Check HEARTBEAT.md existence and update warning
+        warning = self._check_heartbeat_md(project)
+        prev_warning = task.get("warning")
+        if warning != prev_warning:
+            self._update_task(task["id"], {"warning": warning})
+            if warning:
+                logger.info(f"[heartbeat] {project} warning: {warning}")
+            else:
+                logger.info(f"[heartbeat] {project} warning cleared")
 
         if task.get("active_hours") and not self._in_active_hours(task["active_hours"]):
             return
@@ -64,6 +94,16 @@ class HeartbeatThread(threading.Thread):
             next_run = datetime.now(timezone.utc) + timedelta(minutes=5)
             self._update_task(task["id"], {"next_run_at": next_run.isoformat()})
             logger.info(f"[heartbeat] {project} busy → postponed 5m")
+            return
+
+        # Skip inject if no valid HEARTBEAT.md
+        if warning and "파일 없음" in warning:
+            interval = task.get("interval_min", 30)
+            next_run = datetime.now(timezone.utc) + timedelta(minutes=interval)
+            self._update_task(task["id"], {
+                "next_run_at": next_run.isoformat(),
+            })
+            logger.info(f"[heartbeat] {project} skipped (no HEARTBEAT.md)")
             return
 
         msg_id, ts = inject_system_message(project, self.HEARTBEAT_MSG, prefix="[heartbeat]")
