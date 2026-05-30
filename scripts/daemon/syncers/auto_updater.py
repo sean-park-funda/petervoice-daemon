@@ -103,12 +103,22 @@ class AutoUpdater(threading.Thread):
                 return
 
             logger.info(f"[updater] Updating Claude CLI: {current} → {latest}")
+            import platform
+            if platform.machine() == "arm64" and __import__("sys").platform == "darwin":
+                subprocess.run(
+                    ["npm", "install", "-g", "@anthropic-ai/claude-code-darwin-arm64"],
+                    capture_output=True, text=True, timeout=120, env=_env,
+                )
             r = subprocess.run(
                 ["npm", "install", "-g", f"@anthropic-ai/claude-code@{latest}"],
                 capture_output=True, text=True, timeout=180, env=_env,
             )
             if r.returncode == 0:
-                logger.info(f"[updater] Claude CLI updated to {latest}")
+                v = subprocess.run(["claude", "--version"], capture_output=True, text=True, timeout=10, env=_env)
+                if v.returncode == 0:
+                    logger.info(f"[updater] Claude CLI updated to {v.stdout.strip()}")
+                else:
+                    logger.warning(f"[updater] Claude CLI binary broken after update — may need manual fix")
             else:
                 logger.warning(f"[updater] Claude CLI update failed: {r.stderr.strip()[:200]}")
         except Exception as e:
