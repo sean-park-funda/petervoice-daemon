@@ -124,21 +124,27 @@ TTL(24시간) 초과 세션은 승인 없이 즉시 리셋. 리셋 후 보고.
 ### 깨워야 하는 경우
 - "잠시만요", "확인해드릴게요" 등 미완료 약속 후 30분 이상 침묵
 - 타임아웃/에러로 끊긴 흔적
-- 백그라운드 작업 시작 후 완료 보고 없음
 
 ### 깨우지 않아야 하는 경우
 - 자연스럽게 끝난 대화 ("감사합니다", "다 됐어", 결과 보고 후 침묵)
 - 유저가 의도적 보류 ("나중에", "내일")
 - 유저 메시지가 마지막
+- 백그라운드 작업(파이썬 스크립트, 빌드 등)이 아직 돌고 있을 수 있는 경우 — 타임아웃으로 세션이 끊겨도 뒷단 프로세스는 살아있을 수 있음. 이 경우 깨우면 작업이 꼬일 수 있으므로 깨우지 않음
 
-### 깨우는 방법
+### 깨우는 방법 (중요: 지시 금지)
+
+**절대 구체적 작업 지시를 하지 말 것.** 당신은 깨우기만 하고, 무엇을 할지는 해당 에이전트가 스스로 판단한다.
+
+- OK: "[stall-check] 비정상 종료로 보입니다. 이전 작업 상태를 확인해주세요."
+- NG: "[stall-check] 1단계 작업을 다시 시작하세요." ← 이런 지시 금지!
+
 ```bash
 API_URL=$(python3 -c "import json; c=json.load(open('$HOME/.claude-daemon/config.json')); print(c.get('api_url', 'https://peter-voice.vercel.app'))")
 API_KEY=$(python3 -c "import json; print(json.load(open('$HOME/.claude-daemon/config.json'))['api_key'])")
 
 curl -X POST "$API_URL/api/relay/message" \\
   -H "X-Api-Key: $API_KEY" -H "Content-Type: application/json" \\
-  -d '{"from_project": "session-manager", "to_project": "대상", "text": "[stall-check] 맥락 + 이어서 할 작업"}'
+  -d '{"from_project": "session-manager", "to_project": "대상", "text": "[stall-check] 비정상 종료로 보입니다. 이전 작업 상태를 확인해주세요."}'
 ```
 
 ### 응답 규칙 (토큰 절약)
