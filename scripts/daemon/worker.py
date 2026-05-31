@@ -327,13 +327,12 @@ class Worker(threading.Thread):
                 team_project=_check_project,
             )
         elif _engine == "codex":
-            response, sid, tool_lines = run_codex(prompt_text, project)
+            response, sid, tool_lines, timed_out = run_codex(prompt_text, project)
         else:
-            response, sid, tool_lines = run_claude(prompt_text, project)
+            response, sid, tool_lines, timed_out = run_claude(prompt_text, project)
 
         # Timeout auto-followup: 타임아웃 시 자동으로 1회 후속 질문
-        is_timeout = response.startswith("(Claude 실행 시간 초과") or response.startswith("(Claude 응답 시간 초과")
-        if is_timeout and not is_timeout_followup and not _is_team:
+        if timed_out and not is_timeout_followup and not _is_team:
             logger.info(f"[{self.bot_name}] Timeout detected for {project}, scheduling auto-followup")
 
         # D8: skip post-processing for team projects (already handled inside process_team_message)
@@ -361,7 +360,7 @@ class Worker(threading.Thread):
         logger.info(f"[{self.bot_name}] Replied msg #{msg_id}: {len(response)} chars, team={_is_team}")
 
         # Timeout auto-followup: 타임아웃 후 자동 1회 후속 질문 실행
-        if is_timeout and not is_timeout_followup and not _is_team:
+        if timed_out and not is_timeout_followup and not _is_team:
             logger.info(f"[{self.bot_name}] Executing timeout auto-followup for {project}")
             followup_msg = {
                 "id": f"timeout_followup_{msg_id}",

@@ -105,7 +105,7 @@ def run_claude(
     session_key_override: str | None = None,
     prompt_override: str | None = None,
     stream_to_chat: bool = True,
-) -> tuple[str, str | None, list[str]]:
+) -> tuple[str, str | None, list[str], bool]:
     api_key = config["api_key"]
 
     # branch:{branch_id} → 부모 프로젝트 디렉토리 사용
@@ -242,7 +242,7 @@ def run_claude(
         while True:
             if shutdown_event.is_set():
                 proc.terminate()
-                return ("(데몬 종료 중)", new_session_id, tool_lines)
+                return ("(데몬 종료 중)", new_session_id, tool_lines, False)
 
             elapsed = time.time() - process_start_time
             effective_hard_timeout = hard_timeout_with_tools if last_tool_time > 0 else hard_timeout
@@ -250,7 +250,7 @@ def run_claude(
                 label = "with-tools" if last_tool_time > 0 else "no-tools"
                 logger.error(f"[{bot_name}] Claude hard timeout ({label}, {effective_hard_timeout}s, elapsed {elapsed:.0f}s) for {project}, killing")
                 proc.kill()
-                return (f"(Claude 실행 시간 초과 - {elapsed:.0f}초 경과)", sid, tool_lines)
+                return (f"(Claude 실행 시간 초과 - {elapsed:.0f}초 경과)", sid, tool_lines, True)
 
             if os.name == "nt":
                 import threading as _thr
@@ -274,7 +274,7 @@ def run_claude(
                 if time.time() - last_activity_time > stdout_timeout:
                     logger.error(f"[{bot_name}] Claude stdout timeout ({stdout_timeout}s) for {project}, killing")
                     proc.kill()
-                    return (f"(Claude 응답 시간 초과 - {stdout_timeout}초 동안 출력 없음)", sid, tool_lines)
+                    return (f"(Claude 응답 시간 초과 - {stdout_timeout}초 동안 출력 없음)", sid, tool_lines, True)
                 uid = resolve_user_id()
                 if uid and check_stop_requested(uid):
                     logger.info(f"[{bot_name}] Stop requested for {project}, terminating claude process")
@@ -286,7 +286,7 @@ def run_claude(
                     clear_stop_requested(uid)
                     partial = _strip_ansi(response_text).strip()
                     result = partial + "\n\n(작업이 중단되었습니다)" if partial else "(작업이 중단되었습니다)"
-                    return (result, new_session_id, tool_lines)
+                    return (result, new_session_id, tool_lines, False)
                 continue
 
             raw = proc.stdout.readline()
@@ -376,7 +376,7 @@ def run_claude(
                             # D9-B: forward team params on retry
                             return run_claude(prompt, project, _retry_count, _overload_retry + 1,
                                 session_key_override=session_key_override, prompt_override=prompt_override, stream_to_chat=stream_to_chat)
-                        return ("(Anthropic 서버 과부하 - 잠시 후 다시 시도해주세요)", new_session_id, tool_lines)
+                        return ("(Anthropic 서버 과부하 - 잠시 후 다시 시도해주세요)", new_session_id, tool_lines, False)
                     if "could not process image" in error_text.lower() or "invalid_request_error" in error_text.lower():
                         logger.warning(f"[{bot_name}] Image/request error for {project}, resetting session (retry {_retry_count + 1})")
                         conv = _fetch_recent_conversation(project, limit=10)
@@ -386,7 +386,7 @@ def run_claude(
                         proc.wait(timeout=5)
                         g.claude_semaphore.release()
                         if _retry_count >= MAX_CONTEXT_OVERFLOW_RETRIES:
-                            return ("(이미지 처리 오류 - 세션이 초기화되었습니다. 다시 말씀해주세요.)", None, tool_lines)
+                            return ("(이미지 처리 오류 - 세션이 초기화되었습니다. 다시 말씀해주세요.)", None, tool_lines, False)
                         return run_claude(prompt, project, _retry_count + 1, 0,
                             session_key_override=session_key_override, prompt_override=prompt_override, stream_to_chat=stream_to_chat)
                     if "context" in error_text.lower() or "prompt is too long" in error_text.lower():
@@ -398,7 +398,7 @@ def run_claude(
                         proc.wait(timeout=5)
                         g.claude_semaphore.release()
                         if _retry_count >= MAX_CONTEXT_OVERFLOW_RETRIES:
-                            return ("(컨텍스트 초과 - 최대 재시도 횟수 초과)", None, tool_lines)
+                            return ("(컨텍스트 초과 - 최대 재시도 횟수 초과)", None, tool_lines, False)
                         return run_claude(prompt, project, _retry_count + 1, 0,
                             session_key_override=session_key_override, prompt_override=prompt_override, stream_to_chat=stream_to_chat)
 
@@ -415,7 +415,7 @@ def run_claude(
                 reset_session(project)
                 g.claude_semaphore.release()
                 if _retry_count >= MAX_CONTEXT_OVERFLOW_RETRIES:
-                    return ("(컨텍스트 초과 - 최대 재시도 횟수 초과)", None, tool_lines)
+                    return ("(컨텍스트 초과 - 최대 재시도 횟수 초과)", None, tool_lines, False)
                 return run_claude(prompt, project, _retry_count + 1, 0,
                     session_key_override=session_key_override, prompt_override=prompt_override, stream_to_chat=stream_to_chat)
             if "no conversation found" in stderr_output.lower():
@@ -423,10 +423,10 @@ def run_claude(
                 reset_session(project)
                 g.claude_semaphore.release()
                 if _retry_count >= MAX_CONTEXT_OVERFLOW_RETRIES:
-                    return ("(세션 오류 - 최대 재시도 횟수 초과)", None, tool_lines)
+                    return ("(세션 오류 - 최대 재시도 횟수 초과)", None, tool_lines, False)
                 return run_claude(prompt, project, _retry_count + 1, 0,
                     session_key_override=session_key_override, prompt_override=prompt_override, stream_to_chat=stream_to_chat)
-            return (f"(Claude 오류: exit {proc.returncode})", new_session_id, tool_lines)
+            return (f"(Claude 오류: exit {proc.returncode})", new_session_id, tool_lines, False)
 
         if not response_text:
             response_text = "(작업 완료)" if tool_lines else "(응답 없음)"
@@ -452,15 +452,15 @@ def run_claude(
                 from daemon.branches import update_branch_session
                 update_branch_session(int(project.split(":")[1]), new_session_id)
 
-        return (response_text, new_session_id, tool_lines)
+        return (response_text, new_session_id, tool_lines, False)
 
     except subprocess.TimeoutExpired:
         proc.kill()
         logger.error(f"[{bot_name}] Claude timed out for {project}")
-        return ("(Claude 응답 시간 초과)", sid, [])
+        return ("(Claude 응답 시간 초과)", sid, [], True)
     except Exception as e:
         logger.error(f"[{bot_name}] Claude error: {e}")
-        return (f"(Claude 실행 오류: {e})", sid, [])
+        return (f"(Claude 실행 오류: {e})", sid, [], False)
     finally:
         try:
             g.claude_semaphore.release()
@@ -550,7 +550,7 @@ def _prepare_agents_md(project_dir: str, prompt_content: str):
         f.write(merged)
 
 
-def run_codex(prompt: str, project: str, _retry_count: int = 0) -> tuple[str, str | None, list[str]]:
+def run_codex(prompt: str, project: str, _retry_count: int = 0) -> tuple[str, str | None, list[str], bool]:
     """Run Codex CLI and return (response_text, session_id, tool_lines)."""
     api_key = config["api_key"]
 
@@ -677,13 +677,13 @@ def run_codex(prompt: str, project: str, _retry_count: int = 0) -> tuple[str, st
         while True:
             if shutdown_event.is_set():
                 proc.terminate()
-                return ("(데몬 종료 중)", new_session_id, tool_lines)
+                return ("(데몬 종료 중)", new_session_id, tool_lines, False)
 
             elapsed = time.time() - process_start_time
             if elapsed > hard_timeout:
                 logger.error(f"[{bot_name}] Codex hard timeout ({hard_timeout}s, elapsed {elapsed:.0f}s) for {project}, killing")
                 proc.kill()
-                return (f"(Codex 실행 시간 초과 - {elapsed:.0f}초 경과)", sid, tool_lines)
+                return (f"(Codex 실행 시간 초과 - {elapsed:.0f}초 경과)", sid, tool_lines, True)
 
             if IS_WINDOWS:
                 import threading as _thr
@@ -708,7 +708,7 @@ def run_codex(prompt: str, project: str, _retry_count: int = 0) -> tuple[str, st
                 if time.time() - last_activity_time > stdout_timeout:
                     logger.error(f"[{bot_name}] Codex stdout timeout ({stdout_timeout}s) for {project}, killing")
                     proc.kill()
-                    return (f"(Codex 응답 시간 초과 - {stdout_timeout}초 동안 출력 없음)", sid, tool_lines)
+                    return (f"(Codex 응답 시간 초과 - {stdout_timeout}초 동안 출력 없음)", sid, tool_lines, True)
                 # Check stop request
                 uid = resolve_user_id()
                 if uid and check_stop_requested(uid):
@@ -721,7 +721,7 @@ def run_codex(prompt: str, project: str, _retry_count: int = 0) -> tuple[str, st
                     clear_stop_requested(uid)
                     partial = response_text.strip()
                     result = partial + "\n\n(작업이 중단되었습니다)" if partial else "(작업이 중단되었습니다)"
-                    return (result, new_session_id, tool_lines)
+                    return (result, new_session_id, tool_lines, False)
                 continue
 
             raw = proc.stdout.readline()
@@ -788,9 +788,9 @@ def run_codex(prompt: str, project: str, _retry_count: int = 0) -> tuple[str, st
                 reset_codex_session(project)
                 g.claude_semaphore.release()
                 if _retry_count >= MAX_CONTEXT_OVERFLOW_RETRIES:
-                    return ("(Codex 세션 오류 - 최대 재시도 횟수 초과)", None, tool_lines)
+                    return ("(Codex 세션 오류 - 최대 재시도 횟수 초과)", None, tool_lines, False)
                 return run_codex(prompt, project, _retry_count + 1)
-            return (f"(Codex 오류: exit {proc.returncode})", new_session_id, tool_lines)
+            return (f"(Codex 오류: exit {proc.returncode})", new_session_id, tool_lines, False)
 
         if not response_text:
             response_text = "(작업 완료)" if tool_lines else "(응답 없음)"
@@ -798,15 +798,15 @@ def run_codex(prompt: str, project: str, _retry_count: int = 0) -> tuple[str, st
         if new_session_id:
             update_codex_session(project, new_session_id)
 
-        return (response_text, new_session_id, tool_lines)
+        return (response_text, new_session_id, tool_lines, False)
 
     except subprocess.TimeoutExpired:
         proc.kill()
         logger.error(f"[{bot_name}] Codex timed out for {project}")
-        return ("(Codex 응답 시간 초과)", sid, [])
+        return ("(Codex 응답 시간 초과)", sid, [], True)
     except Exception as e:
         logger.error(f"[{bot_name}] Codex error: {e}")
-        return (f"(Codex 실행 오류: {e})", sid, [])
+        return (f"(Codex 실행 오류: {e})", sid, [], False)
     finally:
         try:
             g.claude_semaphore.release()

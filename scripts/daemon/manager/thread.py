@@ -214,7 +214,7 @@ class ManagerThread(threading.Thread):
     INTERNAL_PROJECT_ID = "_manager_internal"
 
     def _ask_manager(self, prompt: str) -> str:
-        response, sid, tool_lines = run_claude(prompt, self.INTERNAL_PROJECT_ID)
+        response, sid, tool_lines, _ = run_claude(prompt, self.INTERNAL_PROJECT_ID)
         return response
 
     # ── Scout ──
