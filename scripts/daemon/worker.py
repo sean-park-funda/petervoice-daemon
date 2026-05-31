@@ -89,8 +89,10 @@ class Worker(threading.Thread):
             processed_ids.clear()
             processed_ids.add(msg_id)
 
-        enqueue_message(msg)
-        mark_message_processed(msg_id)
+        is_synthetic = msg.get("_is_timeout_followup", False)
+        if not is_synthetic:
+            enqueue_message(msg)
+            mark_message_processed(msg_id)
 
         files = msg.get("files", [])
         downloaded_paths = download_files(files) if files else []
@@ -317,6 +319,8 @@ class Worker(threading.Thread):
         _branch_id = int(project.split(":")[1]) if project.startswith("branch:") else None
         _is_team = is_team_project(_check_project)
 
+        is_timeout_followup = msg.get("_is_timeout_followup", False)
+
         if _is_team and process_team_message:
             response, tool_lines = process_team_message(
                 prompt_text, project, self, msg_id, _branch_id,
@@ -326,6 +330,11 @@ class Worker(threading.Thread):
             response, sid, tool_lines = run_codex(prompt_text, project)
         else:
             response, sid, tool_lines = run_claude(prompt_text, project)
+
+        # Timeout auto-followup: 타임아웃 시 자동으로 1회 후속 질문
+        is_timeout = response.startswith("(Claude 실행 시간 초과") or response.startswith("(Claude 응답 시간 초과")
+        if is_timeout and not is_timeout_followup and not _is_team:
+            logger.info(f"[{self.bot_name}] Timeout detected for {project}, scheduling auto-followup")
 
         # D8: skip post-processing for team projects (already handled inside process_team_message)
         if not _is_team:
@@ -350,6 +359,20 @@ class Worker(threading.Thread):
         dequeue_message(msg_id)
 
         logger.info(f"[{self.bot_name}] Replied msg #{msg_id}: {len(response)} chars, team={_is_team}")
+
+        # Timeout auto-followup: 타임아웃 후 자동 1회 후속 질문 실행
+        if is_timeout and not is_timeout_followup and not _is_team:
+            logger.info(f"[{self.bot_name}] Executing timeout auto-followup for {project}")
+            followup_msg = {
+                "id": f"timeout_followup_{msg_id}",
+                "text": "타임아웃이 발생했습니다. 이전 작업이 어디까지 진행됐는지 확인하고 보고해주세요.",
+                "project": project,
+                "_is_timeout_followup": True,
+            }
+            try:
+                self.process_message(followup_msg)
+            except Exception as e:
+                logger.error(f"[{self.bot_name}] Timeout followup failed: {e}")
 
     def _get_project_lock(self, project: str) -> threading.Lock:
         with project_locks_lock:
