@@ -238,6 +238,7 @@ def run_claude(
         hard_timeout_with_tools = config.get("claude_hard_timeout_with_tools_sec", 1800)
         stream_interval = config.get("stream_interval_sec", 2.0)
         tool_lines = []
+        total_usage = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "model": ""}
 
         while True:
             if shutdown_event.is_set():
@@ -309,7 +310,15 @@ def run_claude(
                 new_session_id = event["session_id"]
 
             if etype == "assistant":
-                msg_content = event.get("message", {}).get("content", [])
+                _amsg = event.get("message", {})
+                _ausage = _amsg.get("usage", {})
+                if _ausage:
+                    total_usage["input"] += _ausage.get("input_tokens", 0)
+                    total_usage["output"] += _ausage.get("output_tokens", 0)
+                    total_usage["cache_read"] += _ausage.get("cache_read_input_tokens", 0)
+                    total_usage["cache_write"] += _ausage.get("cache_creation_input_tokens", 0)
+                    total_usage["model"] = _amsg.get("model", "") or total_usage["model"]
+                msg_content = _amsg.get("content", [])
                 for block in msg_content:
                     if block.get("type") == "tool_use":
                         last_tool_time = time.time()
@@ -462,6 +471,18 @@ def run_claude(
         logger.error(f"[{bot_name}] Claude error: {e}")
         return (f"(Claude 실행 오류: {e})", sid, [], False)
     finally:
+        if total_usage.get("model"):
+            try:
+                api_request(api_key, "POST", "/api/usage", body={
+                    "project": project,
+                    "model": total_usage["model"],
+                    "input_tokens": total_usage["input"],
+                    "output_tokens": total_usage["output"],
+                    "cache_read_tokens": total_usage["cache_read"],
+                    "cache_write_tokens": total_usage["cache_write"],
+                })
+            except Exception as e:
+                logger.warning(f"[{bot_name}] Usage report failed: {e}")
         try:
             g.claude_semaphore.release()
         except ValueError:
