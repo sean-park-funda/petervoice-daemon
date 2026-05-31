@@ -309,15 +309,17 @@ def run_claude(
             if etype == "system" and "session_id" in event:
                 new_session_id = event["session_id"]
 
+            if etype == "result":
+                _rusage = event.get("usage", {})
+                if _rusage:
+                    total_usage["input"] = _rusage.get("input_tokens", 0)
+                    total_usage["output"] = _rusage.get("output_tokens", 0)
+                    total_usage["cache_read"] = _rusage.get("cache_read_input_tokens", 0)
+                    total_usage["cache_write"] = _rusage.get("cache_creation_input_tokens", 0)
+
             if etype == "assistant":
                 _amsg = event.get("message", {})
-                _ausage = _amsg.get("usage", {})
-                if _ausage:
-                    total_usage["input"] += _ausage.get("input_tokens", 0)
-                    total_usage["output"] += _ausage.get("output_tokens", 0)
-                    total_usage["cache_read"] += _ausage.get("cache_read_input_tokens", 0)
-                    total_usage["cache_write"] += _ausage.get("cache_creation_input_tokens", 0)
-                    total_usage["model"] = _amsg.get("model", "") or total_usage["model"]
+                total_usage["model"] = _amsg.get("model", "") or total_usage["model"]
                 msg_content = _amsg.get("content", [])
                 for block in msg_content:
                     if block.get("type") == "tool_use":
