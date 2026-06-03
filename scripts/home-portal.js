@@ -986,7 +986,8 @@ function serveDocsFile(res, docsDir, filePath) {
 function apiDocsMkdir(docsDir, name) {
   const validated = validateDocsDir(docsDir);
   if (!validated) return { error: "접근 불가 경로" };
-  if (!name || !/^[a-zA-Z0-9가-힣_\-. ]+$/.test(name)) return { error: "잘못된 폴더명" };
+  if (!name || !/^[a-zA-Z0-9가-힣_\-. /]+$/.test(name)) return { error: "잘못된 폴더명" };
+  if (name.includes("..")) return { error: "잘못된 폴더명" };
 
   const target = path.join(validated, name);
   if (!target.startsWith(validated)) return { error: "접근 불가 경로" };
