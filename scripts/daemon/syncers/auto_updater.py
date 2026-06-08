@@ -82,47 +82,83 @@ class AutoUpdater(threading.Thread):
                 logger.warning(f"[updater] pip install failed: {e}")
 
     def _update_cli_if_needed(self):
-        """Update Claude CLI to latest if a newer version is available on npm."""
+        """Update Claude CLI and Codex CLI to latest if newer versions are available on npm."""
         try:
             _env = {**__import__("os").environ, "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"}
-
-            r = subprocess.run(
-                ["claude", "--version"],
-                capture_output=True, text=True, timeout=10, env=_env,
-            )
-            current = r.stdout.strip().split()[0] if r.returncode == 0 else ""
-            if not current:
-                return
-
-            r = subprocess.run(
-                ["npm", "view", "@anthropic-ai/claude-code", "version"],
-                capture_output=True, text=True, timeout=15, env=_env,
-            )
-            latest = r.stdout.strip() if r.returncode == 0 else ""
-            if not latest or current == latest:
-                return
-
-            logger.info(f"[updater] Updating Claude CLI: {current} → {latest}")
-            import platform
-            if platform.machine() == "arm64" and __import__("sys").platform == "darwin":
-                subprocess.run(
-                    ["npm", "install", "-g", "@anthropic-ai/claude-code-darwin-arm64"],
-                    capture_output=True, text=True, timeout=120, env=_env,
-                )
-            r = subprocess.run(
-                ["npm", "install", "-g", f"@anthropic-ai/claude-code@{latest}"],
-                capture_output=True, text=True, timeout=180, env=_env,
-            )
-            if r.returncode == 0:
-                v = subprocess.run(["claude", "--version"], capture_output=True, text=True, timeout=10, env=_env)
-                if v.returncode == 0:
-                    logger.info(f"[updater] Claude CLI updated to {v.stdout.strip()}")
-                else:
-                    logger.warning(f"[updater] Claude CLI binary broken after update — may need manual fix")
-            else:
-                logger.warning(f"[updater] Claude CLI update failed: {r.stderr.strip()[:200]}")
+            self._update_claude_cli(_env)
+            self._update_codex_cli(_env)
         except Exception as e:
             logger.warning(f"[updater] CLI update check failed (non-blocking): {e}")
+
+    def _update_claude_cli(self, _env: dict):
+        """Update @anthropic-ai/claude-code to latest."""
+        r = subprocess.run(
+            ["claude", "--version"],
+            capture_output=True, text=True, timeout=10, env=_env,
+        )
+        current = r.stdout.strip().split()[0] if r.returncode == 0 else ""
+        if not current:
+            return
+
+        r = subprocess.run(
+            ["npm", "view", "@anthropic-ai/claude-code", "version"],
+            capture_output=True, text=True, timeout=15, env=_env,
+        )
+        latest = r.stdout.strip() if r.returncode == 0 else ""
+        if not latest or current == latest:
+            return
+
+        logger.info(f"[updater] Updating Claude CLI: {current} → {latest}")
+        import platform
+        if platform.machine() == "arm64" and __import__("sys").platform == "darwin":
+            subprocess.run(
+                ["npm", "install", "-g", "@anthropic-ai/claude-code-darwin-arm64"],
+                capture_output=True, text=True, timeout=120, env=_env,
+            )
+        r = subprocess.run(
+            ["npm", "install", "-g", f"@anthropic-ai/claude-code@{latest}"],
+            capture_output=True, text=True, timeout=180, env=_env,
+        )
+        if r.returncode == 0:
+            v = subprocess.run(["claude", "--version"], capture_output=True, text=True, timeout=10, env=_env)
+            if v.returncode == 0:
+                logger.info(f"[updater] Claude CLI updated to {v.stdout.strip()}")
+            else:
+                logger.warning("[updater] Claude CLI binary broken after update — may need manual fix")
+        else:
+            logger.warning(f"[updater] Claude CLI update failed: {r.stderr.strip()[:200]}")
+
+    def _update_codex_cli(self, _env: dict):
+        """Update @openai/codex to latest."""
+        r = subprocess.run(
+            ["codex", "--version"],
+            capture_output=True, text=True, timeout=10, env=_env,
+        )
+        current = r.stdout.strip().split()[0] if r.returncode == 0 else ""
+        if not current:
+            return
+
+        r = subprocess.run(
+            ["npm", "view", "@openai/codex", "version"],
+            capture_output=True, text=True, timeout=15, env=_env,
+        )
+        latest = r.stdout.strip() if r.returncode == 0 else ""
+        if not latest or current == latest:
+            return
+
+        logger.info(f"[updater] Updating Codex CLI: {current} → {latest}")
+        r = subprocess.run(
+            ["npm", "install", "-g", f"@openai/codex@{latest}"],
+            capture_output=True, text=True, timeout=180, env=_env,
+        )
+        if r.returncode == 0:
+            v = subprocess.run(["codex", "--version"], capture_output=True, text=True, timeout=10, env=_env)
+            if v.returncode == 0:
+                logger.info(f"[updater] Codex CLI updated to {v.stdout.strip()}")
+            else:
+                logger.warning("[updater] Codex CLI binary broken after update — may need manual fix")
+        else:
+            logger.warning(f"[updater] Codex CLI update failed: {r.stderr.strip()[:200]}")
 
     def check_once(self):
         if not config.get("auto_update_enabled", True):
