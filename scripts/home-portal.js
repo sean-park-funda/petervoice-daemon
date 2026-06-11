@@ -2048,10 +2048,6 @@ function ensureTmuxSession(sessionKey, projectDir) {
   if (result.status !== 0) {
     throw new Error(result.stderr?.toString() || "tmux new-session failed");
   }
-  // 새 세션: claude --dangerously-skip-permissions 확인창에 "2 (Yes, I accept)" 자동 입력
-  setTimeout(() => {
-    spawnSync(TMUX_CMD, ["send-keys", "-t", sessionKey, "2", "Enter"], { env: PORTAL_ENV });
-  }, 3000);
   return false;
 }
 
