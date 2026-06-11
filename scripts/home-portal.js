@@ -11,14 +11,14 @@ const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
-const { execSync, spawn } = require("child_process");
+const { execSync, spawnSync, spawn } = require("child_process");
 
 // ─── Terminal (WebSocket + node-pty) ─────────────────
 let ptyModule = null;
 let WebSocketServer = null;
 try {
   const SCRIPTS_DIR = path.dirname(__filename);
-  ptyModule = require(path.join(SCRIPTS_DIR, "node_modules/node-pty"));
+  ptyModule = require(path.join(SCRIPTS_DIR, "node_modules/@homebridge/node-pty-prebuilt-multiarch"));
   WebSocketServer = require(path.join(SCRIPTS_DIR, "node_modules/ws")).WebSocketServer;
 } catch (e) {
   console.warn("[terminal] node-pty or ws not available:", e.message);
@@ -2000,11 +2000,16 @@ document.addEventListener('click', e => {
 
 // ─── Terminal WebSocket Server ───────────────────────
 
+// tmux 경로 — launchd 환경은 PATH가 제한적이므로 절대경로 우선
+const TMUX_CMD = ["/opt/homebrew/bin/tmux", "/usr/local/bin/tmux", "/usr/bin/tmux"]
+  .find(p => { try { return require("fs").existsSync(p); } catch { return false; } }) || "tmux";
+
 // pty 세션 풀: key → { pty, clients: Set<ws> }
 const ptySessions = {};
 
 function getSessionKey(project, branch) {
-  return branch ? `${project}__br${branch}` : project;
+  const sanitize = (s) => s.replace(/[:.]/g, "_");
+  return branch ? `${sanitize(project)}__br${branch}` : sanitize(project);
 }
 
 function getProjectDirectory(projectId) {
@@ -2020,20 +2025,34 @@ function getProjectDirectory(projectId) {
   return os.homedir();
 }
 
+const PORTAL_ENV = {
+  ...process.env,
+  TERM: "xterm-256color",
+  LANG: "en_US.UTF-8",
+  PATH: `/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:${process.env.PATH || ""}`,
+};
+
 function ensureTmuxSession(sessionKey, projectDir) {
-  // tmux 세션 존재 여부 확인
-  try {
-    execSync(`tmux has-session -t ${JSON.stringify(sessionKey)} 2>/dev/null`);
-    return true; // already exists
-  } catch {
-    // 없으면 새로 생성 (claude 실행)
-    const claudeCmd = process.env.CLAUDE_CMD || "claude";
-    execSync(
-      `tmux new-session -d -s ${JSON.stringify(sessionKey)} -c ${JSON.stringify(projectDir)} "${claudeCmd} --dangerously-skip-permissions"`,
-      { env: { ...process.env, TERM: "xterm-256color" } }
-    );
-    return false;
+  // tmux 세션 존재 여부 확인 (spawnSync으로 직접 실행)
+  const check = spawnSync(TMUX_CMD, ["has-session", "-t", sessionKey], { env: PORTAL_ENV });
+  if (check.status === 0) return true;
+
+  // 없으면 새로 생성
+  const claudeCmd = ["/opt/homebrew/bin/claude", "/usr/local/bin/claude"]
+    .find(p => fs.existsSync(p)) || "claude";
+  const result = spawnSync(
+    TMUX_CMD,
+    ["new-session", "-d", "-s", sessionKey, "-c", projectDir, claudeCmd, "--dangerously-skip-permissions"],
+    { env: PORTAL_ENV }
+  );
+  if (result.status !== 0) {
+    throw new Error(result.stderr?.toString() || "tmux new-session failed");
   }
+  // 새 세션: claude --dangerously-skip-permissions 확인창에 "2 (Yes, I accept)" 자동 입력
+  setTimeout(() => {
+    spawnSync(TMUX_CMD, ["send-keys", "-t", sessionKey, "2", "Enter"], { env: PORTAL_ENV });
+  }, 3000);
+  return false;
 }
 
 if (ptyModule && WebSocketServer) {
@@ -2069,7 +2088,7 @@ if (ptyModule && WebSocketServer) {
     }
 
     // node-pty로 tmux attach
-    const ptyProcess = ptyModule.spawn("tmux", ["attach-session", "-t", sessionKey], {
+    const ptyProcess = ptyModule.spawn(TMUX_CMD, ["attach-session", "-t", sessionKey], {
       name: "xterm-256color",
       cols: 220,
       rows: 50,
