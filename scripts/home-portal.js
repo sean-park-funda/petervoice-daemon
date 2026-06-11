@@ -11,7 +11,18 @@ const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
-const { execSync } = require("child_process");
+const { execSync, spawn } = require("child_process");
+
+// ─── Terminal (WebSocket + node-pty) ─────────────────
+let ptyModule = null;
+let WebSocketServer = null;
+try {
+  const SCRIPTS_DIR = path.dirname(__filename);
+  ptyModule = require(path.join(SCRIPTS_DIR, "node_modules/node-pty"));
+  WebSocketServer = require(path.join(SCRIPTS_DIR, "node_modules/ws")).WebSocketServer;
+} catch (e) {
+  console.warn("[terminal] node-pty or ws not available:", e.message);
+}
 
 // ─── Config ──────────────────────────────────────────
 const args = process.argv.slice(2);
@@ -1986,6 +1997,128 @@ document.addEventListener('click', e => {
     json({ error: "Not found" }, 404);
   }
 });
+
+// ─── Terminal WebSocket Server ───────────────────────
+
+// pty 세션 풀: key → { pty, clients: Set<ws> }
+const ptySessions = {};
+
+function getSessionKey(project, branch) {
+  return branch ? `${project}__br${branch}` : project;
+}
+
+function getProjectDirectory(projectId) {
+  const config = loadConfig();
+  // config의 project_dirs 확인
+  const projectDirs = config.project_dirs || {};
+  if (projectDirs[projectId]) return projectDirs[projectId];
+  // ~/Projects/{projectId} fallback
+  for (const base of PROJECTS_DIRS) {
+    const dir = path.join(base, projectId);
+    if (fs.existsSync(dir)) return dir;
+  }
+  return os.homedir();
+}
+
+function ensureTmuxSession(sessionKey, projectDir) {
+  // tmux 세션 존재 여부 확인
+  try {
+    execSync(`tmux has-session -t ${JSON.stringify(sessionKey)} 2>/dev/null`);
+    return true; // already exists
+  } catch {
+    // 없으면 새로 생성 (claude 실행)
+    const claudeCmd = process.env.CLAUDE_CMD || "claude";
+    execSync(
+      `tmux new-session -d -s ${JSON.stringify(sessionKey)} -c ${JSON.stringify(projectDir)} "${claudeCmd} --dangerously-skip-permissions"`,
+      { env: { ...process.env, TERM: "xterm-256color" } }
+    );
+    return false;
+  }
+}
+
+if (ptyModule && WebSocketServer) {
+  const wss = new WebSocketServer({ server, path: "/terminal" });
+
+  wss.on("connection", (ws, req) => {
+    const url = new URL(req.url, `http://localhost:${PORT}`);
+    const project = url.searchParams.get("project") || "general";
+    const branch = url.searchParams.get("branch") || null;
+    const apiKey = url.searchParams.get("key") || req.headers["x-api-key"];
+
+    // API 키 인증
+    const config = loadConfig();
+    if (apiKey !== config.api_key) {
+      ws.send(JSON.stringify({ type: "error", message: "Unauthorized" }));
+      ws.close();
+      return;
+    }
+
+    const sessionKey = getSessionKey(project, branch);
+    const projectDir = getProjectDirectory(project);
+
+    console.log(`[terminal] WS connect: session=${sessionKey}, dir=${projectDir}`);
+
+    // tmux 세션 준비
+    try {
+      ensureTmuxSession(sessionKey, projectDir);
+    } catch (e) {
+      console.error("[terminal] tmux session create failed:", e.message);
+      ws.send(`\r\n[Error] Failed to create tmux session: ${e.message}\r\n`);
+      ws.close();
+      return;
+    }
+
+    // node-pty로 tmux attach
+    const ptyProcess = ptyModule.spawn("tmux", ["attach-session", "-t", sessionKey], {
+      name: "xterm-256color",
+      cols: 220,
+      rows: 50,
+      cwd: projectDir,
+      env: { ...process.env, TERM: "xterm-256color", LANG: "en_US.UTF-8" },
+    });
+
+    // pty 출력 → WebSocket
+    ptyProcess.onData((data) => {
+      if (ws.readyState === ws.OPEN) {
+        ws.send(data);
+      }
+    });
+
+    ptyProcess.onExit(() => {
+      console.log(`[terminal] pty exited: ${sessionKey}`);
+      if (ws.readyState === ws.OPEN) ws.close();
+    });
+
+    // WebSocket 입력 → pty
+    ws.on("message", (msg) => {
+      try {
+        const parsed = JSON.parse(msg);
+        if (parsed.type === "resize") {
+          ptyProcess.resize(parsed.cols, parsed.rows);
+        } else if (parsed.type === "input") {
+          ptyProcess.write(parsed.data);
+        }
+      } catch {
+        // raw input (string)
+        ptyProcess.write(msg.toString());
+      }
+    });
+
+    ws.on("close", () => {
+      console.log(`[terminal] WS close: ${sessionKey}`);
+      try { ptyProcess.kill(); } catch {}
+    });
+
+    ws.on("error", (e) => {
+      console.error(`[terminal] WS error: ${e.message}`);
+      try { ptyProcess.kill(); } catch {}
+    });
+  });
+
+  console.log("[terminal] WebSocket server ready at /terminal");
+} else {
+  console.warn("[terminal] WebSocket server disabled (node-pty/ws not available)");
+}
 
 server.listen(PORT, () => {
   console.log(`PeterVoice Home Portal running on http://localhost:${PORT}`);
