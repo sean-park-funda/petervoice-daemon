@@ -332,7 +332,9 @@ class Worker(threading.Thread):
             response, sid, tool_lines, timed_out = run_claude(prompt_text, project)
 
         # Timeout auto-followup: 타임아웃 시 자동으로 1회 후속 질문
-        if timed_out and not is_timeout_followup and not _is_team:
+        from daemon.globals import SESSION_MANAGER_PROJECT
+        _is_manager_project = (_check_project == SESSION_MANAGER_PROJECT or project == SESSION_MANAGER_PROJECT)
+        if timed_out and not is_timeout_followup and not _is_team and not _is_manager_project:
             logger.info(f"[{self.bot_name}] Timeout detected for {project}, scheduling auto-followup")
 
         # D8: skip post-processing for team projects (already handled inside process_team_message)
@@ -360,7 +362,7 @@ class Worker(threading.Thread):
         logger.info(f"[{self.bot_name}] Replied msg #{msg_id}: {len(response)} chars, team={_is_team}")
 
         # Timeout auto-followup: 타임아웃 후 자동 1회 후속 질문 실행
-        if timed_out and not is_timeout_followup and not _is_team:
+        if timed_out and not is_timeout_followup and not _is_team and not _is_manager_project:
             logger.info(f"[{self.bot_name}] Executing timeout auto-followup for {project}")
             followup_msg = {
                 "id": f"timeout_followup_{msg_id}",
