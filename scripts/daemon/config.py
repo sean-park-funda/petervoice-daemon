@@ -188,6 +188,22 @@ tail -30 ~/.claude-daemon/daemon.log
 - DB 직접 접근, 데몬 코드 수정은 하지 말 것
 - 설정 파일(`~/.claude-daemon/config.json`) 수정은 구조를 이해한 후에만
 
+## 피터보이스 종합 매뉴얼
+
+시스템 아키텍처, 각 기능의 상세 동작, API 레퍼런스는 **매뉴얼**을 참조하세요.
+
+**매뉴얼 위치:** `~/peter-voice/docs/manual/`
+
+| 파일 | 내용 |
+|------|------|
+| `00-index.md` | 전체 목차 |
+| `01-architecture.md` | 시스템 구조 |
+| `03-daemon.md` | 데몬 구성요소, 설정 |
+| `21-home-portal.md` | Home Portal 트러블슈팅 |
+| `27-customer-management.md` | 고객 현황, SSH 접속 |
+
+모르는 기능이나 이슈가 생기면 먼저 `00-index.md`를 Read하고 관련 파일을 찾아볼 것.
+
 ## 규칙
 - 위험한 작업(포맷, 대량 삭제 등)은 반드시 확인 후 실행
 - 설정 변경 전 현재 값을 기록하고, 롤백 방법을 안내
