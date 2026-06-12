@@ -16,11 +16,42 @@ from pathlib import Path
 # ─── Platform ────────────────────────────────────────────────────
 IS_WINDOWS = os.name == "nt"
 
+# ─── Build extended PATH including nvm/local bin ────────────────
+def _extended_path() -> str:
+    """Return PATH augmented with common non-standard CLI locations."""
+    extra = []
+    home = Path.home()
+    # nvm: pick the highest installed node version
+    nvm_dir = home / ".nvm" / "versions" / "node"
+    if nvm_dir.is_dir():
+        versions = sorted(nvm_dir.iterdir(), reverse=True)
+        if versions:
+            extra.append(str(versions[0] / "bin"))
+    # local bin
+    local_bin = home / ".local" / "bin"
+    if local_bin.is_dir():
+        extra.append(str(local_bin))
+    current = os.environ.get("PATH", "")
+    return ":".join(extra + [current]) if extra else current
+
+
 # ─── Resolve claude CLI path ────────────────────────────────────
 def _find_claude_cmd() -> str:
-    found = shutil.which("claude")
+    # 1. config.json claude_path (set during onboarding or manual fix)
+    try:
+        import json
+        _cfg_path = Path.home() / ".claude-daemon" / "config.json"
+        _cfg = json.loads(_cfg_path.read_text()) if _cfg_path.exists() else {}
+        _cp = _cfg.get("claude_path", "")
+        if _cp and Path(_cp).exists():
+            return _cp
+    except Exception:
+        pass
+    # 2. which() with extended PATH
+    found = shutil.which("claude", path=_extended_path())
     if found:
         return found
+    # 3. Windows fallback
     if IS_WINDOWS:
         npm_claude = Path.home() / "AppData" / "Roaming" / "npm" / "claude.cmd"
         if npm_claude.exists():
@@ -31,7 +62,7 @@ CLAUDE_CMD = _find_claude_cmd()
 
 # ─── Resolve codex CLI path ────────────────────────────────────
 def _find_codex_cmd() -> str:
-    found = shutil.which("codex")
+    found = shutil.which("codex", path=_extended_path())
     if found:
         return found
     if IS_WINDOWS:

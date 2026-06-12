@@ -84,7 +84,8 @@ class AutoUpdater(threading.Thread):
     def _update_cli_if_needed(self):
         """Update Claude CLI and Codex CLI to latest if newer versions are available on npm."""
         try:
-            _env = {**__import__("os").environ, "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"}
+            from daemon.globals import _extended_path
+            _env = {**__import__("os").environ, "PATH": _extended_path()}
             self._update_claude_cli(_env)
             self._update_codex_cli(_env)
         except Exception as e:
@@ -120,9 +121,17 @@ class AutoUpdater(threading.Thread):
             capture_output=True, text=True, timeout=180, env=_env,
         )
         if r.returncode == 0:
-            v = subprocess.run(["claude", "--version"], capture_output=True, text=True, timeout=10, env=_env)
+            import shutil
+            new_path = shutil.which("claude", path=_env["PATH"])
+            v = subprocess.run(
+                [new_path or "claude", "--version"],
+                capture_output=True, text=True, timeout=10, env=_env,
+            )
             if v.returncode == 0:
                 logger.info(f"[updater] Claude CLI updated to {v.stdout.strip()}")
+                if new_path:
+                    import daemon.globals as g
+                    g.CLAUDE_CMD = new_path
             else:
                 logger.warning("[updater] Claude CLI binary broken after update — may need manual fix")
         else:
