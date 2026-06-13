@@ -10,6 +10,8 @@
 
 const fs = require("fs");
 const path = require("path");
+const os = require("os");
+const { spawnSync } = require("child_process");
 
 const API_BASE = "https://api.soniox.com";
 // Async diarization model. If Soniox changes the id, update here only.
@@ -32,12 +34,32 @@ async function soniox(apiKey, method, urlPath, body, isJson = true) {
   return res.json().catch(() => ({}));
 }
 
+/**
+ * Browser MediaRecorder WebM has no duration in its header (live-stream format),
+ * so Soniox async rejects it with "Error determining audio duration". Remux to
+ * a clean 16kHz mono WAV with ffmpeg, which writes a proper duration.
+ * Returns the path to use for upload (wav on success, original on failure).
+ */
+function remuxForSoniox(filePath) {
+  const ffmpeg = process.env.FFMPEG_PATH || "/opt/homebrew/bin/ffmpeg";
+  const wavPath = path.join(os.tmpdir(), `pv-meeting-${path.basename(filePath, path.extname(filePath))}.wav`);
+  try {
+    const r = spawnSync(ffmpeg, ["-y", "-i", filePath, "-ar", "16000", "-ac", "1", wavPath], {
+      stdio: "ignore", timeout: 10 * 60 * 1000,
+    });
+    if (r.status === 0 && fs.existsSync(wavPath) && fs.statSync(wavPath).size > 0) {
+      return { path: wavPath, mime: "audio/wav", cleanup: true };
+    }
+  } catch { /* fall through */ }
+  return { path: filePath, mime: "audio/webm", cleanup: false };
+}
+
 /** Upload local file via multipart → returns file id. */
-async function uploadFile(apiKey, filePath) {
+async function uploadFile(apiKey, filePath, mime = "audio/webm") {
   const buf = fs.readFileSync(filePath);
   const form = new FormData();
   // Node 18+ Blob/FormData are global
-  const blob = new Blob([buf], { type: "audio/webm" });
+  const blob = new Blob([buf], { type: mime });
   form.append("file", blob, path.basename(filePath));
   const res = await fetch(`${API_BASE}/v1/files`, {
     method: "POST",
@@ -65,9 +87,13 @@ async function transcribeFile(apiKey, filePath, opts = {}) {
   const onProgress = opts.onProgress || (() => {});
 
   let fileId, transcriptionId;
+  let remuxed = null;
   try {
+    onProgress("remuxing");
+    remuxed = remuxForSoniox(filePath);
+
     onProgress("uploading");
-    fileId = await uploadFile(apiKey, filePath);
+    fileId = await uploadFile(apiKey, remuxed.path, remuxed.mime);
 
     onProgress("submitting");
     const tr = await soniox(apiKey, "POST", "/v1/transcriptions", {
@@ -102,6 +128,9 @@ async function transcribeFile(apiKey, filePath, opts = {}) {
     }
     if (fileId) {
       soniox(apiKey, "DELETE", `/v1/files/${fileId}`).catch(() => {});
+    }
+    if (remuxed && remuxed.cleanup) {
+      try { fs.unlinkSync(remuxed.path); } catch { /* ignore */ }
     }
   }
 }
