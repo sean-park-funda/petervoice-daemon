@@ -2111,7 +2111,11 @@ const PORTAL_ENV = {
 function ensureTmuxSession(sessionKey, projectDir, mode = "claude") {
   // tmux 세션 존재 여부 확인 (spawnSync으로 직접 실행)
   const check = spawnSync(TMUX_CMD, ["has-session", "-t", sessionKey], { env: PORTAL_ENV });
-  if (check.status === 0) return true;
+  if (check.status === 0) {
+    // 기존 세션도 마우스 스크롤 가능하도록 보장
+    spawnSync(TMUX_CMD, ["set-option", "-t", sessionKey, "mouse", "on"], { env: PORTAL_ENV });
+    return true;
+  }
 
   // 세션 시작 명령 결정
   let startCmd;
@@ -2125,6 +2129,9 @@ function ensureTmuxSession(sessionKey, projectDir, mode = "claude") {
     startCmd = [claudeCmd, "--dangerously-skip-permissions"];
   }
 
+  // 스크롤백: history-limit은 pane 생성 전에 설정해야 적용됨 → 글로벌 옵션으로 먼저 세팅
+  spawnSync(TMUX_CMD, ["set-option", "-g", "history-limit", "50000"], { env: PORTAL_ENV });
+
   const result = spawnSync(
     TMUX_CMD,
     ["new-session", "-d", "-s", sessionKey, "-c", projectDir, ...startCmd],
@@ -2133,6 +2140,10 @@ function ensureTmuxSession(sessionKey, projectDir, mode = "claude") {
   if (result.status !== 0) {
     throw new Error(result.stderr?.toString() || "tmux new-session failed");
   }
+
+  // 마우스/터치 휠로 이전 출력을 스크롤(copy-mode 진입)할 수 있게 마우스 모드 ON
+  spawnSync(TMUX_CMD, ["set-option", "-t", sessionKey, "mouse", "on"], { env: PORTAL_ENV });
+
   return false;
 }
 
