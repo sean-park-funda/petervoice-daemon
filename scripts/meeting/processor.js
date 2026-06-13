@@ -111,6 +111,18 @@ async function processMeeting({ configDir, config, meetingId, projectDocsDir, lo
 
     const metaForDoc = { ...meta, speaker_map: speakerMap };
     const { docPath, speakers, segments } = store.writeTranscriptDoc(projectDocsDir, tokens, metaForDoc);
+
+    // Representative lines per speaker so labeling UI can show "who said what"
+    const speakerSamples = {};
+    for (const s of segments) {
+      (speakerSamples[s.speaker] = speakerSamples[s.speaker] || []).push(s);
+    }
+    for (const sp of Object.keys(speakerSamples)) {
+      speakerSamples[sp] = speakerSamples[sp]
+        .slice().sort((a, b) => b.text.length - a.text.length).slice(0, 5)
+        .sort((a, b) => a.start_ms - b.start_ms)
+        .map((s) => s.text);
+    }
     const rel = docPath.split("/docs/").pop();
     const transcriptRel = rel ? `docs/${rel}` : docPath;
 
@@ -123,6 +135,7 @@ async function processMeeting({ configDir, config, meetingId, projectDocsDir, lo
       speaker_map: speakerMap,
       unknown_speakers: unknownSpeakers,
       speaker_embeddings: speakerEmbeddings,
+      speaker_samples: speakerSamples,
       segments,
     });
     out(`[meeting] ${meetingId} transcribed → ${transcriptRel} (${speakers.length} speakers)`);
