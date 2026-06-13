@@ -28,7 +28,11 @@ async function triggerMinutes(config, meeting, transcriptDocRelPath) {
   try {
     const res = await fetch(`${apiUrl}/api/bot/message`, {
       method: "POST",
-      headers: { "X-Api-Key": apiKey, "Content-Type": "application/json" },
+      headers: {
+        "Authorization": `Bearer ${apiKey}`,
+        "X-Api-Key": apiKey,
+        "Content-Type": "application/json",
+      },
       body: JSON.stringify({
         project: meeting.project,
         text,
