@@ -13,6 +13,16 @@ const path = require("path");
 const os = require("os");
 const { execSync, spawnSync, spawn } = require("child_process");
 
+// ─── Meeting mode (modular) ──────────────────────────
+let meetingStore = null, processMeeting = null;
+try {
+  const MDIR = path.join(path.dirname(__filename), "meeting");
+  meetingStore = require(path.join(MDIR, "meeting-store"));
+  ({ processMeeting } = require(path.join(MDIR, "processor")));
+} catch (e) {
+  console.warn("[meeting] module not available:", e.message);
+}
+
 // ─── Terminal (WebSocket + node-pty) ─────────────────
 let ptyModule = null;
 let WebSocketServer = null;
@@ -1576,6 +1586,72 @@ const server = http.createServer((req, res) => {
       }
     }).catch(e => json({ error: "업로드 실패: " + e.message }, 400));
   }
+  // ─── Meeting API (회의록 모드) ───────────────────────
+  // POST /api/meetings/upload — 청크 업로드(브라우저→로컬). 마지막 청크에서 처리 시작.
+  else if (pathname === "/api/meetings/upload" && req.method === "POST") {
+    if (!meetingStore || !processMeeting) return json({ error: "meeting 모듈 없음" }, 503);
+    const MAX = 1024 * 1024 * 1024; // 1GB (긴 회의 대비)
+    parseMultipartStreaming(req, MAX).then(({ fields, file }) => {
+      const meetingId = (fields.meetingId || "").replace(/[^a-zA-Z0-9_-]/g, "");
+      if (!meetingId || !file) { if (file && file.tempPath) try { fs.unlinkSync(file.tempPath); } catch {} return json({ error: "meetingId, file 필요" }, 400); }
+      // docs 경로 검증 (프로젝트의 docs 디렉토리)
+      const docsDir = fields.dir ? validateDocsDir(fields.dir) : null;
+
+      // 청크 누적
+      const chunkIdx = parseInt(fields.chunkIndex || "0");
+      const totalChunks = parseInt(fields.totalChunks || "1");
+      const chunkDir = path.join(os.tmpdir(), "pv-meeting-chunks");
+      fs.mkdirSync(chunkDir, { recursive: true });
+      const chunkFile = path.join(chunkDir, `${meetingId}.part`);
+      try {
+        if (chunkIdx === 0) fs.copyFileSync(file.tempPath, chunkFile);
+        else fs.appendFileSync(chunkFile, fs.readFileSync(file.tempPath));
+        fs.unlinkSync(file.tempPath);
+      } catch (e) {
+        try { fs.unlinkSync(file.tempPath); } catch {}
+        return json({ error: "청크 저장 실패: " + e.message }, 500);
+      }
+      if (chunkIdx < totalChunks - 1) return json({ ok: true, chunk: chunkIdx });
+
+      // 마지막 청크 → 영구 저장 + 메타 생성 + 백그라운드 처리
+      const now = new Date().toISOString();
+      meetingStore.storeAudio(CONFIG_DIR, meetingId, chunkFile);
+      const meta = meetingStore.writeMeta(CONFIG_DIR, meetingId, {
+        id: meetingId,
+        project: fields.project || null,
+        title: fields.title || "제목 없는 회의",
+        duration_sec: parseInt(fields.duration || "0") || null,
+        status: "processing",
+        created_at: now,
+        updated_at: now,
+      });
+
+      // fire-and-forget
+      processMeeting({
+        configDir: CONFIG_DIR,
+        config: loadConfig(),
+        meetingId,
+        projectDocsDir: docsDir,
+        log: (m) => console.log(m),
+      }).catch((e) => console.error("[meeting] process error:", e));
+
+      json({ ok: true, meeting: meta });
+    }).catch(e => json({ error: "업로드 실패: " + e.message }, 400));
+  }
+  // GET /api/meetings/list — 회의 목록(메타)
+  else if (pathname === "/api/meetings/list" && req.method === "GET") {
+    if (!meetingStore) return json({ error: "meeting 모듈 없음" }, 503);
+    try { json({ meetings: meetingStore.listMeetings(CONFIG_DIR) }); }
+    catch (e) { json({ error: e.message }, 500); }
+  }
+  // GET /api/meetings/get?id= — 단일 회의 메타
+  else if (pathname === "/api/meetings/get" && req.method === "GET") {
+    if (!meetingStore) return json({ error: "meeting 모듈 없음" }, 503);
+    const id = url.searchParams.get("id");
+    const meta = id ? meetingStore.readMeta(CONFIG_DIR, id) : null;
+    if (!meta) return json({ error: "not found" }, 404);
+    json({ meeting: meta });
+  }
   // Docs API: /api/docs/copy — 파일/폴더 복사 (다른 프로젝트로)
   else if (pathname === "/api/docs/copy" && req.method === "POST") {
     readBody().then(body => {
@@ -2032,17 +2108,26 @@ const PORTAL_ENV = {
   PATH: `/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:${process.env.PATH || ""}`,
 };
 
-function ensureTmuxSession(sessionKey, projectDir) {
+function ensureTmuxSession(sessionKey, projectDir, mode = "claude") {
   // tmux 세션 존재 여부 확인 (spawnSync으로 직접 실행)
   const check = spawnSync(TMUX_CMD, ["has-session", "-t", sessionKey], { env: PORTAL_ENV });
   if (check.status === 0) return true;
 
-  // 없으면 새로 생성
-  const claudeCmd = ["/opt/homebrew/bin/claude", "/usr/local/bin/claude"]
-    .find(p => fs.existsSync(p)) || "claude";
+  // 세션 시작 명령 결정
+  let startCmd;
+  if (mode === "shell") {
+    // 범용 셸 모드: 맨 zsh/로그인 셸 (claude가 불능일 때의 비상 통로)
+    startCmd = [process.env.SHELL || "/bin/zsh", "-l"];
+  } else {
+    // 기본: 프로젝트에 연결된 claude 대화형 세션
+    const claudeCmd = ["/opt/homebrew/bin/claude", "/usr/local/bin/claude"]
+      .find(p => fs.existsSync(p)) || "claude";
+    startCmd = [claudeCmd, "--dangerously-skip-permissions"];
+  }
+
   const result = spawnSync(
     TMUX_CMD,
-    ["new-session", "-d", "-s", sessionKey, "-c", projectDir, claudeCmd, "--dangerously-skip-permissions"],
+    ["new-session", "-d", "-s", sessionKey, "-c", projectDir, ...startCmd],
     { env: PORTAL_ENV }
   );
   if (result.status !== 0) {
@@ -2058,6 +2143,7 @@ if (ptyModule && WebSocketServer) {
     const url = new URL(req.url, `http://localhost:${PORT}`);
     const project = url.searchParams.get("project") || "general";
     const branch = url.searchParams.get("branch") || null;
+    const mode = url.searchParams.get("mode") === "shell" ? "shell" : "claude";
     const apiKey = url.searchParams.get("key") || req.headers["x-api-key"];
 
     // API 키 인증
@@ -2068,14 +2154,22 @@ if (ptyModule && WebSocketServer) {
       return;
     }
 
-    const sessionKey = getSessionKey(project, branch);
-    const projectDir = getProjectDirectory(project);
+    // 셸 모드: 데몬 설정으로 차단 가능 (기본 허용). claude가 불능일 때의 비상 통로.
+    if (mode === "shell" && config.allow_shell_mode === false) {
+      ws.send(JSON.stringify({ type: "error", message: "Shell mode disabled" }));
+      ws.close();
+      return;
+    }
 
-    console.log(`[terminal] WS connect: session=${sessionKey}, dir=${projectDir}`);
+    // 셸 모드는 프로젝트와 무관한 단일 글로벌 세션(홈 디렉토리)
+    const sessionKey = mode === "shell" ? "__shell__" : getSessionKey(project, branch);
+    const projectDir = mode === "shell" ? os.homedir() : getProjectDirectory(project);
+
+    console.log(`[terminal] WS connect: mode=${mode}, session=${sessionKey}, dir=${projectDir}`);
 
     // tmux 세션 준비
     try {
-      ensureTmuxSession(sessionKey, projectDir);
+      ensureTmuxSession(sessionKey, projectDir, mode);
     } catch (e) {
       console.error("[terminal] tmux session create failed:", e.message);
       ws.send(`\r\n[Error] Failed to create tmux session: ${e.message}\r\n`);
