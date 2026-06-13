@@ -50,6 +50,29 @@ function getArg(name) {
   return idx !== -1 && args[idx + 1] ? args[idx + 1] : null;
 }
 
+// ─── Load synced secrets (~/.claude-daemon/.env.secrets) into process.env ───
+// The daemon syncs Supabase secrets to this file, but the home-portal launchd
+// process only inherits PATH. Load them so features like meeting-mode STT work.
+function loadSecretsEnv() {
+  const secretsFile = path.join(CONFIG_DIR, ".env.secrets");
+  try {
+    const text = fs.readFileSync(secretsFile, "utf-8");
+    for (const line of text.split("\n")) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith("#")) continue;
+      const eq = trimmed.indexOf("=");
+      if (eq <= 0) continue;
+      const key = trimmed.slice(0, eq).trim();
+      let val = trimmed.slice(eq + 1).trim();
+      if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+        val = val.slice(1, -1);
+      }
+      if (!(key in process.env)) process.env[key] = val;
+    }
+  } catch { /* file may not exist yet */ }
+}
+loadSecretsEnv();
+
 function loadConfig() {
   try {
     return JSON.parse(fs.readFileSync(path.join(CONFIG_DIR, "config.json"), "utf-8"));
