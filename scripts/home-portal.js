@@ -14,11 +14,11 @@ const os = require("os");
 const { execSync, spawnSync, spawn } = require("child_process");
 
 // ─── Meeting mode (modular) ──────────────────────────
-let meetingStore = null, processMeeting = null;
+let meetingStore = null, processMeeting = null, meetingLabel = null;
 try {
   const MDIR = path.join(path.dirname(__filename), "meeting");
   meetingStore = require(path.join(MDIR, "meeting-store"));
-  ({ processMeeting } = require(path.join(MDIR, "processor")));
+  ({ processMeeting, labelMeeting: meetingLabel } = require(path.join(MDIR, "processor")));
 } catch (e) {
   console.warn("[meeting] module not available:", e.message);
 }
@@ -1668,13 +1668,28 @@ const server = http.createServer((req, res) => {
     try { json({ meetings: meetingStore.listMeetings(CONFIG_DIR) }); }
     catch (e) { json({ error: e.message }, 500); }
   }
-  // GET /api/meetings/get?id= — 단일 회의 메타
+  // GET /api/meetings/get?id= — 단일 회의 메타 (임베딩 등 큰 필드 제외)
   else if (pathname === "/api/meetings/get" && req.method === "GET") {
     if (!meetingStore) return json({ error: "meeting 모듈 없음" }, 503);
     const id = url.searchParams.get("id");
     const meta = id ? meetingStore.readMeta(CONFIG_DIR, id) : null;
     if (!meta) return json({ error: "not found" }, 404);
-    json({ meeting: meta });
+    const { speaker_embeddings, segments, live_transcript, ...slim } = meta;
+    json({ meeting: slim });
+  }
+  // POST /api/meetings/label — 화자에 이름 부여 + 등록 + 문서 재작성
+  else if (pathname === "/api/meetings/label" && req.method === "POST") {
+    if (!meetingStore || !meetingLabel) return json({ error: "meeting 모듈 없음" }, 503);
+    readBody().then((body) => {
+      const { meetingId, labels } = body;
+      if (!meetingId || !labels || typeof labels !== "object") return json({ error: "meetingId, labels 필요" }, 400);
+      try {
+        const result = meetingLabel({ configDir: CONFIG_DIR, meetingId, labels });
+        json({ ok: true, ...result });
+      } catch (e) {
+        json({ error: e.message }, 500);
+      }
+    }).catch((e) => json({ error: e.message }, 400));
   }
   // Docs API: /api/docs/copy — 파일/폴더 복사 (다른 프로젝트로)
   else if (pathname === "/api/docs/copy" && req.method === "POST") {

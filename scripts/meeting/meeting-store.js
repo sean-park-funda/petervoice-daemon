@@ -98,6 +98,26 @@ function writeTranscriptDoc(projectDocsDir, tokens, meta = {}) {
   return { docPath, segments, speakers };
 }
 
+/**
+ * Rewrite an existing transcript doc with an updated speaker_map (e.g. after
+ * labeling 화자1 → Sean). Uses meta.segments + meta.docs_dir + meta.transcript_doc.
+ */
+function rewriteTranscriptDoc(meta) {
+  if (!meta.segments || !meta.docs_dir || !meta.transcript_doc) return null;
+  const dateStr = new Date(meta.created_at || Date.now()).toLocaleString("ko-KR");
+  const markdown = buildTranscriptMarkdown(meta.segments, {
+    title: meta.title || "회의록 (원본 전사)",
+    dateStr,
+    durationSec: meta.duration_sec,
+    speakerMap: meta.speaker_map,
+  });
+  // transcript_doc is stored as "docs/meetings/x.md"; docs_dir is the docs/ dir
+  const rel = meta.transcript_doc.replace(/^docs\//, "");
+  const abs = path.join(meta.docs_dir, rel);
+  fs.writeFileSync(abs, markdown);
+  return abs;
+}
+
 module.exports = {
   meetingsDir,
   audioPath,
@@ -108,5 +128,6 @@ module.exports = {
   storeAudio,
   listMeetings,
   writeTranscriptDoc,
+  rewriteTranscriptDoc,
   speakerLabel,
 };

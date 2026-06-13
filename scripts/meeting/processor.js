@@ -7,6 +7,11 @@
 
 const { transcribeFile } = require("./soniox-async");
 const store = require("./meeting-store");
+const { groupBySpeaker } = require("./transcript");
+const voiceProfiles = require("./voice-profiles");
+
+// Minimum speaker audio (sec) to consider enrolling an unknown speaker
+const ENROLL_MIN_SEC = 8;
 
 /**
  * Ask the bot to turn the raw transcript into polished minutes.
@@ -80,7 +85,32 @@ async function processMeeting({ configDir, config, meetingId, projectDocsDir, lo
       return;
     }
 
-    const { docPath, speakers } = store.writeTranscriptDoc(projectDocsDir, tokens, meta);
+    // ── Speaker identification via local voice profiles (best-effort) ──
+    // Registered speakers → auto-named; unknown speakers with enough audio
+    // are flagged so the UI can ask "who was this?" and enroll them.
+    let speakerMap = {};
+    let unknownSpeakers = [];
+    let speakerEmbeddings = {};
+    try {
+      store.updateMeta(configDir, meetingId, { phase: "identifying" });
+      const segs = groupBySpeaker(tokens).map((s) => ({
+        speaker: s.speaker, start_ms: s.start_ms, end_ms: s.end_ms,
+      }));
+      const { embeddings, durations } = voiceProfiles.embedSpeakers(audio, segs);
+      speakerEmbeddings = embeddings;
+      const profiles = voiceProfiles.loadProfiles(configDir);
+      for (const [sp, emb] of Object.entries(embeddings)) {
+        const m = voiceProfiles.matchSpeaker(emb, profiles);
+        if (m) speakerMap[sp] = m.name;
+        else if ((durations[sp] || 0) >= ENROLL_MIN_SEC) unknownSpeakers.push(sp);
+      }
+      out(`[meeting] ${meetingId} speaker-id: matched=${JSON.stringify(speakerMap)} unknown=[${unknownSpeakers}]`);
+    } catch (e) {
+      out(`[meeting] ${meetingId} speaker-id skipped: ${e.message}`);
+    }
+
+    const metaForDoc = { ...meta, speaker_map: speakerMap };
+    const { docPath, speakers } = store.writeTranscriptDoc(projectDocsDir, tokens, metaForDoc);
     const rel = docPath.split("/docs/").pop();
     const transcriptRel = rel ? `docs/${rel}` : docPath;
 
@@ -88,7 +118,12 @@ async function processMeeting({ configDir, config, meetingId, projectDocsDir, lo
       status: "transcribed",
       phase: "done",
       transcript_doc: transcriptRel,
+      docs_dir: projectDocsDir,
       speakers,
+      speaker_map: speakerMap,
+      unknown_speakers: unknownSpeakers,
+      speaker_embeddings: speakerEmbeddings,
+      segments,
     });
     out(`[meeting] ${meetingId} transcribed → ${transcriptRel} (${speakers.length} speakers)`);
 
@@ -133,4 +168,34 @@ async function processMeeting({ configDir, config, meetingId, projectDocsDir, lo
   }
 }
 
-module.exports = { processMeeting, triggerMinutes };
+/**
+ * Apply user labels to a meeting: enroll each labeled speaker's embedding
+ * under the given name and rewrite the transcript doc with real names.
+ * labels: { "<speakerId>": "<name>" }
+ */
+function labelMeeting({ configDir, meetingId, labels }) {
+  const meta = store.readMeta(configDir, meetingId);
+  if (!meta) throw new Error("meeting not found");
+  const embeddings = meta.speaker_embeddings || {};
+  const speakerMap = { ...(meta.speaker_map || {}) };
+  let enrolled = 0;
+
+  for (const [sp, name] of Object.entries(labels || {})) {
+    const clean = String(name || "").trim();
+    if (!clean) continue;
+    speakerMap[sp] = clean;
+    const emb = embeddings[sp];
+    if (Array.isArray(emb)) { voiceProfiles.enroll(configDir, clean, emb); enrolled++; }
+  }
+
+  // remaining unknowns = eligible speakers still without a name
+  const unknown = (meta.unknown_speakers || []).filter((sp) => !speakerMap[sp]);
+  const updated = store.updateMeta(configDir, meetingId, {
+    speaker_map: speakerMap,
+    unknown_speakers: unknown,
+  });
+  const rewritten = store.rewriteTranscriptDoc(updated);
+  return { speaker_map: speakerMap, enrolled, rewritten: !!rewritten };
+}
+
+module.exports = { processMeeting, triggerMinutes, labelMeeting };
