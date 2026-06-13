@@ -110,7 +110,7 @@ async function processMeeting({ configDir, config, meetingId, projectDocsDir, lo
     }
 
     const metaForDoc = { ...meta, speaker_map: speakerMap };
-    const { docPath, speakers } = store.writeTranscriptDoc(projectDocsDir, tokens, metaForDoc);
+    const { docPath, speakers, segments } = store.writeTranscriptDoc(projectDocsDir, tokens, metaForDoc);
     const rel = docPath.split("/docs/").pop();
     const transcriptRel = rel ? `docs/${rel}` : docPath;
 
