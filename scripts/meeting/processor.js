@@ -92,6 +92,38 @@ async function processMeeting({ configDir, config, meetingId, projectDocsDir, lo
     const triggered = await triggerMinutes(config || {}, meta, transcriptRel);
     store.updateMeta(configDir, meetingId, { status: triggered ? "minutes_pending" : "transcribed" });
   } catch (e) {
+    // Fallback: if async diarization failed but we captured a live transcript,
+    // save that so the meeting isn't lost.
+    const fallback = (meta.live_transcript || "").trim();
+    if (fallback && projectDocsDir) {
+      try {
+        const fs = require("fs");
+        const path = require("path");
+        const dateStr = new Date(meta.created_at || Date.now()).toLocaleString("ko-KR");
+        const md =
+          `# ${meta.title || "회의록 (실시간 전사 — 폴백)"}\n\n` +
+          `- 일시: ${dateStr}\n` +
+          `> ⚠️ 정밀 화자분리(async)에 실패하여 **실시간 전사(러프)**로 대체했습니다.\n` +
+          `> 사유: ${String(e.message || e)}\n\n## 전사 (실시간)\n\n${fallback}\n`;
+        const outDir = path.join(projectDocsDir, "meetings");
+        fs.mkdirSync(outDir, { recursive: true });
+        const p = (n) => String(n).padStart(2, "0");
+        const d = new Date(meta.created_at || Date.now());
+        const stamp = `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}`;
+        const docPath = path.join(outDir, `${stamp}-fallback-transcript.md`);
+        fs.writeFileSync(docPath, md);
+        const rel = docPath.split("/docs/").pop();
+        store.updateMeta(configDir, meetingId, {
+          status: "transcribed", phase: "fallback",
+          transcript_doc: rel ? `docs/${rel}` : docPath,
+          error: `async 실패, 실시간 전사로 대체: ${String(e.message || e)}`,
+        });
+        out(`[meeting] ${meetingId} fallback to live transcript`);
+        return;
+      } catch (e2) {
+        out(`[meeting] ${meetingId} fallback write failed: ${e2.message}`);
+      }
+    }
     store.updateMeta(configDir, meetingId, { status: "failed", error: String(e.message || e) });
     out(`[meeting] ${meetingId} error: ${e.message || e}`);
   }

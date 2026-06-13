@@ -1644,6 +1644,7 @@ const server = http.createServer((req, res) => {
         project: fields.project || null,
         title: fields.title || "제목 없는 회의",
         duration_sec: parseInt(fields.duration || "0") || null,
+        live_transcript: fields.liveTranscript || null,
         status: "processing",
         created_at: now,
         updated_at: now,
