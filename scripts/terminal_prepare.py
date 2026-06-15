@@ -69,6 +69,11 @@ def main() -> int:
     result = {"dir": os.path.expanduser("~"), "prompt_file": ""}
 
     try:
+        # Standalone process: load config (api_url/api_key) the daemon way,
+        # otherwise every API-backed resolver silently falls back to defaults.
+        from daemon.config import load_config
+        load_config()
+
         from daemon.supabase import get_project_dir
 
         combined = ""
