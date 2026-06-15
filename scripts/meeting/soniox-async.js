@@ -40,8 +40,21 @@ async function soniox(apiKey, method, urlPath, body, isJson = true) {
  * a clean 16kHz mono WAV with ffmpeg, which writes a proper duration.
  * Returns the path to use for upload (wav on success, original on failure).
  */
+function findFfmpeg() {
+  const candidates = [
+    process.env.FFMPEG_PATH,
+    "/opt/homebrew/bin/ffmpeg",
+    "/usr/local/bin/ffmpeg",
+    "/usr/bin/ffmpeg",
+  ].filter(Boolean);
+  for (const c of candidates) {
+    try { if (fs.existsSync(c)) return c; } catch { /* ignore */ }
+  }
+  return "ffmpeg"; // rely on PATH
+}
+
 function remuxForSoniox(filePath) {
-  const ffmpeg = process.env.FFMPEG_PATH || "/opt/homebrew/bin/ffmpeg";
+  const ffmpeg = findFfmpeg();
   const wavPath = path.join(os.tmpdir(), `pv-meeting-${path.basename(filePath, path.extname(filePath))}.wav`);
   try {
     const r = spawnSync(ffmpeg, ["-y", "-i", filePath, "-ar", "16000", "-ac", "1", wavPath], {

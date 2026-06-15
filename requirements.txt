@@ -4,3 +4,7 @@ idna==3.11
 requests==2.32.5
 urllib3==2.6.3
 cryptography>=44.0.0
+# Meeting voice enrollment (speaker embeddings, ONNX — no PyTorch)
+numpy>=1.26
+scipy>=1.11
+onnxruntime>=1.20

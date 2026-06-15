@@ -14,6 +14,29 @@ const voiceProfiles = require("./voice-profiles");
 const ENROLL_MIN_SEC = 8;
 
 /**
+ * Resolve the Soniox key for async transcription. Sean's machine has it in
+ * env (.env.secrets); other users fetch the shared key from the web with their
+ * api_key. Soniox temp keys are websocket-only, so async needs the real key.
+ */
+async function resolveSonioxKey(config) {
+  if (process.env.SONIOX_API_KEY) return process.env.SONIOX_API_KEY;
+  const apiUrl = (config && config.api_url) || "https://peter-voice.vercel.app";
+  const apiKey = config && config.api_key;
+  if (!apiKey) return null;
+  try {
+    const res = await fetch(`${apiUrl}/api/stt/async-key`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+    });
+    if (!res.ok) return null;
+    const d = await res.json();
+    return d.key || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Ask the bot to turn the raw transcript into polished minutes.
  * Best-effort: posts a user message into the meeting's project session via
  * the PeterVoice API. The daemon picks it up and the bot writes the minutes doc.
@@ -59,10 +82,10 @@ async function triggerMinutes(config, meeting, transcriptDocRelPath) {
  */
 async function processMeeting({ configDir, config, meetingId, projectDocsDir, log }) {
   const out = log || (() => {});
-  const sonioxKey = process.env.SONIOX_API_KEY;
+  const sonioxKey = await resolveSonioxKey(config);
   if (!sonioxKey) {
-    store.updateMeta(configDir, meetingId, { status: "failed", error: "SONIOX_API_KEY 미설정" });
-    out(`[meeting] ${meetingId} failed: no SONIOX_API_KEY`);
+    store.updateMeta(configDir, meetingId, { status: "failed", error: "Soniox 키를 가져오지 못했습니다" });
+    out(`[meeting] ${meetingId} failed: no Soniox key (local + web both unavailable)`);
     return;
   }
 

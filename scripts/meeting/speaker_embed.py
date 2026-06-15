@@ -15,10 +15,17 @@ Pipeline: ffmpeg → 16k mono wav → Kaldi-style 80-dim fbank (numpy/scipy)
 
 No PyTorch — runs on onnxruntime (verified on Python 3.14).
 """
-import sys, os, json, subprocess, tempfile
+import sys, os, json, subprocess, tempfile, shutil
 import numpy as np
 from scipy.io import wavfile
 import onnxruntime as ort
+
+def _find_ffmpeg():
+    for c in (os.environ.get("FFMPEG_PATH"), "/opt/homebrew/bin/ffmpeg",
+              "/usr/local/bin/ffmpeg", "/usr/bin/ffmpeg"):
+        if c and os.path.exists(c):
+            return c
+    return shutil.which("ffmpeg") or "ffmpeg"
 
 SR = 16000
 MODEL = os.environ.get(
@@ -27,7 +34,7 @@ MODEL = os.environ.get(
 )
 MODEL_URL = ("https://huggingface.co/onnx-community/"
              "wespeaker-voxceleb-resnet34-LM/resolve/main/onnx/model.onnx")
-FFMPEG = os.environ.get("FFMPEG_PATH", "/opt/homebrew/bin/ffmpeg")
+FFMPEG = _find_ffmpeg()
 
 def _ensure_model():
     if os.path.exists(MODEL) and os.path.getsize(MODEL) > 1_000_000:
