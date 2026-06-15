@@ -103,8 +103,13 @@ class SecretsSyncer(threading.Thread):
 
         logger.info(f"[secrets] Synced {len(keys)} secrets: {', '.join(keys)}")
 
-        # Sync Google tokens to keyring for skill compatibility
-        self._sync_google_keyring()
+        # Sync Google tokens to keyring — run in a separate thread with timeout
+        # to prevent blocking on headless keychain GUI prompts (launchd context)
+        t = threading.Thread(target=self._sync_google_keyring, daemon=True)
+        t.start()
+        t.join(timeout=5)
+        if t.is_alive():
+            logger.warning("[secrets] keyring sync timed out (headless keychain), skipping")
 
     def run(self):
         logger.info("[secrets] Syncer started")
