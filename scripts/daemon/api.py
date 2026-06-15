@@ -4,30 +4,57 @@ All DB access goes through PeterVoice web API — no direct Supabase.
 """
 
 import json
-import urllib.request
-import urllib.error
+import threading
+
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from daemon.globals import config, logger
+
+# Module-level session with connection pooling and keep-alive.
+# Reusing TCP connections prevents TIME_WAIT port exhaustion on long-running daemons.
+_session_lock = threading.Lock()
+_session: requests.Session | None = None
+
+
+def _get_session() -> requests.Session:
+    global _session
+    if _session is None:
+        with _session_lock:
+            if _session is None:
+                s = requests.Session()
+                adapter = HTTPAdapter(
+                    pool_connections=4,
+                    pool_maxsize=10,
+                    max_retries=Retry(total=0),
+                )
+                s.mount("https://", adapter)
+                s.mount("http://", adapter)
+                _session = s
+    return _session
 
 
 def api_request(api_key: str, method: str, path: str, body: dict | None = None, timeout: int = 30) -> dict | None:
     url = f"{config['api_url']}{path}"
-    data = json.dumps(body).encode("utf-8") if body else None
-    req = urllib.request.Request(url, data=data, method=method)
-    req.add_header("Authorization", f"Bearer {api_key}")
-    req.add_header("X-Api-Key", api_key)
-    req.add_header("Content-Type", "application/json")
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "X-Api-Key": api_key,
+        "Content-Type": "application/json",
+    }
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        body_text = ""
-        try:
-            body_text = e.read().decode("utf-8")[:200]
-        except Exception:
-            pass
-        logger.error(f"HTTP {e.code} {method} {path}: {body_text}")
-        return None
+        resp = _get_session().request(
+            method,
+            url,
+            json=body,
+            headers=headers,
+            timeout=timeout,
+        )
+        if not resp.ok:
+            body_text = resp.text[:200] if resp.text else ""
+            logger.error(f"HTTP {resp.status_code} {method} {path}: {body_text}")
+            return None
+        return resp.json()
     except Exception as e:
         logger.error(f"Request failed {method} {path}: {e}")
         return None
