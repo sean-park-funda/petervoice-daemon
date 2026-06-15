@@ -37,20 +37,24 @@ class AutoUpdater(threading.Thread):
         r = self._git("rev-parse", "HEAD")
         return r.stdout.strip() if r.returncode == 0 else ""
 
+    def _restart_home_portal(self):
+        """Restart the Home Portal launchd service (so it reloads native deps/code)."""
+        try:
+            import os
+            uid = os.getuid()
+            plist = os.path.expanduser("~/Library/LaunchAgents/com.petervoice.home-portal.plist")
+            subprocess.run(["launchctl", "bootout", f"gui/{uid}", plist], capture_output=True)
+            subprocess.run(["launchctl", "bootstrap", f"gui/{uid}", plist], capture_output=True)
+            logger.info("[updater] Home Portal restarted")
+        except Exception as e:
+            logger.warning(f"[updater] Home Portal restart failed: {e}")
+
     def _restart_home_portal_if_changed(self, old_head: str, new_head: str):
         """Restart Home Portal launchd service if home-portal.js changed."""
         r = self._git("diff", "--name-only", old_head, new_head)
         if r.returncode == 0 and "home-portal.js" in r.stdout:
             logger.info("[updater] home-portal.js changed — restarting Home Portal")
-            try:
-                import os
-                uid = os.getuid()
-                plist = os.path.expanduser("~/Library/LaunchAgents/com.petervoice.home-portal.plist")
-                subprocess.run(["launchctl", "bootout", f"gui/{uid}", plist], capture_output=True)
-                subprocess.run(["launchctl", "bootstrap", f"gui/{uid}", plist], capture_output=True)
-                logger.info("[updater] Home Portal restarted")
-            except Exception as e:
-                logger.warning(f"[updater] Home Portal restart failed: {e}")
+            self._restart_home_portal()
 
     def _clear_pycache(self):
         """Remove __pycache__ dirs under scripts/ to prevent stale .pyc issues."""
@@ -82,8 +86,11 @@ class AutoUpdater(threading.Thread):
                 logger.warning(f"[updater] pip install failed: {e}")
 
     def _npm_install_if_needed(self, old_head: str, new_head: str):
-        """Run npm install in scripts/ if package.json changed, or if node_modules
-        is missing entirely (e.g. terminal deps node-pty/ws never installed)."""
+        """Ensure scripts/ npm deps (terminal node-pty/ws) are installed.
+        Runs when package.json changed or when the native deps are missing.
+        Handles npm's stale hidden lockfile (node_modules/.package-lock.json),
+        which can make a plain `npm install` skip a dir that is actually absent."""
+        import os
         scripts_dir = self._repo_dir / "scripts"
         pkg = scripts_dir / "package.json"
         if not pkg.exists():
@@ -92,31 +99,56 @@ class AutoUpdater(threading.Thread):
         pty_mod = node_modules / "@homebridge" / "node-pty-prebuilt-multiarch"
         ws_mod = node_modules / "ws"
 
+        def deps_ok():
+            return pty_mod.exists() and ws_mod.exists()
+
         changed = False
         r = self._git("diff", "--name-only", old_head, new_head)
         if r.returncode == 0 and ("scripts/package.json" in r.stdout or "scripts/package-lock.json" in r.stdout):
             changed = True
-        missing = not pty_mod.exists() or not ws_mod.exists()
+        missing = not deps_ok()
 
         if not (changed or missing):
             return
 
-        reason = "package.json changed" if changed else "node_modules missing (terminal deps)"
-        logger.info(f"[updater] {reason} — running npm install in scripts/")
-        try:
-            from daemon.globals import _extended_path
-            import os
-            _env = {**os.environ, "PATH": _extended_path()}
-            res = subprocess.run(
-                ["npm", "install", "--no-audit", "--no-fund"],
-                cwd=str(scripts_dir), capture_output=True, text=True, timeout=300, env=_env,
-            )
-            if res.returncode == 0:
-                logger.info("[updater] npm install completed (terminal deps ready)")
-            else:
-                logger.warning(f"[updater] npm install failed: {res.stderr[:500]}")
-        except Exception as e:
-            logger.warning(f"[updater] npm install failed: {e}")
+        # npm/node may live in homebrew or /usr/local which launchd PATH often omits
+        from daemon.globals import _extended_path
+        _env = {**os.environ,
+                "PATH": "/opt/homebrew/bin:/usr/local/bin:" + _extended_path()}
+
+        def run_npm(args, timeout=600):
+            try:
+                return subprocess.run(["npm", *args, "--no-audit", "--no-fund"],
+                                      cwd=str(scripts_dir), capture_output=True,
+                                      text=True, timeout=timeout, env=_env)
+            except Exception as e:
+                logger.warning(f"[updater] npm {' '.join(args)} failed: {e}")
+                return None
+
+        reason = "package.json changed" if changed else "terminal deps missing"
+        logger.info(f"[updater] {reason} — installing scripts/ npm deps")
+
+        # If deps are physically missing, drop npm's hidden lockfile so it can't
+        # falsely believe they're already installed and skip them.
+        if missing:
+            try:
+                (node_modules / ".package-lock.json").unlink(missing_ok=True)
+            except Exception:
+                pass
+
+        run_npm(["install"])
+
+        # Verify; if a native dep is still absent, force an explicit reinstall
+        # (covers stale-lockfile and partial-install states).
+        if not deps_ok():
+            logger.warning("[updater] deps still missing after npm install — forcing explicit reinstall")
+            run_npm(["install", "@homebridge/node-pty-prebuilt-multiarch", "ws", "--force"])
+
+        if deps_ok():
+            logger.info("[updater] terminal deps ready — restarting Home Portal")
+            self._restart_home_portal()
+        else:
+            logger.warning("[updater] terminal deps STILL missing — manual npm install may be needed")
 
     def _update_cli_if_needed(self):
         """Update Claude CLI and Codex CLI to latest if newer versions are available on npm."""
