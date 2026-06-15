@@ -1528,7 +1528,8 @@ const server = http.createServer((req, res) => {
     // 터미널 화면(+스크롤백) 텍스트를 평문으로 반환 — 웹에서 선택/복사용
     // (claude TUI는 화면을 계속 다시 그려 xterm 선택이 지워지므로, 캡처 방식이 안정적)
     const key = url.searchParams.get("key") || req.headers["x-api-key"];
-    if (key !== config.api_key) { res.writeHead(401); res.end("Unauthorized"); return; }
+    const capCfg = loadConfig();
+    if (key !== capCfg.api_key) { res.writeHead(401); res.end("Unauthorized"); return; }
     const project = url.searchParams.get("project") || "general";
     const branch = url.searchParams.get("branch") || null;
     const mode = url.searchParams.get("mode") === "shell" ? "shell" : "claude";
