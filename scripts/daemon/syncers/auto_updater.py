@@ -150,6 +150,36 @@ class AutoUpdater(threading.Thread):
         else:
             logger.warning("[updater] terminal deps STILL missing — manual npm install may be needed")
 
+    def _ensure_tmux(self):
+        """Terminal mode needs tmux. Install it (brew) if missing so the
+        terminal WebSocket can create sessions. macOS only."""
+        import os, shutil, platform
+        if platform.system() != "Darwin":
+            return
+        # tmux already present in a standard location?
+        for p in ("/opt/homebrew/bin/tmux", "/usr/local/bin/tmux", "/usr/bin/tmux"):
+            if os.path.exists(p):
+                return
+        if shutil.which("tmux"):
+            return
+
+        brew = shutil.which("brew") or next(
+            (b for b in ("/opt/homebrew/bin/brew", "/usr/local/bin/brew") if os.path.exists(b)), None)
+        if not brew:
+            logger.warning("[updater] tmux missing and brew not found — terminal mode unavailable")
+            return
+        logger.info("[updater] tmux missing — installing via brew (terminal mode)")
+        try:
+            res = subprocess.run([brew, "install", "tmux"],
+                                 capture_output=True, text=True, timeout=600)
+            if res.returncode == 0 and (os.path.exists("/opt/homebrew/bin/tmux") or os.path.exists("/usr/local/bin/tmux")):
+                logger.info("[updater] tmux installed — restarting Home Portal")
+                self._restart_home_portal()
+            else:
+                logger.warning(f"[updater] tmux install failed: {res.stderr[:400]}")
+        except Exception as e:
+            logger.warning(f"[updater] tmux install failed: {e}")
+
     def _update_cli_if_needed(self):
         """Update Claude CLI and Codex CLI to latest if newer versions are available on npm."""
         try:
@@ -315,9 +345,10 @@ class AutoUpdater(threading.Thread):
             logger.warning("[updater] Git repo not found — auto-updater disabled")
             return
 
-        # Self-heal on startup: install scripts/ deps if node_modules is missing
-        # (e.g. terminal deps node-pty/ws were never installed on this machine).
+        # Self-heal on startup: ensure terminal deps (tmux + node-pty/ws) exist
+        # on this machine even if they were never installed.
         try:
+            self._ensure_tmux()
             head = self._local_head()
             if head:
                 self._npm_install_if_needed(head, head)
