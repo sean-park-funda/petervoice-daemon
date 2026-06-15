@@ -1,0 +1,110 @@
+#!/usr/bin/env python3
+"""Terminal-mode session preparer.
+
+home-portal.js calls this right before creating a tmux `claude` session so the
+terminal claude starts with the SAME project context the chat mode injects:
+
+  - resolves the project working directory the same way the daemon does
+    (authoritative source = web API), so chat & terminal share one folder (C-1)
+  - composes the project/branch system prompt (common + system + project +
+    branch/kanban rules + wiki index + prior-session summary) exactly like chat,
+    and writes it to a prompt file for `claude --append-system-prompt-file` (C-2)
+  - appends a "how to recall past chat" block pointing at the conversation API,
+    since terminal claude isn't wired to the DB the way the daemon is (C-3)
+
+Usage:
+    python3 terminal_prepare.py --project <id> [--branch <branch_id>]
+
+Prints a single JSON line to stdout:
+    {"dir": "<projectDir>", "prompt_file": "<path>"}
+
+On any failure it still prints valid JSON with whatever it could resolve
+(at minimum an empty prompt_file and a best-effort dir) so the terminal can
+still open — degraded, not broken.
+"""
+
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+
+# Make `daemon` importable regardless of cwd
+SCRIPTS_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(SCRIPTS_DIR))
+
+PROMPTS_DIR = Path.home() / ".claude-daemon" / "prompts"
+
+
+def _recall_block(project_arg: str) -> str:
+    """Instructions so terminal claude can pull past chat history on demand."""
+    return f"""# 터미널 모드 — 과거 대화 불러오기
+
+당신은 지금 피터보이스 **터미널 모드**로 실행 중입니다. 채팅 모드와 달리 과거 대화가
+자동으로 주입되지 않습니다. 유저가 "이전 대화 확인해", "아까 뭐라 했지?" 등 과거 맥락을
+요청하거나 맥락이 필요하면, 아래 API로 최근 대화를 직접 조회하세요.
+
+```bash
+API_URL=$(python3 -c "import json,os; c=json.load(open(os.path.expanduser('~/.claude-daemon/config.json'))); print(c.get('api_url','https://peter-voice.vercel.app'))")
+API_KEY=$(python3 -c "import json,os; print(json.load(open(os.path.expanduser('~/.claude-daemon/config.json')))['api_key'])")
+curl -s "$API_URL/api/bot/conversation?project={project_arg}&limit=20" -H "Authorization: Bearer $API_KEY"
+```
+
+- 응답: `{{"messages": [{{"type": "user"|"bot", "text": "..."}}]}}`
+- 이 프로젝트의 채팅 모드 대화가 그대로 보입니다. 맥락을 놓쳤으면 먼저 조회 후 답하세요."""
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--project", required=True)
+    ap.add_argument("--branch", default=None)
+    args = ap.parse_args()
+
+    # Reconstruct the daemon's project identifier form
+    if args.branch:
+        project_arg = f"branch:{args.branch}"
+    else:
+        project_arg = args.project
+
+    result = {"dir": os.path.expanduser("~"), "prompt_file": ""}
+
+    try:
+        from daemon.supabase import get_project_dir
+
+        combined = ""
+        if project_arg.startswith("branch:"):
+            from daemon.branches import fetch_branch, build_branch_prompt, build_branch_context
+            branch_id = project_arg.split(":", 1)[1]
+            branch_data = fetch_branch(branch_id)
+            real_project = (branch_data or {}).get("project_id", "general")
+            result["dir"] = get_project_dir(real_project)
+            if branch_data:
+                combined = build_branch_prompt(branch_data)
+                ctx = build_branch_context(branch_data)
+                if ctx:
+                    combined = (combined + "\n\n---\n\n" + ctx) if combined else ctx
+        else:
+            from daemon.claude_runner import build_project_prompt
+            result["dir"] = get_project_dir(project_arg)
+            combined = build_project_prompt(project_arg)
+
+        # C-3: append the recall instructions
+        recall = _recall_block(project_arg)
+        combined = (combined + "\n\n---\n\n" + recall) if combined else recall
+
+        # Write prompt file (named by project arg, sanitized)
+        PROMPTS_DIR.mkdir(parents=True, exist_ok=True)
+        safe = project_arg.replace(":", "_").replace("/", "_")
+        prompt_file = PROMPTS_DIR / f"_terminal_{safe}.md"
+        prompt_file.write_text(combined, encoding="utf-8")
+        result["prompt_file"] = str(prompt_file)
+    except Exception as e:
+        # Degrade gracefully — terminal still opens, just without injected context
+        sys.stderr.write(f"[terminal_prepare] {e}\n")
+
+    print(json.dumps(result))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

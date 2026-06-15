@@ -2171,7 +2171,7 @@ const PORTAL_ENV = {
   PATH: `/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:${process.env.PATH || ""}`,
 };
 
-function ensureTmuxSession(sessionKey, projectDir, mode = "claude") {
+function ensureTmuxSession(sessionKey, projectDir, mode = "claude", promptFile = null) {
   // tmux 세션 존재 여부 확인 (spawnSync으로 직접 실행)
   const check = spawnSync(TMUX_CMD, ["has-session", "-t", sessionKey], { env: PORTAL_ENV });
   if (check.status === 0) {
@@ -2187,9 +2187,13 @@ function ensureTmuxSession(sessionKey, projectDir, mode = "claude") {
     startCmd = [process.env.SHELL || "/bin/zsh", "-l"];
   } else {
     // 기본: 프로젝트에 연결된 claude 대화형 세션
+    // 채팅 모드와 동일하게 조합된 프로젝트/브랜치 프롬프트를 시스템 프롬프트로 주입
     const claudeCmd = ["/opt/homebrew/bin/claude", "/usr/local/bin/claude"]
       .find(p => fs.existsSync(p)) || "claude";
     startCmd = [claudeCmd, "--dangerously-skip-permissions"];
+    if (promptFile && fs.existsSync(promptFile)) {
+      startCmd.push("--append-system-prompt-file", promptFile);
+    }
   }
 
   // 스크롤백: history-limit은 pane 생성 전에 설정해야 적용됨 → 글로벌 옵션으로 먼저 세팅
@@ -2237,13 +2241,35 @@ if (ptyModule && WebSocketServer) {
 
     // 셸 모드는 프로젝트와 무관한 단일 글로벌 세션(홈 디렉토리)
     const sessionKey = mode === "shell" ? "__shell__" : getSessionKey(project, branch);
-    const projectDir = mode === "shell" ? os.homedir() : getProjectDirectory(project);
 
-    console.log(`[terminal] WS connect: mode=${mode}, session=${sessionKey}, dir=${projectDir}`);
+    // claude 모드: 데몬 로직으로 프로젝트 디렉토리 + 조합 프롬프트를 준비
+    // (채팅 모드와 같은 폴더·같은 프로젝트/브랜치 프롬프트 + 대화 조회 안내 주입)
+    let projectDir = mode === "shell" ? os.homedir() : getProjectDirectory(project);
+    let promptFile = null;
+    if (mode !== "shell") {
+      try {
+        const prepArgs = ["terminal_prepare.py", "--project", project];
+        if (branch) prepArgs.push("--branch", branch);
+        const prep = spawnSync("python3", prepArgs, {
+          cwd: __dirname, env: PORTAL_ENV, timeout: 30000,
+        });
+        if (prep.status === 0 && prep.stdout) {
+          const out = JSON.parse(prep.stdout.toString().trim().split("\n").pop());
+          if (out.dir) projectDir = out.dir;
+          if (out.prompt_file) promptFile = out.prompt_file;
+        } else {
+          console.warn("[terminal] terminal_prepare failed:", (prep.stderr || "").toString().slice(0, 300));
+        }
+      } catch (e) {
+        console.warn("[terminal] terminal_prepare error (degraded):", e.message);
+      }
+    }
+
+    console.log(`[terminal] WS connect: mode=${mode}, session=${sessionKey}, dir=${projectDir}, prompt=${promptFile ? "yes" : "no"}`);
 
     // tmux 세션 준비
     try {
-      ensureTmuxSession(sessionKey, projectDir, mode);
+      ensureTmuxSession(sessionKey, projectDir, mode, promptFile);
     } catch (e) {
       console.error("[terminal] tmux session create failed:", e.message);
       ws.send(`\r\n[Error] Failed to create tmux session: ${e.message}\r\n`);
