@@ -125,7 +125,7 @@ ssh -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519_migration user@{TAILSCALE_IP}
 | 고객명 | 이름 | Tailscale IP | OS 유저 | SSH 방식 | Claude 계정 | 비고 |
 |--------|------|-------------|---------|----------|-------------|------|
 | karl | 안영수 | 100.86.21.105 | karl | sshpass -p 'karl1234' (password auth) | dev.ceo@ptjcomics.com | 박태준과 계정 공유 |
-| — | 박태준 | — | — | — | dev.ceo@ptjcomics.com | 안영수와 계정 공유 |
+| — | 박태준 | 100.76.237.77 | 777inked777 | SSH 키 인증 (기본 id_ed25519) | dev.ceo@ptjcomics.com | 안영수와 계정 공유; sudo 없음 |
 
 > **주의**: `dev.ceo@ptjcomics.com` 계정을 두 사람이 공유한다. Claude CLI 재로그인 시 이 계정으로 로그인해야 하며, Sean 계정(`sungjunpark@ptjcomics.com`)으로 덮어쓰지 말 것.
 
