@@ -4,6 +4,7 @@ All DB access goes through PeterVoice web API — no direct Supabase.
 """
 
 import json
+import subprocess
 import threading
 
 import requests
@@ -16,22 +17,53 @@ from daemon.globals import config, logger
 # Reusing TCP connections prevents TIME_WAIT port exhaustion on long-running daemons.
 _session_lock = threading.Lock()
 _session: requests.Session | None = None
+_session_source_ip: str = ""
+
+
+def _get_primary_ip() -> str:
+    """Return the current IP of the primary outbound network interface.
+
+    On macOS, the kernel's automatic source-address selection can break after
+    DHCP renewal or interface toggles (sockets get EADDRNOTAVAIL even with a
+    valid route). Explicit binding via source_address sidesteps this bug.
+    """
+    for iface in ("en0", "en1", "en2"):
+        try:
+            result = subprocess.run(
+                ["ipconfig", "getifaddr", iface],
+                capture_output=True, text=True, timeout=2,
+            )
+            ip = result.stdout.strip()
+            if result.returncode == 0 and ip and not ip.startswith("127."):
+                return ip
+        except Exception:
+            pass
+    return ""
+
+
+def _build_session() -> requests.Session:
+    source_ip = _get_primary_ip()
+    s = requests.Session()
+    adapter = HTTPAdapter(
+        pool_connections=4,
+        pool_maxsize=10,
+        max_retries=Retry(total=0),
+        source_address=(source_ip, 0) if source_ip else None,
+    )
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
+    if source_ip:
+        logger.debug(f"[api] session bound to {source_ip}")
+    return s, source_ip
 
 
 def _get_session() -> requests.Session:
-    global _session
-    if _session is None:
+    global _session, _session_source_ip
+    current_ip = _get_primary_ip()
+    if _session is None or current_ip != _session_source_ip:
         with _session_lock:
-            if _session is None:
-                s = requests.Session()
-                adapter = HTTPAdapter(
-                    pool_connections=4,
-                    pool_maxsize=10,
-                    max_retries=Retry(total=0),
-                )
-                s.mount("https://", adapter)
-                s.mount("http://", adapter)
-                _session = s
+            if _session is None or current_ip != _session_source_ip:
+                _session, _session_source_ip = _build_session()
     return _session
 
 
