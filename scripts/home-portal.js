@@ -1524,6 +1524,26 @@ const server = http.createServer((req, res) => {
     res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
     res.end(renderHTML(req));
   }
+  else if (pathname === "/api/terminal/capture" && req.method === "GET") {
+    // 터미널 화면(+스크롤백) 텍스트를 평문으로 반환 — 웹에서 선택/복사용
+    // (claude TUI는 화면을 계속 다시 그려 xterm 선택이 지워지므로, 캡처 방식이 안정적)
+    const key = url.searchParams.get("key") || req.headers["x-api-key"];
+    if (key !== config.api_key) { res.writeHead(401); res.end("Unauthorized"); return; }
+    const project = url.searchParams.get("project") || "general";
+    const branch = url.searchParams.get("branch") || null;
+    const mode = url.searchParams.get("mode") === "shell" ? "shell" : "claude";
+    const sessionKey = mode === "shell" ? "__shell__" : getSessionKey(project, branch);
+    const cap = spawnSync(TMUX_CMD, ["capture-pane", "-p", "-S", "-2000", "-t", sessionKey], { env: PORTAL_ENV, maxBuffer: 8 * 1024 * 1024 });
+    if (cap.status !== 0) {
+      res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
+      res.end("(세션을 찾을 수 없습니다)");
+      return;
+    }
+    // 끝부분의 빈 줄 정리
+    const text = cap.stdout.toString().replace(/\n+$/, "\n");
+    res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-cache" });
+    res.end(text);
+  }
   else if (pathname === "/api/sites" && req.method === "GET") {
     json(apiSites());
   }
