@@ -81,6 +81,43 @@ class AutoUpdater(threading.Thread):
             except Exception as e:
                 logger.warning(f"[updater] pip install failed: {e}")
 
+    def _npm_install_if_needed(self, old_head: str, new_head: str):
+        """Run npm install in scripts/ if package.json changed, or if node_modules
+        is missing entirely (e.g. terminal deps node-pty/ws never installed)."""
+        scripts_dir = self._repo_dir / "scripts"
+        pkg = scripts_dir / "package.json"
+        if not pkg.exists():
+            return
+        node_modules = scripts_dir / "node_modules"
+        pty_mod = node_modules / "@homebridge" / "node-pty-prebuilt-multiarch"
+        ws_mod = node_modules / "ws"
+
+        changed = False
+        r = self._git("diff", "--name-only", old_head, new_head)
+        if r.returncode == 0 and ("scripts/package.json" in r.stdout or "scripts/package-lock.json" in r.stdout):
+            changed = True
+        missing = not pty_mod.exists() or not ws_mod.exists()
+
+        if not (changed or missing):
+            return
+
+        reason = "package.json changed" if changed else "node_modules missing (terminal deps)"
+        logger.info(f"[updater] {reason} — running npm install in scripts/")
+        try:
+            from daemon.globals import _extended_path
+            import os
+            _env = {**os.environ, "PATH": _extended_path()}
+            res = subprocess.run(
+                ["npm", "install", "--no-audit", "--no-fund"],
+                cwd=str(scripts_dir), capture_output=True, text=True, timeout=300, env=_env,
+            )
+            if res.returncode == 0:
+                logger.info("[updater] npm install completed (terminal deps ready)")
+            else:
+                logger.warning(f"[updater] npm install failed: {res.stderr[:500]}")
+        except Exception as e:
+            logger.warning(f"[updater] npm install failed: {e}")
+
     def _update_cli_if_needed(self):
         """Update Claude CLI and Codex CLI to latest if newer versions are available on npm."""
         try:
@@ -227,6 +264,7 @@ class AutoUpdater(threading.Thread):
 
         # 5. Install dependencies if changed
         self._pip_install_if_changed(old_head, new_head)
+        self._npm_install_if_needed(old_head, new_head)
 
         # 6. Restart Home Portal if home-portal.js changed
         self._restart_home_portal_if_changed(old_head, new_head)
@@ -244,6 +282,15 @@ class AutoUpdater(threading.Thread):
         else:
             logger.warning("[updater] Git repo not found — auto-updater disabled")
             return
+
+        # Self-heal on startup: install scripts/ deps if node_modules is missing
+        # (e.g. terminal deps node-pty/ws were never installed on this machine).
+        try:
+            head = self._local_head()
+            if head:
+                self._npm_install_if_needed(head, head)
+        except Exception as e:
+            logger.warning(f"[updater] startup npm check failed: {e}")
 
         # Wait 30s before first check
         shutdown_event.wait(30)
