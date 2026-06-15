@@ -41,14 +41,31 @@ def _get_primary_ip() -> str:
     return ""
 
 
-def _build_session() -> requests.Session:
+class _SourceBoundAdapter(HTTPAdapter):
+    """HTTPAdapter that binds outbound sockets to a specific local IP.
+
+    requests.HTTPAdapter does not expose source_address directly; we must
+    override init_poolmanager to pass it down to urllib3.PoolManager.
+    """
+
+    def __init__(self, source_address: str, **kwargs):
+        self._source_address = source_address
+        super().__init__(**kwargs)
+
+    def init_poolmanager(self, *args, **kwargs):
+        if self._source_address:
+            kwargs["source_address"] = (self._source_address, 0)
+        super().init_poolmanager(*args, **kwargs)
+
+
+def _build_session() -> tuple[requests.Session, str]:
     source_ip = _get_primary_ip()
     s = requests.Session()
-    adapter = HTTPAdapter(
+    adapter = _SourceBoundAdapter(
+        source_address=source_ip,
         pool_connections=4,
         pool_maxsize=10,
         max_retries=Retry(total=0),
-        source_address=(source_ip, 0) if source_ip else None,
     )
     s.mount("https://", adapter)
     s.mount("http://", adapter)
