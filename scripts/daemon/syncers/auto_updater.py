@@ -180,6 +180,36 @@ class AutoUpdater(threading.Thread):
         except Exception as e:
             logger.warning(f"[updater] tmux install failed: {e}")
 
+    def _ensure_claude_credentials_file(self):
+        """Terminal mode runs claude inside a detached tmux server, which can't
+        reach the macOS login Keychain (no GUI to approve the ACL prompt), so
+        claude there shows a login screen even though chat works. Mirror the
+        Keychain OAuth token into ~/.claude/.credentials.json (file-based auth,
+        which works in any context). macOS only; the daemon itself runs in the
+        GUI session so it CAN read the Keychain to seed the file."""
+        import os, json, platform
+        if platform.system() != "Darwin":
+            return
+        creds_path = os.path.expanduser("~/.claude/.credentials.json")
+        if os.path.exists(creds_path):
+            return  # already file-based; claude keeps it refreshed
+        try:
+            res = subprocess.run(
+                ["security", "find-generic-password", "-s", "Claude Code-credentials", "-w"],
+                capture_output=True, text=True, timeout=15,
+            )
+            if res.returncode != 0 or not res.stdout.strip():
+                return  # no keychain creds (not logged in yet) — nothing to mirror
+            blob = res.stdout.strip()
+            json.loads(blob)  # validate
+            os.makedirs(os.path.dirname(creds_path), exist_ok=True)
+            with open(creds_path, "w") as f:
+                f.write(blob)
+            os.chmod(creds_path, 0o600)
+            logger.info("[updater] seeded ~/.claude/.credentials.json from Keychain (terminal auth)")
+        except Exception as e:
+            logger.warning(f"[updater] credentials file seed failed: {e}")
+
     def _update_cli_if_needed(self):
         """Update Claude CLI and Codex CLI to latest if newer versions are available on npm."""
         try:
@@ -349,11 +379,12 @@ class AutoUpdater(threading.Thread):
         # on this machine even if they were never installed.
         try:
             self._ensure_tmux()
+            self._ensure_claude_credentials_file()
             head = self._local_head()
             if head:
                 self._npm_install_if_needed(head, head)
         except Exception as e:
-            logger.warning(f"[updater] startup npm check failed: {e}")
+            logger.warning(f"[updater] startup self-heal failed: {e}")
 
         # Wait 30s before first check
         shutdown_event.wait(30)
