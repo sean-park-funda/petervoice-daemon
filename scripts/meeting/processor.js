@@ -205,9 +205,16 @@ async function processMeeting({ configDir, config, meetingId, projectDocsDir, lo
 }
 
 /**
- * Apply user labels to a meeting: enroll each labeled speaker's embedding
- * under the given name and rewrite the transcript doc with real names.
- * labels: { "<speakerId>": "<name>" }
+ * Apply user labels to a meeting (add / rename / clear), diffing against the
+ * meeting's current speaker_map so re-edits stay correct:
+ *   - new name on an unnamed speaker  → enroll
+ *   - name changed (A → B)            → unenroll A, enroll B
+ *   - name cleared (A → "")           → unenroll A, drop from map
+ *   - unchanged                       → no-op (idempotent, safe to re-save)
+ * Voice-profile contributions are tracked by source key `meetingId:speaker`,
+ * so corrections never leave a stale embedding behind. Then the transcript doc
+ * is rewritten with the resolved names.
+ * labels: { "<speakerId>": "<name>" } — only the speakers the caller wants to set.
  */
 function labelMeeting({ configDir, meetingId, labels }) {
   const meta = store.readMeta(configDir, meetingId);
@@ -215,13 +222,25 @@ function labelMeeting({ configDir, meetingId, labels }) {
   const embeddings = meta.speaker_embeddings || {};
   const speakerMap = { ...(meta.speaker_map || {}) };
   let enrolled = 0;
+  let removed = 0;
 
-  for (const [sp, name] of Object.entries(labels || {})) {
-    const clean = String(name || "").trim();
-    if (!clean) continue;
-    speakerMap[sp] = clean;
+  for (const [sp, raw] of Object.entries(labels || {})) {
+    const next = String(raw || "").trim();
+    const prev = String(speakerMap[sp] || "").trim();
+    if (next === prev) continue; // unchanged → idempotent no-op
+
+    const key = `${meetingId}:${sp}`;
     const emb = embeddings[sp];
-    if (Array.isArray(emb)) { voiceProfiles.enroll(configDir, clean, emb); enrolled++; }
+
+    // remove the old contribution (if this speaker had a confirmed name before)
+    if (prev) { voiceProfiles.unenroll(configDir, prev, key); removed++; }
+
+    if (next) {
+      speakerMap[sp] = next;
+      if (Array.isArray(emb)) { voiceProfiles.enroll(configDir, next, emb, key); enrolled++; }
+    } else {
+      delete speakerMap[sp]; // cleared → unnamed again
+    }
   }
 
   // remaining unknowns = eligible speakers still without a name
@@ -231,7 +250,7 @@ function labelMeeting({ configDir, meetingId, labels }) {
     unknown_speakers: unknown,
   });
   const rewritten = store.rewriteTranscriptDoc(updated);
-  return { speaker_map: speakerMap, enrolled, rewritten: !!rewritten };
+  return { speaker_map: speakerMap, enrolled, removed, rewritten: !!rewritten };
 }
 
 module.exports = { processMeeting, triggerMinutes, labelMeeting };

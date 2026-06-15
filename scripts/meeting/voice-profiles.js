@@ -49,20 +49,77 @@ function matchSpeaker(emb, profiles, threshold = MATCH_THRESHOLD) {
   return null;
 }
 
-/** Enroll/merge an embedding under `name` (running average, weighted by sample count). */
-function enroll(configDir, name, emb) {
+/**
+ * Ensure a profile has a `sources` list (lazy migration of legacy profiles
+ * that only carried a single running-average `embedding`). Mutates in place.
+ */
+function ensureSources(profile) {
+  if (Array.isArray(profile.sources)) return profile;
+  profile.sources = Array.isArray(profile.embedding)
+    ? [{ key: `legacy:${profile.name}`, embedding: profile.embedding, at: profile.updated_at || null }]
+    : [];
+  return profile;
+}
+
+/**
+ * Recompute the derived `embedding` (L2-normalized mean of all source
+ * embeddings) and `sample_count` from a profile's `sources`. Mutates in place.
+ * Returns the profile, or null if it has no usable sources (caller drops it).
+ */
+function recompute(profile) {
+  const srcs = (profile.sources || []).filter((s) => Array.isArray(s.embedding));
+  if (srcs.length === 0) return null;
+  const dim = srcs[0].embedding.length;
+  const sum = new Array(dim).fill(0);
+  for (const s of srcs) for (let i = 0; i < dim; i++) sum[i] += s.embedding[i];
+  const mean = sum.map((v) => v / srcs.length);
+  const norm = Math.sqrt(mean.reduce((acc, v) => acc + v * v, 0)) || 1;
+  profile.embedding = mean.map((v) => v / norm);
+  profile.sample_count = srcs.length;
+  profile.updated_at = new Date().toISOString();
+  return profile;
+}
+
+/**
+ * Enroll an embedding under `name`, tracked by `sourceKey` (= `meetingId:speaker`).
+ * Idempotent per source: re-enrolling the same key replaces that contribution
+ * instead of double-counting. The derived embedding is recomputed from sources.
+ * If `sourceKey` is omitted, falls back to an anonymous one-off source (legacy
+ * callers) — but prefer always passing a stable key.
+ */
+function enroll(configDir, name, emb, sourceKey) {
+  const profiles = loadProfiles(configDir);
+  let existing = profiles.find((p) => p.name === name);
+  if (!existing) {
+    existing = { name, sources: [] };
+    profiles.push(existing);
+  }
+  ensureSources(existing);
+  const key = sourceKey || `oneoff:${name}:${existing.sources.length}`;
+  existing.sources = existing.sources.filter((s) => s.key !== key);
+  existing.sources.push({ key, embedding: emb, at: new Date().toISOString() });
+  recompute(existing);
+  saveProfiles(configDir, profiles);
+  return profiles;
+}
+
+/**
+ * Remove the contribution identified by `sourceKey` from `name`'s profile and
+ * recompute. If the profile has no sources left, it is deleted entirely.
+ * No-op if the profile or source does not exist.
+ */
+function unenroll(configDir, name, sourceKey) {
   const profiles = loadProfiles(configDir);
   const existing = profiles.find((p) => p.name === name);
-  if (existing && Array.isArray(existing.embedding)) {
-    const n = existing.sample_count || 1;
-    const merged = existing.embedding.map((v, i) => (v * n + emb[i]) / (n + 1));
-    // renormalize
-    const norm = Math.sqrt(merged.reduce((s, v) => s + v * v, 0)) || 1;
-    existing.embedding = merged.map((v) => v / norm);
-    existing.sample_count = n + 1;
-    existing.updated_at = new Date().toISOString();
-  } else {
-    profiles.push({ name, embedding: emb, sample_count: 1, updated_at: new Date().toISOString() });
+  if (!existing) return profiles;
+  ensureSources(existing);
+  const before = existing.sources.length;
+  existing.sources = existing.sources.filter((s) => s.key !== sourceKey);
+  if (existing.sources.length === before) return profiles; // nothing removed
+  if (!recompute(existing)) {
+    // no usable sources remain → drop the profile
+    const idx = profiles.indexOf(existing);
+    if (idx >= 0) profiles.splice(idx, 1);
   }
   saveProfiles(configDir, profiles);
   return profiles;
@@ -94,6 +151,7 @@ module.exports = {
   saveProfiles,
   matchSpeaker,
   enroll,
+  unenroll,
   embedSpeakers,
   profilesPath,
 };
