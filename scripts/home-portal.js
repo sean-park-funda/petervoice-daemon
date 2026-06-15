@@ -73,6 +73,30 @@ function loadSecretsEnv() {
 }
 loadSecretsEnv();
 
+// ─── Ensure ffmpeg (meeting mode: remux + speaker embeddings) ───
+// Installer covers new users; this covers existing installs on restart.
+// Non-blocking: installs in the background if ffmpeg is missing.
+function ensureFfmpeg() {
+  const paths = ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/usr/bin/ffmpeg"];
+  if (paths.some((p) => { try { return fs.existsSync(p); } catch { return false; } })) return;
+  try {
+    const which = spawnSync("which", ["ffmpeg"], { encoding: "utf-8" });
+    if (which.status === 0 && which.stdout.trim()) return;
+  } catch { /* ignore */ }
+  const brew = ["/opt/homebrew/bin/brew", "/usr/local/bin/brew"].find((b) => {
+    try { return fs.existsSync(b); } catch { return false; }
+  });
+  if (!brew) { console.warn("[ffmpeg] missing and brew not found — meeting transcription will be limited"); return; }
+  console.log("[ffmpeg] not found — installing via brew in background...");
+  const child = spawn(brew, ["install", "ffmpeg"], {
+    env: { ...process.env, HOMEBREW_NO_AUTO_UPDATE: "1" },
+    detached: true, stdio: "ignore",
+  });
+  child.on("exit", (code) => console.log(`[ffmpeg] brew install exited ${code}`));
+  child.unref();
+}
+try { ensureFfmpeg(); } catch (e) { console.warn("[ffmpeg] ensure failed:", e.message); }
+
 function loadConfig() {
   try {
     return JSON.parse(fs.readFileSync(path.join(CONFIG_DIR, "config.json"), "utf-8"));
