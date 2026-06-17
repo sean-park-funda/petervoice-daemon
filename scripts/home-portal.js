@@ -2077,10 +2077,14 @@ const PORTAL_ENV = {
   PATH: `/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:${process.env.PATH || ""}`,
 };
 
-function ensureTmuxSession(sessionKey, projectDir, mode = "claude", promptFile = null) {
-  // tmux 세션 존재 여부 확인 (spawnSync으로 직접 실행)
+function tmuxHasSession(sessionKey) {
   const check = spawnSync(TMUX_CMD, ["has-session", "-t", sessionKey], { env: PORTAL_ENV });
-  if (check.status === 0) {
+  return check.status === 0;
+}
+
+function ensureTmuxSession(sessionKey, projectDir, mode = "claude", promptFile = null, sessionId = null, resume = false) {
+  // tmux 세션 존재 여부 확인 (spawnSync으로 직접 실행)
+  if (tmuxHasSession(sessionKey)) {
     // 기존 세션도 마우스 스크롤 가능하도록 보장
     spawnSync(TMUX_CMD, ["set-option", "-t", sessionKey, "mouse", "on"], { env: PORTAL_ENV });
     return true;
@@ -2097,6 +2101,12 @@ function ensureTmuxSession(sessionKey, projectDir, mode = "claude", promptFile =
     const claudeCmd = ["/opt/homebrew/bin/claude", "/usr/local/bin/claude"]
       .find(p => fs.existsSync(p)) || "claude";
     startCmd = [claudeCmd, "--dangerously-skip-permissions"];
+    // 이전 터미널 대화 이어가기: 트랜스크립트가 있으면 --resume, 없으면 새 --session-id
+    if (sessionId && resume) {
+      startCmd.push("--resume", sessionId);
+    } else if (sessionId) {
+      startCmd.push("--session-id", sessionId);
+    }
     if (promptFile && fs.existsSync(promptFile)) {
       startCmd.push("--append-system-prompt-file", promptFile);
     }
@@ -2148,11 +2158,12 @@ if (ptyModule && WebSocketServer) {
     // 셸 모드는 프로젝트와 무관한 단일 글로벌 세션(홈 디렉토리)
     const sessionKey = mode === "shell" ? "__shell__" : getSessionKey(project, branch);
 
-    // claude 모드: 데몬 로직으로 프로젝트 디렉토리 + 조합 프롬프트를 준비
-    // (채팅 모드와 같은 폴더·같은 프로젝트/브랜치 프롬프트 + 대화 조회 안내 주입)
+    // 새 세션을 만들 때만 prepare 호출(디렉토리/프롬프트/세션ID 해석).
+    // 기존 세션이 살아있으면 그대로 attach — 세션ID 레지스트리 드리프트 방지.
     let projectDir = mode === "shell" ? os.homedir() : getProjectDirectory(project);
-    let promptFile = null;
-    if (mode !== "shell") {
+    let promptFile = null, sessionId = null, resume = false;
+    const sessionExists = tmuxHasSession(sessionKey);
+    if (mode !== "shell" && !sessionExists) {
       try {
         const prepArgs = ["terminal_prepare.py", "--project", project];
         if (branch) prepArgs.push("--branch", branch);
@@ -2163,6 +2174,7 @@ if (ptyModule && WebSocketServer) {
           const out = JSON.parse(prep.stdout.toString().trim().split("\n").pop());
           if (out.dir) projectDir = out.dir;
           if (out.prompt_file) promptFile = out.prompt_file;
+          if (out.session_id) { sessionId = out.session_id; resume = !!out.resume; }
         } else {
           console.warn("[terminal] terminal_prepare failed:", (prep.stderr || "").toString().slice(0, 300));
         }
@@ -2171,11 +2183,11 @@ if (ptyModule && WebSocketServer) {
       }
     }
 
-    console.log(`[terminal] WS connect: mode=${mode}, session=${sessionKey}, dir=${projectDir}, prompt=${promptFile ? "yes" : "no"}`);
+    console.log(`[terminal] WS connect: mode=${mode}, session=${sessionKey}, dir=${projectDir}, ${sessionExists ? "attach" : (resume ? "resume" : "new")}`);
 
     // tmux 세션 준비
     try {
-      ensureTmuxSession(sessionKey, projectDir, mode, promptFile);
+      ensureTmuxSession(sessionKey, projectDir, mode, promptFile, sessionId, resume);
     } catch (e) {
       console.error("[terminal] tmux session create failed:", e.message);
       ws.send(`\r\n[Error] Failed to create tmux session: ${e.message}\r\n`);
@@ -2231,6 +2243,31 @@ if (ptyModule && WebSocketServer) {
   });
 
   console.log("[terminal] WebSocket server ready at /terminal");
+
+  // ── Idle reaper ─────────────────────────────────────────────
+  // 미접속(attached==0) 상태로 idle 임계(기본 360분)를 넘긴 터미널 세션을 정리.
+  // claude 트랜스크립트는 디스크에 남으므로, 재접속 시 --resume으로 대화 이어감.
+  // config.terminal_idle_minutes = 0 이면 비활성화.
+  function reapIdleTerminalSessions() {
+    const idleMin = loadConfig().terminal_idle_minutes;
+    const limit = (idleMin === undefined || idleMin === null) ? 360 : Number(idleMin);
+    if (!limit || limit <= 0) return;
+    const r = spawnSync(TMUX_CMD, ["list-sessions", "-F", "#{session_name}|#{session_activity}|#{session_attached}"], { env: PORTAL_ENV });
+    if (r.status !== 0 || !r.stdout) return;
+    const nowSec = Math.floor(Date.now() / 1000);
+    for (const line of r.stdout.toString().trim().split("\n")) {
+      if (!line) continue;
+      const [name, act, attached] = line.split("|");
+      if (Number(attached) >= 1) continue;        // 보고 있는 사람 있음 → 보호
+      const idleSec = nowSec - Number(act);
+      if (idleSec < 60) continue;                 // 레이스 가드(방금 활동)
+      if (idleSec > limit * 60) {
+        spawnSync(TMUX_CMD, ["kill-session", "-t", name], { env: PORTAL_ENV });
+        console.log(`[terminal] reaped idle session: ${name} (idle ${Math.floor(idleSec / 60)}m, limit ${limit}m)`);
+      }
+    }
+  }
+  setInterval(reapIdleTerminalSessions, 5 * 60 * 1000);
 } else {
   console.warn("[terminal] WebSocket server disabled (node-pty/ws not available)");
 }

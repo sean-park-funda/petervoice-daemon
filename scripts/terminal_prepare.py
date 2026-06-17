@@ -27,6 +27,8 @@ import argparse
 import json
 import os
 import sys
+import uuid
+import glob
 from pathlib import Path
 
 # Make `daemon` importable regardless of cwd
@@ -34,6 +36,51 @@ SCRIPTS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 PROMPTS_DIR = Path.home() / ".claude-daemon" / "prompts"
+# Per-terminal claude session registry: sessionKey -> {session_id, dir}
+TERMINAL_SESSIONS_PATH = Path.home() / ".claude-daemon" / "terminal-sessions.json"
+CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
+
+
+def _session_key(project, branch):
+    """Mirror home-portal getSessionKey() so the registry key matches the tmux key."""
+    def sanitize(s):
+        return s.replace(":", "_").replace(".", "_")
+    return f"{sanitize(project)}__br{branch}" if branch else sanitize(project)
+
+
+def _load_registry():
+    try:
+        return json.loads(TERMINAL_SESSIONS_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _save_registry(reg):
+    try:
+        TERMINAL_SESSIONS_PATH.write_text(json.dumps(reg, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _transcript_exists(session_id):
+    """claude session ids are globally unique, so a match anywhere under
+    ~/.claude/projects/*/ confirms the session transcript is still on disk."""
+    if not session_id:
+        return False
+    return bool(glob.glob(str(CLAUDE_PROJECTS_DIR / "*" / f"{session_id}.jsonl")))
+
+
+def _resolve_session_id(session_key, project_dir):
+    """Return (session_id, resume_bool). Reuse the stored id if its transcript
+    still exists AND the dir matches; otherwise mint a fresh one and store it."""
+    reg = _load_registry()
+    entry = reg.get(session_key)
+    if entry and entry.get("dir") == project_dir and _transcript_exists(entry.get("session_id")):
+        return entry["session_id"], True
+    new_id = str(uuid.uuid4())
+    reg[session_key] = {"session_id": new_id, "dir": project_dir}
+    _save_registry(reg)
+    return new_id, False
 
 
 def _recall_block(project_arg: str) -> str:
@@ -66,7 +113,8 @@ def main() -> int:
     else:
         project_arg = args.project
 
-    result = {"dir": os.path.expanduser("~"), "prompt_file": ""}
+    result = {"dir": os.path.expanduser("~"), "prompt_file": "", "session_id": "", "resume": False}
+    session_key = _session_key(args.project, args.branch)
 
     try:
         # Standalone process: load config (api_url/api_key) the daemon way,
@@ -103,6 +151,11 @@ def main() -> int:
         prompt_file = PROMPTS_DIR / f"_terminal_{safe}.md"
         prompt_file.write_text(combined, encoding="utf-8")
         result["prompt_file"] = str(prompt_file)
+
+        # 이전 터미널 대화 이어가기: 트랜스크립트가 남아있으면 --resume, 아니면 새 --session-id
+        sid, resume = _resolve_session_id(session_key, result["dir"])
+        result["session_id"] = sid
+        result["resume"] = resume
     except Exception as e:
         # Degrade gracefully — terminal still opens, just without injected context
         sys.stderr.write(f"[terminal_prepare] {e}\n")
