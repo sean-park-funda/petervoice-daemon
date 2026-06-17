@@ -13,15 +13,6 @@ const path = require("path");
 const os = require("os");
 const { execSync, spawnSync, spawn } = require("child_process");
 
-// ─── Meeting mode (modular) ──────────────────────────
-let meetingStore = null, processMeeting = null, meetingLabel = null;
-try {
-  const MDIR = path.join(path.dirname(__filename), "meeting");
-  meetingStore = require(path.join(MDIR, "meeting-store"));
-  ({ processMeeting, labelMeeting: meetingLabel } = require(path.join(MDIR, "processor")));
-} catch (e) {
-  console.warn("[meeting] module not available:", e.message);
-}
 
 // ─── Terminal (WebSocket + node-pty) ─────────────────
 let ptyModule = null;
@@ -72,30 +63,6 @@ function loadSecretsEnv() {
   } catch { /* file may not exist yet */ }
 }
 loadSecretsEnv();
-
-// ─── Ensure ffmpeg (meeting mode: remux + speaker embeddings) ───
-// Installer covers new users; this covers existing installs on restart.
-// Non-blocking: installs in the background if ffmpeg is missing.
-function ensureFfmpeg() {
-  const paths = ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/usr/bin/ffmpeg"];
-  if (paths.some((p) => { try { return fs.existsSync(p); } catch { return false; } })) return;
-  try {
-    const which = spawnSync("which", ["ffmpeg"], { encoding: "utf-8" });
-    if (which.status === 0 && which.stdout.trim()) return;
-  } catch { /* ignore */ }
-  const brew = ["/opt/homebrew/bin/brew", "/usr/local/bin/brew"].find((b) => {
-    try { return fs.existsSync(b); } catch { return false; }
-  });
-  if (!brew) { console.warn("[ffmpeg] missing and brew not found — meeting transcription will be limited"); return; }
-  console.log("[ffmpeg] not found — installing via brew in background...");
-  const child = spawn(brew, ["install", "ffmpeg"], {
-    env: { ...process.env, HOMEBREW_NO_AUTO_UPDATE: "1" },
-    detached: true, stdio: "ignore",
-  });
-  child.on("exit", (code) => console.log(`[ffmpeg] brew install exited ${code}`));
-  child.unref();
-}
-try { ensureFfmpeg(); } catch (e) { console.warn("[ffmpeg] ensure failed:", e.message); }
 
 function loadConfig() {
   try {
@@ -1653,88 +1620,6 @@ const server = http.createServer((req, res) => {
         json({ error: "저장 실패: " + e.message }, 500);
       }
     }).catch(e => json({ error: "업로드 실패: " + e.message }, 400));
-  }
-  // ─── Meeting API (회의록 모드) ───────────────────────
-  // POST /api/meetings/upload — 청크 업로드(브라우저→로컬). 마지막 청크에서 처리 시작.
-  else if (pathname === "/api/meetings/upload" && req.method === "POST") {
-    if (!meetingStore || !processMeeting) return json({ error: "meeting 모듈 없음" }, 503);
-    const MAX = 1024 * 1024 * 1024; // 1GB (긴 회의 대비)
-    parseMultipartStreaming(req, MAX).then(({ fields, file }) => {
-      const meetingId = (fields.meetingId || "").replace(/[^a-zA-Z0-9_-]/g, "");
-      if (!meetingId || !file) { if (file && file.tempPath) try { fs.unlinkSync(file.tempPath); } catch {} return json({ error: "meetingId, file 필요" }, 400); }
-      // docs 경로 검증 (프로젝트의 docs 디렉토리)
-      const docsDir = fields.dir ? validateDocsDir(fields.dir) : null;
-
-      // 청크 누적
-      const chunkIdx = parseInt(fields.chunkIndex || "0");
-      const totalChunks = parseInt(fields.totalChunks || "1");
-      const chunkDir = path.join(os.tmpdir(), "pv-meeting-chunks");
-      fs.mkdirSync(chunkDir, { recursive: true });
-      const chunkFile = path.join(chunkDir, `${meetingId}.part`);
-      try {
-        if (chunkIdx === 0) fs.copyFileSync(file.tempPath, chunkFile);
-        else fs.appendFileSync(chunkFile, fs.readFileSync(file.tempPath));
-        fs.unlinkSync(file.tempPath);
-      } catch (e) {
-        try { fs.unlinkSync(file.tempPath); } catch {}
-        return json({ error: "청크 저장 실패: " + e.message }, 500);
-      }
-      if (chunkIdx < totalChunks - 1) return json({ ok: true, chunk: chunkIdx });
-
-      // 마지막 청크 → 영구 저장 + 메타 생성 + 백그라운드 처리
-      const now = new Date().toISOString();
-      meetingStore.storeAudio(CONFIG_DIR, meetingId, chunkFile);
-      const meta = meetingStore.writeMeta(CONFIG_DIR, meetingId, {
-        id: meetingId,
-        project: fields.project || null,
-        title: fields.title || "제목 없는 회의",
-        duration_sec: parseInt(fields.duration || "0") || null,
-        live_transcript: fields.liveTranscript || null,
-        status: "processing",
-        created_at: now,
-        updated_at: now,
-      });
-
-      // fire-and-forget
-      processMeeting({
-        configDir: CONFIG_DIR,
-        config: loadConfig(),
-        meetingId,
-        projectDocsDir: docsDir,
-        log: (m) => console.log(m),
-      }).catch((e) => console.error("[meeting] process error:", e));
-
-      json({ ok: true, meeting: meta });
-    }).catch(e => json({ error: "업로드 실패: " + e.message }, 400));
-  }
-  // GET /api/meetings/list — 회의 목록(메타)
-  else if (pathname === "/api/meetings/list" && req.method === "GET") {
-    if (!meetingStore) return json({ error: "meeting 모듈 없음" }, 503);
-    try { json({ meetings: meetingStore.listMeetings(CONFIG_DIR) }); }
-    catch (e) { json({ error: e.message }, 500); }
-  }
-  // GET /api/meetings/get?id= — 단일 회의 메타 (임베딩 등 큰 필드 제외)
-  else if (pathname === "/api/meetings/get" && req.method === "GET") {
-    if (!meetingStore) return json({ error: "meeting 모듈 없음" }, 503);
-    const id = url.searchParams.get("id");
-    const meta = id ? meetingStore.readMeta(CONFIG_DIR, id) : null;
-    if (!meta) return json({ error: "not found" }, 404);
-    const { speaker_embeddings, segments, live_transcript, ...slim } = meta;
-    json({ meeting: slim });
-  }
-  // POST /api/meetings/label — 화자에 이름 부여 + 등록 + 문서 재작성
-  else if (pathname === "/api/meetings/label" && req.method === "POST") {
-    if (!meetingStore || !meetingLabel) return json({ error: "meeting 모듈 없음" }, 503);
-    readBody().then((body) => {
-      const { meetingId, labels } = body;
-      if (!meetingId || !labels || typeof labels !== "object") return json({ error: "meetingId, labels 필요" }, 400);
-      try {
-        const result = meetingLabel({ configDir: CONFIG_DIR, meetingId, labels });
-        json({ ok: true, ...result });
-      } catch (e) {
-        json({ error: e.message }, 500);
-      }
-    }).catch((e) => json({ error: e.message }, 400));
   }
   // Docs API: /api/docs/copy — 파일/폴더 복사 (다른 프로젝트로)
   else if (pathname === "/api/docs/copy" && req.method === "POST") {
