@@ -1,5 +1,6 @@
 ---
 name: notion-api
+pv_version: "1.0.0"
 description: >
   This skill provides comprehensive instructions for interacting with the Notion API via REST calls.
   This skill should be used whenever the user asks to interact with Notion, including reading, creating,
@@ -53,7 +54,8 @@ curl -s "https://api.notion.com/v1/users/me" \
 ## Base URL and Conventions
 
 - **Base URL**: `https://api.notion.com`
-- **API Version**: `2025-09-03` (required header)
+- **API Version**: Use `2022-06-28` (required header). Do NOT use `2025-09-03` — it causes intermittent 401 errors on POST/PATCH.
+- **Auth token**: `NOTION_API_TOKEN` env var (canonical). `NOTION_ACCESS_TOKEN` is an alias.
 - **Data Format**: JSON for all request/response bodies
 - **IDs**: UUIDv4 format (dashes optional in requests)
 - **Timestamps**: ISO 8601 format (`2020-08-12T02:12:33.231Z`)

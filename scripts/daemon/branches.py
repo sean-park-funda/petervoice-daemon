@@ -85,7 +85,7 @@ def build_branch_prompt(branch: dict) -> str:
     3. 프로젝트 프롬프트
     4. 브랜치/칸반 규칙
     """
-    from daemon.prompts import get_prompt_file
+    from daemon.prompts import get_prompt_file, build_connected_services_note
 
     project_id = branch.get("project_id", "")
 
@@ -162,7 +162,8 @@ curl -X PATCH "$API_URL/api/branches/{branch_id}" \\
   -d '{{"status": "archived"}}'
 ```
 """
-        combined = "\n\n".join(p for p in [system_prompt_pv, common_prompt, project_prompt, branch_prompt, branch_rules, lead_patch, relay_guide, conversation_hint] if p)
+        connected_services = build_connected_services_note()
+        combined = "\n\n".join(p for p in [system_prompt_pv, common_prompt, connected_services, project_prompt, branch_prompt, branch_rules, lead_patch, relay_guide, conversation_hint] if p)
         return combined
 
 

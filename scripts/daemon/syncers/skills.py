@@ -1,6 +1,7 @@
 """Skills syncer: periodically sync skills from API to ~/.claude/skills/."""
 
 import json
+import re
 import shutil
 import threading
 from pathlib import Path
@@ -10,6 +11,18 @@ from daemon.api import api_request
 
 CLEANUP_FLAG = SKILLS_DIR / ".cleanup-v1-done"
 BUNDLE_INSTALLED_FLAG = SKILLS_DIR / ".bundle-v1-done"
+
+
+def _skill_pv_version(skill_md: Path) -> tuple:
+    """SKILL.md frontmatter의 pv_version을 (major, minor, patch)로 파싱. 없으면 (0,0,0)."""
+    try:
+        text = skill_md.read_text(encoding="utf-8")
+    except Exception:
+        return (0, 0, 0)
+    m = re.search(r'^pv_version:\s*"?(\d+)\.(\d+)\.(\d+)"?', text, re.MULTILINE)
+    if not m:
+        return (0, 0, 0)
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3)))
 
 
 def _find_bundle_dir() -> Path | None:
@@ -71,19 +84,28 @@ class SkillsSyncer(threading.Thread):
         SKILLS_DIR.mkdir(parents=True, exist_ok=True)
         installed = []
 
+        updated = []
         for skill_dir in bundle_dir.iterdir():
             if not skill_dir.is_dir() or skill_dir.name.startswith("."):
                 continue
             local_dir = SKILLS_DIR / skill_dir.name
-            # 이미 로컬에 있으면 건드리지 않음 (유저 삭제 존중: flag 파일로 체크)
-            if local_dir.exists():
+            if not local_dir.exists():
+                # 신규: 복사
+                shutil.copytree(skill_dir, local_dir)
+                installed.append(skill_dir.name)
                 continue
-            # 복사
-            shutil.copytree(skill_dir, local_dir)
-            installed.append(skill_dir.name)
+            # 기존: 번들 pv_version이 더 높으면 덮어쓰기 (스크립트 패치 전파)
+            bundle_v = _skill_pv_version(skill_dir / "SKILL.md")
+            local_v = _skill_pv_version(local_dir / "SKILL.md")
+            if bundle_v > local_v:
+                shutil.rmtree(local_dir, ignore_errors=True)
+                shutil.copytree(skill_dir, local_dir)
+                updated.append(f"{skill_dir.name}({'.'.join(map(str, local_v))}→{'.'.join(map(str, bundle_v))})")
 
         if installed:
             logger.info(f"[skills] Bundled skills installed: {', '.join(installed)}")
+        if updated:
+            logger.info(f"[skills] Bundled skills updated: {', '.join(updated)}")
 
     def sync_once(self):
         api_key = config.get("api_key", "")

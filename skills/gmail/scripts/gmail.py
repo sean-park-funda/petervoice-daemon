@@ -268,10 +268,40 @@ def _run_oauth_flow(service: str, scopes: list[str]) -> Credentials:
     return creds
 
 
+def _env_google_credentials(service: str, scopes: list[str]) -> "Credentials | None":
+    """Build credentials directly from environment variables (PeterVoice synced).
+
+    Works headless (no keyring, no browser). Token priority:
+      {SERVICE}_REFRESH_TOKEN > GOOGLE_REFRESH_TOKEN
+    Returns None if env not configured or refresh fails.
+    """
+    prefix = service.upper().replace("-", "_")
+    refresh_token = os.environ.get(f"{prefix}_REFRESH_TOKEN") or os.environ.get("GOOGLE_REFRESH_TOKEN")
+    client_id = os.environ.get(f"{prefix}_CLIENT_ID") or os.environ.get("GOOGLE_CLIENT_ID")
+    client_secret = os.environ.get(f"{prefix}_CLIENT_SECRET") or os.environ.get("GOOGLE_CLIENT_SECRET")
+    if not (refresh_token and client_id and client_secret):
+        return None
+    try:
+        creds = Credentials(
+            token=None,
+            refresh_token=refresh_token,
+            token_uri="https://oauth2.googleapis.com/token",
+            client_id=client_id,
+            client_secret=client_secret,
+            scopes=scopes,
+        )
+        creds.refresh(Request())
+        return creds if creds.valid else None
+    except Exception as e:
+        print(f"env-based Google auth failed: {e}", file=sys.stderr)
+        return None
+
+
 def get_google_credentials(service: str, scopes: list[str]) -> Credentials:
     """Get Google credentials for human-in-the-loop use cases.
 
     Priority:
+    0. Environment variables (PeterVoice synced) - headless, no keyring
     1. Saved OAuth tokens from keyring - from previous OAuth flow
     2. OAuth 2.0 flow - opens browser for user consent
 
@@ -288,6 +318,11 @@ def get_google_credentials(service: str, scopes: list[str]) -> Credentials:
     Raises:
         AuthenticationError: If authentication fails.
     """
+    # 0. Try environment-variable credentials (PeterVoice synced, headless-safe)
+    env_creds = _env_google_credentials(service, scopes)
+    if env_creds:
+        return env_creds
+
     # 1. Try keyring-stored OAuth token from previous flow
     token_json = get_credential(f"{service}-token-json")
     if token_json:

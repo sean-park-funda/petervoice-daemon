@@ -28,7 +28,7 @@ from daemon.sessions import (
     get_codex_session_id, update_codex_session, reset_codex_session,
 )
 from daemon.tasks import get_current_task, get_task_description
-from daemon.prompts import get_prompt_file, build_system_prompt
+from daemon.prompts import get_prompt_file, build_system_prompt, build_connected_services_note
 
 
 def _load_wiki_index(project: str) -> str:
@@ -93,7 +93,9 @@ def build_project_prompt(project: str) -> str:
 
     wiki_index = _load_wiki_index(project)
 
-    return "\n\n".join(p for p in [sys_prompt, system_prompt_pv, common_prompt, global_wiki, prompt_content, wiki_index, session_context] if p)
+    connected_services = "" if is_demo else build_connected_services_note()
+
+    return "\n\n".join(p for p in [sys_prompt, system_prompt_pv, common_prompt, connected_services, global_wiki, prompt_content, wiki_index, session_context] if p)
 
 
 def run_claude(
