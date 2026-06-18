@@ -178,6 +178,21 @@ def run_claude(
                 logger.info(f"Injecting session context for {project} ({len(sc)} chars)")
                 combined = combined + "\n\n" + sc if combined else sc
 
+    # Workspace rule: pin the agent to its working directory (single source of truth).
+    # Covers all paths (project / branch / kanban / team) since project_dir is already resolved.
+    if project_dir:
+        workspace_note = (
+            "## Workspace\n"
+            f"`{project_dir}` is your working directory: the project root and single source of truth.\n"
+            "- Create ALL files (code, docs, configs, build output) inside this directory only.\n"
+            "- Never scaffold a project in a hand-picked path (e.g. ~/Projects/...); new apps "
+            "(Next.js, etc.) go here, in the root or a subfolder.\n"
+            "- Docs live in `docs/` under this directory (the web UI serves docs from there).\n"
+            "- Need a different location? Don't move files yourself — ask the user to change the "
+            "project's directory setting."
+        )
+        combined = (combined + "\n\n" + workspace_note) if combined else workspace_note
+
     if combined:
         # D9-A: unique file per session key to avoid race condition with parallel team members
         _safe_key = _sid_key.replace(":", "_")
@@ -210,6 +225,7 @@ def run_claude(
     else:
         logger.info(f"[{bot_name}] Claude: project={project}, dir={project_dir}, session={sid or 'new'}")
 
+    total_usage = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "model": ""}
     try:
         g.claude_semaphore.acquire()
         claude_env = {
