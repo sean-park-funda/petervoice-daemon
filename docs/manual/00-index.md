@@ -35,6 +35,7 @@ Peter Voice — 음성 기반 AI 어시스턴트 플랫폼.
 | 26 | [장기 작업 & 협업](./26-long-tasks-collaboration.md) | /do 멀티턴, HeartBeat, Stall Detection, Relay, Summon 협업 패턴 |
 | 27 | [고객 매니지먼트](./27-customer-management.md) | 고객 현황, 채팅 기록 조회, Tailscale SSH 원격 접속, 장애 복구 |
 | 28 | [문서의 기억화](./28-doc-memory.md) | 🚧 계획 — docs 인덱싱, doc-search 스킬, 문서 기반 자동 응답 |
+| 29 | [크로스유저 에이전트 연결](./29-cross-user-connections.md) | 다른 유저 에이전트 간 친구 기반 통신, 양방향 수신함, /api/relay/external, 핸드오프 |
 | 30 | [홈포탈 & 로컬 퍼블리싱 종합](./30-homeportal-localpublish-guide.md) | Home Portal + Local Publishing + Cloudflare Tunnel + Local-First 아키텍처 통합 가이드 |
 | 31 | [웹 터미널](./31-terminal-page.md) | xterm.js WebSocket 터미널, Home Portal node-pty, 프로젝트별 tmux 세션 |
 | 32 | [엔진 선택 (Claude vs Codex)](./32-codex-engine.md) | Claude Code CLI / OpenAI Codex CLI 선택, 프로젝트·브랜치별 설정, 자동 업데이트 |
