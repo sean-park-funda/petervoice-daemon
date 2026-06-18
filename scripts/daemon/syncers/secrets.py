@@ -29,6 +29,8 @@ class SecretsSyncer(threading.Thread):
         super().__init__(daemon=True, name="secrets-syncer")
         self.api_key = config["api_key"]
         self._last_google_refresh_token: str | None = None
+        # 직전 싱크에서 주입한 시크릿 키 집합 — 이번에 사라진 키를 os.environ에서 제거하기 위해 추적
+        self._synced_keys: set[str] = set()
 
     def _sync_google_keyring(self):
         """Sync Google OAuth token from env vars to keyring for all Google skills."""
@@ -101,7 +103,18 @@ class SecretsSyncer(threading.Thread):
         SECRETS_ENV_PATH.write_text("\n".join(lines) + "\n", encoding="utf-8")
         os.chmod(SECRETS_ENV_PATH, 0o600)
 
-        logger.info(f"[secrets] Synced {len(keys)} secrets: {', '.join(keys)}")
+        # 이번 사이클에 사라진 시크릿(예: 외부 연동 해제)을 os.environ에서도 제거
+        # → "연결 해제"가 데몬 재시작 없이 ~60초 내 실제로 차단됨 (메모리에 잔존 방지)
+        new_keys = set(keys)
+        removed = self._synced_keys - new_keys
+        for k in removed:
+            os.environ.pop(k, None)
+        self._synced_keys = new_keys
+
+        log_msg = f"[secrets] Synced {len(keys)} secrets: {', '.join(keys)}"
+        if removed:
+            log_msg += f" | Removed {len(removed)}: {', '.join(sorted(removed))}"
+        logger.info(log_msg)
 
         # Sync Google tokens to keyring — run in a separate thread with timeout
         # to prevent blocking on headless keychain GUI prompts (launchd context)
