@@ -432,19 +432,12 @@ def run_claude(
                         return run_claude(prompt, project, _retry_count + 1, 0,
                             session_key_override=session_key_override, prompt_override=prompt_override, stream_to_chat=stream_to_chat)
                     if "401" in error_text or "invalid authentication" in error_text.lower():
-                        logger.warning(f"[{bot_name}] Auth 401 for {project} (retry {_retry_count + 1}): clearing Keychain")
-                        if sys.platform == "darwin":
-                            subprocess.run(
-                                ["security", "delete-generic-password", "-s", "Claude Code-credentials"],
-                                capture_output=True,
-                            )
-                        reset_session(project)
-                        proc.wait(timeout=5)
+                        # Do NOT touch credentials/Keychain — Claude CLI manages its own token
+                        # refresh, and deleting the Keychain entry can destroy the only valid
+                        # credential source (file may be expired while Keychain is valid).
+                        logger.warning(f"[{bot_name}] Auth 401 for {project}: Claude CLI auth needs re-login")
                         g.claude_semaphore.release()
-                        if _retry_count >= 1:
-                            return ("(인증 오류가 발생했습니다. 관리자에게 문의하세요.)", None, tool_lines, False)
-                        return run_claude(prompt, project, _retry_count + 1, 0,
-                            session_key_override=session_key_override, prompt_override=prompt_override, stream_to_chat=stream_to_chat)
+                        return ("(Claude 인증이 만료되었습니다. 관리자에게 재로그인을 요청해주세요.)", new_session_id, tool_lines, False)
 
         proc.wait(timeout=300)
 
