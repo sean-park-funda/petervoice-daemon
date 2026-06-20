@@ -1,13 +1,41 @@
 """Claude/Codex CLI execution: run_claude(), run_codex(), and rewrite_for_voice()."""
 
 import os
+import sys
 import json
 import time
 import select
 import subprocess
+import shutil
 from pathlib import Path
 
 import re
+
+# Daemon-specific Claude config dir — isolates daemon from user's Keychain/GUI credentials.
+# Claude CLI running as a LaunchAgent (GUI session) would otherwise use macOS Keychain,
+# which can have expired tokens while the credentials file is still valid.
+_DAEMON_CLAUDE_CONFIG = Path.home() / ".claude-daemon" / "claude-config"
+
+
+def _seed_daemon_claude_config() -> None:
+    """Copy ~/.claude/.credentials.json to daemon's CLAUDE_CONFIG_DIR if missing or stale."""
+    src = Path.home() / ".claude" / ".credentials.json"
+    dst = _DAEMON_CLAUDE_CONFIG / ".credentials.json"
+    if not src.exists():
+        return
+    try:
+        _DAEMON_CLAUDE_CONFIG.mkdir(parents=True, exist_ok=True)
+        src_expires = json.loads(src.read_text()).get("expiresAt", 0)
+        if dst.exists():
+            dst_expires = json.loads(dst.read_text()).get("expiresAt", 0)
+            if dst_expires >= src_expires:
+                return
+        shutil.copy2(src, dst)
+    except Exception:
+        pass
+
+
+_seed_daemon_claude_config()
 
 from daemon.globals import (
     IS_WINDOWS, CLAUDE_CMD, CODEX_CMD, PROMPTS_DIR, SECRETS_ENV_PATH,
@@ -233,6 +261,7 @@ def run_claude(
         claude_env = {
             **{k: v for k, v in os.environ.items() if k != "CLAUDECODE"},
             "LANG": "en_US.UTF-8",
+            "CLAUDE_CONFIG_DIR": str(_DAEMON_CLAUDE_CONFIG),
         }
         if account_config_dir:
             claude_env["CLAUDE_CONFIG_DIR"] = os.path.expanduser(account_config_dir)
@@ -428,6 +457,21 @@ def run_claude(
                         g.claude_semaphore.release()
                         if _retry_count >= MAX_CONTEXT_OVERFLOW_RETRIES:
                             return ("(컨텍스트 초과 - 최대 재시도 횟수 초과)", None, tool_lines, False)
+                        return run_claude(prompt, project, _retry_count + 1, 0,
+                            session_key_override=session_key_override, prompt_override=prompt_override, stream_to_chat=stream_to_chat)
+                    if "401" in error_text or "invalid authentication" in error_text.lower():
+                        logger.warning(f"[{bot_name}] Auth 401 for {project} (retry {_retry_count + 1}): clearing Keychain + reseeding credentials")
+                        if sys.platform == "darwin":
+                            subprocess.run(
+                                ["security", "delete-generic-password", "-s", "Claude Code-credentials"],
+                                capture_output=True,
+                            )
+                        _seed_daemon_claude_config()
+                        reset_session(project)
+                        proc.wait(timeout=5)
+                        g.claude_semaphore.release()
+                        if _retry_count >= 1:
+                            return ("(인증 오류가 발생했습니다. 관리자에게 문의하세요.)", None, tool_lines, False)
                         return run_claude(prompt, project, _retry_count + 1, 0,
                             session_key_override=session_key_override, prompt_override=prompt_override, stream_to_chat=stream_to_chat)
 
