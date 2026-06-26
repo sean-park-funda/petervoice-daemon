@@ -165,12 +165,19 @@ async function processMeeting({ configDir, config, meetingId, projectDocsDir, lo
         const docPath = path.join(outDir, `${stamp}-fallback-transcript.md`);
         fs.writeFileSync(docPath, md);
         const rel = docPath.split("/docs/").pop();
+        const fallbackRel = rel ? `docs/${rel}` : docPath;
         store.updateMeta(configDir, meetingId, {
           status: "transcribed", phase: "fallback",
-          transcript_doc: rel ? `docs/${rel}` : docPath,
+          transcript_doc: fallbackRel,
           error: `async 실패, 실시간 전사로 대체: ${String(e.message || e)}`,
         });
         out(`[meeting] ${meetingId} fallback to live transcript`);
+        // Even when async failed, still hand the (live) transcript to the bot so
+        // the meeting gets summarized — otherwise the project agent never hears
+        // about it and no minutes are produced.
+        const triggered = await triggerMinutes(config || {}, meta, fallbackRel);
+        store.updateMeta(configDir, meetingId, { status: triggered ? "minutes_pending" : "transcribed" });
+        out(`[meeting] ${meetingId} fallback minutes ${triggered ? "triggered" : "NOT triggered"}`);
         return;
       } catch (e2) {
         out(`[meeting] ${meetingId} fallback write failed: ${e2.message}`);

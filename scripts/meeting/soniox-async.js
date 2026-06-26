@@ -126,8 +126,22 @@ async function transcribeFile(apiKey, filePath, opts = {}) {
 
     onProgress("processing");
     const deadline = Date.now() + maxWaitMs;
+    // Long meetings poll for many minutes; a single transient "fetch failed"
+    // network blip must NOT kill a transcription Soniox is still processing.
+    // Tolerate a few consecutive poll errors before giving up.
+    let pollErrors = 0;
+    const MAX_POLL_ERRORS = 5;
     for (;;) {
-      const st = await soniox(apiKey, "GET", `/v1/transcriptions/${transcriptionId}`);
+      let st;
+      try {
+        st = await soniox(apiKey, "GET", `/v1/transcriptions/${transcriptionId}`);
+        pollErrors = 0;
+      } catch (e) {
+        if (++pollErrors > MAX_POLL_ERRORS) throw e;
+        if (Date.now() > deadline) throw new Error("transcription timed out");
+        await sleep(pollIntervalMs);
+        continue;
+      }
       const status = st.status;
       if (status === "completed") break;
       if (status === "error" || status === "failed") {

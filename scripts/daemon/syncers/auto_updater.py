@@ -52,8 +52,10 @@ class AutoUpdater(threading.Thread):
     def _restart_home_portal_if_changed(self, old_head: str, new_head: str):
         """Restart Home Portal launchd service if home-portal.js changed."""
         r = self._git("diff", "--name-only", old_head, new_head)
-        if r.returncode == 0 and "home-portal.js" in r.stdout:
-            logger.info("[updater] home-portal.js changed — restarting Home Portal")
+        # home-portal.js require()s scripts/meeting/* at startup, so changes there
+        # also only take effect after a Home Portal restart.
+        if r.returncode == 0 and ("home-portal.js" in r.stdout or "scripts/meeting/" in r.stdout):
+            logger.info("[updater] home-portal code changed — restarting Home Portal")
             self._restart_home_portal()
 
     def _clear_pycache(self):
