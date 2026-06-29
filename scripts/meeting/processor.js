@@ -140,9 +140,10 @@ async function processMeeting({ configDir, config, meetingId, projectDocsDir, lo
     // Audio is no longer needed once transcribed → delete to cap local disk use.
     try { store.deleteAudio(configDir, meetingId); } catch { /* best-effort */ }
 
-    // Phase 1B: hand off to the bot for polished minutes (best-effort)
-    const triggered = await triggerMinutes(config || {}, meta, transcriptRel);
-    store.updateMeta(configDir, meetingId, { status: triggered ? "minutes_pending" : "transcribed" });
+    // NOTE: minutes are NOT triggered here. The user labels speakers first, and
+    // labelMeeting (or the "이름 없이 작성"/close path) triggers minutes with the
+    // resolved names — otherwise the bot summarizes 화자N and guesses names.
+    out(`[meeting] ${meetingId} awaiting speaker labels before minutes`);
   } catch (e) {
     // Fallback: if async diarization failed but we captured a live transcript,
     // save that so the meeting isn't lost.
@@ -189,12 +190,16 @@ async function processMeeting({ configDir, config, meetingId, projectDocsDir, lo
 }
 
 /**
- * Apply user labels to a meeting: set each speaker's display name and rewrite
- * the transcript doc with the resolved names. Name substitution only — there is
- * no voice-profile enrollment (speakers are labeled manually every meeting).
+ * Apply user labels to a meeting: set each speaker's display name, rewrite the
+ * transcript doc with the resolved names, then hand the (now named) transcript
+ * to the bot for minutes. Name substitution only — no voice-profile enrollment.
+ * Triggering minutes HERE (not at transcription) is what lets the summary use
+ * the real names instead of 화자N. Idempotent: re-labeling re-triggers with the
+ * latest names; if minutes were already requested we still re-send so the bot
+ * picks up corrections.
  * labels: { "<speakerId>": "<name>" } — blank clears that speaker's name.
  */
-function labelMeeting({ configDir, meetingId, labels }) {
+async function labelMeeting({ configDir, config, meetingId, labels }) {
   const meta = store.readMeta(configDir, meetingId);
   if (!meta) throw new Error("meeting not found");
   const speakerMap = { ...(meta.speaker_map || {}) };
@@ -212,7 +217,12 @@ function labelMeeting({ configDir, meetingId, labels }) {
     unknown_speakers: unknown,
   });
   const rewritten = store.rewriteTranscriptDoc(updated);
-  return { speaker_map: speakerMap, rewritten: !!rewritten };
+
+  // Hand off to the bot for polished minutes now that names are applied.
+  const triggered = await triggerMinutes(config || {}, updated || meta, (updated || meta).transcript_doc);
+  store.updateMeta(configDir, meetingId, { status: triggered ? "minutes_pending" : "transcribed" });
+
+  return { speaker_map: speakerMap, rewritten: !!rewritten, minutes_triggered: triggered };
 }
 
 module.exports = { processMeeting, triggerMinutes, labelMeeting };

@@ -1726,11 +1726,11 @@ const server = http.createServer((req, res) => {
   // POST /api/meetings/label — 화자 이름 부여 + 문서 재작성 (등록 없음)
   else if (pathname === "/api/meetings/label" && req.method === "POST") {
     if (!meetingStore || !meetingLabel) return json({ error: "meeting 모듈 없음" }, 503);
-    readBody().then((body) => {
+    readBody().then(async (body) => {
       const { meetingId, labels } = body;
       if (!meetingId || !labels || typeof labels !== "object") return json({ error: "meetingId, labels 필요" }, 400);
       try {
-        const result = meetingLabel({ configDir: CONFIG_DIR, meetingId, labels });
+        const result = await meetingLabel({ configDir: CONFIG_DIR, config: loadConfig(), meetingId, labels });
         json({ ok: true, ...result });
       } catch (e) {
         json({ error: e.message }, 500);
