@@ -55,7 +55,9 @@ def build_connected_services_note() -> str:
     import os
     lines = []
     if os.environ.get("GOOGLE_REFRESH_TOKEN"):
-        lines.append("- **Google**: 메일은 `/gmail`, 일정은 `/google-calendar` 스킬 사용. (드라이브/닥스/시트 스킬은 아직 미배포 — 필요 시 직접 API 호출)")
+        accounts = os.environ.get("GOOGLE_ACCOUNTS", "")
+        acc_note = f" 연결된 계정: {accounts} — 특정 계정은 `gmail.py --account <email>`." if accounts and "," in accounts else ""
+        lines.append(f"- **Google**: 메일은 `/gmail`, 일정은 `/google-calendar` 스킬 사용.{acc_note} (드라이브/닥스/시트 스킬은 아직 미배포 — 필요 시 직접 API 호출)")
     if os.environ.get("SLACK_BOT_TOKEN"):
         lines.append("- **Slack**: `/slack` 스킬로 채널/DM 읽기·요약·전송. 비공개 채널은 봇 초대 필요.")
     if os.environ.get("NOTION_API_TOKEN"):

@@ -1,6 +1,6 @@
 ---
 name: gmail
-pv_version: "1.0.0"
+pv_version: "1.1.0"
 description: Send, search, and organize Gmail messages, drafts, and labels. Use when asked to compose an email, reply to mail, forward a message, search inbox, manage attachments, or organize Gmail.
 metadata:
   author: odyssey4me
@@ -15,6 +15,14 @@ allowed-tools: Bash($SKILL_DIR/scripts/gmail.py:*)
 # Gmail
 
 Interact with Gmail for email management, search, and organization.
+
+## Multi-account (PeterVoice)
+
+여러 Google 계정을 연결한 경우, `--account <email>`로 계정을 지정한다.
+- 연결된 계정 목록: 환경변수 `GOOGLE_ACCOUNTS` (쉼표 구분).
+- 예: `python3 scripts/gmail.py --account dev@ptjcomics.com messages list --query "is:unread"`
+- `--account` 생략 시 primary 계정(`GOOGLE_REFRESH_TOKEN`) 사용.
+- 계정별 토큰은 env `GOOGLE_REFRESH_TOKEN__<SANITIZED_EMAIL>`에 자동 주입됨.
 
 ## Installation
 

@@ -1082,6 +1082,11 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
+    # Multi-account: pick which connected Google account to use.
+    # Uses env GOOGLE_REFRESH_TOKEN__<SANITIZED_EMAIL> (PeterVoice synced).
+    # Connected accounts are listed in env GOOGLE_ACCOUNTS (comma-separated).
+    parser.add_argument("--account", help="Google account email to use (multi-account)")
+
     subparsers = parser.add_subparsers(dest="command", help="Command to execute")
 
     # check command
@@ -1167,6 +1172,21 @@ def main():
     # Check dependencies first (allows --help to work even if deps missing)
     parser = build_parser()
     args = parser.parse_args()
+
+    # Multi-account: if --account given, point the default GOOGLE_* env to that
+    # account's per-account token so all downstream auth uses the selected account.
+    if getattr(args, "account", None):
+        sfx = "".join(c if c.isalnum() else "_" for c in args.account.upper())
+        rt = os.environ.get(f"GOOGLE_REFRESH_TOKEN__{sfx}")
+        at = os.environ.get(f"GOOGLE_ACCESS_TOKEN__{sfx}")
+        if not rt:
+            accounts = os.environ.get("GOOGLE_ACCOUNTS", "")
+            print(f"Error: account '{args.account}' not connected. "
+                  f"Connected: {accounts or '(none)'}", file=sys.stderr)
+            return 1
+        os.environ["GOOGLE_REFRESH_TOKEN"] = rt
+        if at:
+            os.environ["GOOGLE_ACCESS_TOKEN"] = at
 
     # Now check dependencies if not just showing help
     if not GOOGLE_AUTH_AVAILABLE:
