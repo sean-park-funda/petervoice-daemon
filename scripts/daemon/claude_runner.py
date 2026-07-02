@@ -386,8 +386,18 @@ def run_claude(
             if etype == "result":
                 if "session_id" in event:
                     new_session_id = event["session_id"]
-                if event.get("result") and not response_text.strip():
-                    response_text = event["result"]
+                _rtxt = event.get("result")
+                if _rtxt and not event.get("is_error"):
+                    # 한 claude -p 턴에서 result 이벤트가 여러 번 올 수 있다.
+                    # (run_in_background 서브에이전트 완료 시 턴이 재개되며 두 번째 result 발생)
+                    # 각 result는 '완결된 메시지'이므로 첫 것만 남기지 말고 모두 이어붙인다.
+                    # (예전엔 `not response_text.strip()` 가드가 2번째 이후 result를 버려 백그라운드 결과가 유실됨)
+                    if response_text.strip():
+                        if not response_text.endswith("\n\n"):
+                            response_text += "\n\n"
+                        response_text += _rtxt
+                    else:
+                        response_text = _rtxt
                 if event.get("is_error"):
                     error_text = str(event.get("error", "")) + str(event.get("result", ""))
                     if "overloaded" in error_text.lower() or '"529"' in error_text or "529" in error_text:
