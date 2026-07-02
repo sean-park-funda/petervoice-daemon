@@ -586,6 +586,13 @@ class ManagerThread(threading.Thread):
         projects = self._get_target_projects()
         if not projects:
             logger.info("[manager] No projects to check")
+            # projects:[] 인 고객은 자율 순회 대상이 없다. last_run을 갱신해
+            # run 루프의 interval 가드(run())가 interval_minutes 주기로 동작하도록 한다.
+            # (갱신하지 않으면 매 _wait_or_wake(300s)마다 이 no-op 사이클이 다시 돌아
+            #  "No projects to check" 로그가 ~5분마다 무한 발생함)
+            self.state["last_run"] = datetime.now().isoformat()
+            self.state["run_count"] = cycle_num
+            self._save_state()
             return
 
         idx = self.state.get("next_project_idx", 0) % len(projects)

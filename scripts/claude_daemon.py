@@ -423,6 +423,36 @@ def _sanitize_config():
     logger.info(f"[security] Removed direct DB keys from config: {removed}")
 
 
+def _migrate_manager_config():
+    """Backfill a default manager block so /do works on every customer.
+
+    /do delegates to the manager thread (g._manager_instance), which only
+    starts when config.manager.enabled is true. Installers historically wrote
+    configs without a manager block, so /do was inert for most customers.
+
+    Idempotent: only adds the block when the "manager" key is ABSENT. Never
+    touches an existing manager config — respects Sean's manual settings and
+    any account explicitly provisioned with enabled:false (e.g. add-account).
+
+    projects MUST be [] (empty list): _get_target_projects() treats an explicit
+    empty list as "autonomous sweep disabled" (0 Claude calls when idle) while
+    /do deep tasks still run. Omitting projects would fall back to the session
+    sweep and start autonomous Claude calls for every customer.
+    """
+    from daemon.globals import CONFIG_PATH
+    if "manager" in config:
+        return
+    config["manager"] = {
+        "enabled": True,
+        "interval_minutes": 60,
+        "projects": [],
+    }
+    # Dump the full in-memory config (same pattern as _sanitize_config) so no
+    # existing fields or customer-specific keys are lost.
+    CONFIG_PATH.write_text(json.dumps(config, indent=2, ensure_ascii=False))
+    logger.info("[migrate] Added default manager block (enabled, projects=[]) to config")
+
+
 def main():
     setup_logging()
     logger.info("=" * 60)
@@ -438,6 +468,7 @@ def main():
     try:
         load_config()
         _sanitize_config()
+        _migrate_manager_config()
         load_sessions()
         load_codex_sessions()
         load_tasks()
