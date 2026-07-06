@@ -83,6 +83,9 @@ class Worker(threading.Thread):
         project = msg.get("project", "general") or "general"
 
         if msg_id in processed_ids:
+            # 이미 처리한 메시지가 폴에 다시 나타남 = DB 처리완료 마킹이 유실된 좀비.
+            # 재마킹하지 않으면 매 폴마다 계속 반환되어 핫루프가 지속된다 (2026-07-06 비용 폭증 원인).
+            mark_message_processed(msg_id)
             return
         processed_ids.add(msg_id)
         if len(processed_ids) > 1000:
@@ -427,6 +430,7 @@ class Worker(threading.Thread):
 
                 consecutive_errors = 0
 
+                spawned_any = False
                 for msg in messages:
                     if shutdown_event.is_set():
                         break
@@ -435,12 +439,15 @@ class Worker(threading.Thread):
                         if msg_id in self._spawned_ids:
                             continue
                         self._spawned_ids.add(msg_id)
+                    spawned_any = True
                     self._executor.submit(self._process_message_safe, msg)
 
                 # kanban messages now flow through messages table (project="kanban:{card_id}")
                 # No separate kanban_messages polling needed
 
-                if not messages:
+                # 새로 시작한 처리가 없으면 반드시 대기한다. 폴 응답에 이미 처리중/좀비
+                # 메시지만 있을 때 대기 없이 재폴링하면 핫루프가 된다.
+                if not spawned_any:
                     shutdown_event.wait(poll_interval)
 
             except BaseException as e:

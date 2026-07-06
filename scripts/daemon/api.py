@@ -110,10 +110,18 @@ def api_request(api_key: str, method: str, path: str, body: dict | None = None, 
 
 
 def mark_message_processed(msg_id: int):
+    # 마킹이 유실되면 해당 메시지가 pending에 영구히 남아 폴링 핫루프를 유발하므로
+    # (2026-07-06 Vercel 비용 폭증 원인) 실패 시 백오프 재시도한다.
+    import time
     api_key = config.get("api_key", "")
     if not api_key:
         return
-    api_request(api_key, "PATCH", "/api/bot/message", body={"id": msg_id, "updates": {"processed": True}}, timeout=5)
+    for attempt in range(3):
+        result = api_request(api_key, "PATCH", "/api/bot/message", body={"id": msg_id, "updates": {"processed": True}}, timeout=5)
+        if result is not None:
+            return
+        time.sleep(2 ** attempt)
+    logger.error(f"[api] mark_message_processed failed after 3 attempts: msg {msg_id}")
 
 
 def inject_system_message(project: str, text: str, prefix: str = "[heartbeat]") -> tuple[int | None, str]:
