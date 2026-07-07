@@ -64,6 +64,28 @@ def release_pid_lock(pid_file):
         pass
 
 
+# ── Infra migration (Vercel → self-hosted Lightsail) ──────────────────────────
+# One-time, idempotent rewrite of the daemon's api_url. Fires ONLY for the known
+# legacy Vercel hosts; canary/www/localhost/custom URLs are left untouched, so
+# this is a no-op for machines already migrated or under canary testing.
+_LEGACY_API_URLS = {
+    "https://peter-voice.vercel.app",
+    "http://peter-voice.vercel.app",
+    "https://sonolbotweb.vercel.app",
+}
+_SELF_HOSTED_API_URL = "https://www.peter-voice.site"
+
+
+def migrate_api_url(cfg: dict) -> bool:
+    """Rewrite a legacy Vercel api_url to the self-hosted domain in-place.
+    Returns True if a change was made."""
+    url = (cfg.get("api_url") or "").rstrip("/")
+    if url in _LEGACY_API_URLS:
+        cfg["api_url"] = _SELF_HOSTED_API_URL
+        return True
+    return False
+
+
 def load_config():
     import daemon.globals as g
     if not CONFIG_PATH.exists():
@@ -71,6 +93,14 @@ def load_config():
         sys.exit(1)
     with open(CONFIG_PATH) as f:
         new_config = json.load(f)
+    # Infra migration: move legacy Vercel api_url to self-hosted, persist once.
+    if migrate_api_url(new_config):
+        try:
+            with open(CONFIG_PATH, "w") as wf:
+                json.dump(new_config, wf, ensure_ascii=False, indent=2)
+            logger.info(f"[migrate] api_url -> {new_config['api_url']} (self-hosted infra)")
+        except Exception as e:
+            logger.warning(f"[migrate] api_url persist failed (will retry next load): {e}")
     # Update in-place so all modules holding a reference to config see the new values
     g.config.clear()
     g.config.update(new_config)

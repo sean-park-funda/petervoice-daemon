@@ -1479,7 +1479,7 @@ const server = http.createServer((req, res) => {
   const pathname = url.pathname;
 
   // CORS — 특정 origin만 허용 (브라우저 직접 통신)
-  const ALLOWED_ORIGINS = ["https://peter-voice.vercel.app", "http://localhost:3001"];
+  const ALLOWED_ORIGINS = ["https://peter-voice.vercel.app", "https://canary.peter-voice.site", "https://www.peter-voice.site", "http://localhost:3001"];
   const origin = req.headers.origin;
   if (origin && ALLOWED_ORIGINS.includes(origin)) {
     res.setHeader("Access-Control-Allow-Origin", origin);
