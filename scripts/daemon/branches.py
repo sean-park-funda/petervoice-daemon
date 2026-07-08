@@ -15,7 +15,7 @@ def _build_branch_relay_guide(project_id: str, branch_id: int) -> str:
 
 ### 메시지 보내기
 ```bash
-API_URL=$(python3 -c "import json; c=json.load(open('$HOME/.claude-daemon/config.json')); print(c.get('api_url', 'https://peter-voice.vercel.app'))")
+API_URL=$(python3 -c "import json; c=json.load(open('$HOME/.claude-daemon/config.json')); print(c.get('api_url', 'https://www.peter-voice.site'))")
 API_KEY=$(python3 -c "import json; print(json.load(open('$HOME/.claude-daemon/config.json'))['api_key'])")
 
 curl -X POST "$API_URL/api/relay/message" \\
@@ -154,7 +154,7 @@ def build_branch_prompt(branch: dict) -> str:
 1. 변경 요약을 유저에게 보고
 2. 브랜치 상태를 archived로 변경:
 ```bash
-API_URL=$(python3 -c "import json; c=json.load(open('$HOME/.claude-daemon/config.json')); print(c.get('api_url', 'https://peter-voice.vercel.app'))")
+API_URL=$(python3 -c "import json; c=json.load(open('$HOME/.claude-daemon/config.json')); print(c.get('api_url', 'https://www.peter-voice.site'))")
 API_KEY=$(python3 -c "import json; print(json.load(open('$HOME/.claude-daemon/config.json'))['api_key'])")
 curl -X PATCH "$API_URL/api/branches/{branch_id}" \\
   -H "X-Api-Key: $API_KEY" \\

@@ -15,7 +15,7 @@ const store = require("./meeting-store");
  */
 async function resolveSonioxKey(config) {
   if (process.env.SONIOX_API_KEY) return process.env.SONIOX_API_KEY;
-  const apiUrl = (config && config.api_url) || "https://peter-voice.vercel.app";
+  const apiUrl = (config && config.api_url) || "https://www.peter-voice.site";
   const apiKey = config && config.api_key;
   if (!apiKey) return null;
   try {
@@ -37,7 +37,7 @@ async function resolveSonioxKey(config) {
  * the PeterVoice API. The daemon picks it up and the bot writes the minutes doc.
  */
 async function triggerMinutes(config, meeting, transcriptDocRelPath) {
-  const apiUrl = config.api_url || "https://peter-voice.vercel.app";
+  const apiUrl = config.api_url || "https://www.peter-voice.site";
   const apiKey = config.api_key;
   if (!apiKey || !meeting.project) return false;
 

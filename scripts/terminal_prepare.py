@@ -92,7 +92,7 @@ def _recall_block(project_arg: str) -> str:
 요청하거나 맥락이 필요하면, 아래 API로 최근 대화를 직접 조회하세요.
 
 ```bash
-API_URL=$(python3 -c "import json,os; c=json.load(open(os.path.expanduser('~/.claude-daemon/config.json'))); print(c.get('api_url','https://peter-voice.vercel.app'))")
+API_URL=$(python3 -c "import json,os; c=json.load(open(os.path.expanduser('~/.claude-daemon/config.json'))); print(c.get('api_url','https://www.peter-voice.site'))")
 API_KEY=$(python3 -c "import json,os; print(json.load(open(os.path.expanduser('~/.claude-daemon/config.json')))['api_key'])")
 curl -s "$API_URL/api/bot/conversation?project={project_arg}&limit=20" -H "Authorization: Bearer $API_KEY"
 ```

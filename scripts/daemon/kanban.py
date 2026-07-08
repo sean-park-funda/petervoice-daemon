@@ -126,7 +126,7 @@ def build_kanban_prompt(card: dict) -> str:
 ## 과거 대화 기록 조회
 이 카드의 대화 기록을 확인해야 할 때 (이전 대화 내용, 맥락 파악 등):
 ```bash
-API_URL=$(python3 -c "import json; c=json.load(open('$HOME/.claude-daemon/config.json')); print(c.get('api_url', 'https://peter-voice.vercel.app'))")
+API_URL=$(python3 -c "import json; c=json.load(open('$HOME/.claude-daemon/config.json')); print(c.get('api_url', 'https://www.peter-voice.site'))")
 API_KEY=$(python3 -c "import json; print(json.load(open('$HOME/.claude-daemon/config.json'))['api_key'])")
 curl -s "$API_URL/api/kanban/{card.get('id')}/messages" \\
   -H "Authorization: Bearer $API_KEY"
@@ -149,7 +149,7 @@ curl -s "$API_URL/api/kanban/{card.get('id')}/messages" \\
 
 ## 상태 변경 API
 ```bash
-API_URL=$(python3 -c "import json; c=json.load(open('$HOME/.claude-daemon/config.json')); print(c.get('api_url', 'https://peter-voice.vercel.app'))")
+API_URL=$(python3 -c "import json; c=json.load(open('$HOME/.claude-daemon/config.json')); print(c.get('api_url', 'https://www.peter-voice.site'))")
 API_KEY=$(python3 -c "import json; print(json.load(open('$HOME/.claude-daemon/config.json'))['api_key'])")
 curl -s -X PATCH "$API_URL/api/kanban/{card.get('id')}/status" \\
   -H "Authorization: Bearer $API_KEY" \\
@@ -180,7 +180,7 @@ curl -s -X PATCH "$API_URL/api/kanban/{card.get('id')}/status" \\
 ### Step 1.5: 개발 결과를 카드에 저장
 커밋 목록과 변경 요약을 카드 DB에 저장합니다 (프로젝트 요약에 사용됨):
 ```bash
-API_URL=$(python3 -c "import json; c=json.load(open('$HOME/.claude-daemon/config.json')); print(c.get('api_url', 'https://peter-voice.vercel.app'))")
+API_URL=$(python3 -c "import json; c=json.load(open('$HOME/.claude-daemon/config.json')); print(c.get('api_url', 'https://www.peter-voice.site'))")
 API_KEY=$(python3 -c "import json; print(json.load(open('$HOME/.claude-daemon/config.json'))['api_key'])")
 curl -s -X PATCH "$API_URL/api/kanban/{card.get('id')}" \\
   -H "Authorization: Bearer $API_KEY" \\
@@ -202,7 +202,7 @@ print(json.dumps({{'result_commits': commits, 'result_notes': summary}}))
 ### Step 3: 코드리뷰 의뢰 (review 전환 시에만)
 review로 전환한 경우, 아래 curl로 code-reviewer 에이전트에게 리뷰를 의뢰:
 ```bash
-API_URL=$(python3 -c "import json; c=json.load(open('$HOME/.claude-daemon/config.json')); print(c.get('api_url', 'https://peter-voice.vercel.app'))")
+API_URL=$(python3 -c "import json; c=json.load(open('$HOME/.claude-daemon/config.json')); print(c.get('api_url', 'https://www.peter-voice.site'))")
 API_KEY=$(python3 -c "import json; print(json.load(open('$HOME/.claude-daemon/config.json'))['api_key'])")
 curl -s -X POST "$API_URL/api/relay/message" \\
   -H "X-Api-Key: $API_KEY" \\

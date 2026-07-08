@@ -7,7 +7,7 @@ import subprocess
 import os
 
 # Configuration
-WEB_API_URL = "https://peter-voice.vercel.app"
+WEB_API_URL = "https://www.peter-voice.site"
 OPENCLAW_BIN = "/Users/a111/.nvm/versions/node/v24.13.0/bin/openclaw"
 POLL_INTERVAL = 0.5  # 500ms
 

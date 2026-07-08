@@ -185,7 +185,7 @@ print('OK')
 
 ### 상태 변경 (수정 필요 시)
 ```bash
-API_URL=$(python3 -c "import json; c=json.load(open('/Users/sean/.claude-daemon/config.json')); print(c.get('api_url', 'https://peter-voice.vercel.app'))")
+API_URL=$(python3 -c "import json; c=json.load(open('/Users/sean/.claude-daemon/config.json')); print(c.get('api_url', 'https://www.peter-voice.site'))")
 API_KEY=$(python3 -c "import json; print(json.load(open('/Users/sean/.claude-daemon/config.json'))['api_key'])")
 curl -s -X PATCH "$API_URL/api/kanban/CARD_ID/status" \
   -H "Authorization: Bearer $API_KEY" \

@@ -90,7 +90,7 @@ class SessionHealthChecker(threading.Thread):
 ## 대화 조회 방법
 
 ```bash
-API_URL=$(python3 -c "import json; c=json.load(open('$HOME/.claude-daemon/config.json')); print(c.get('api_url', 'https://peter-voice.vercel.app'))")
+API_URL=$(python3 -c "import json; c=json.load(open('$HOME/.claude-daemon/config.json')); print(c.get('api_url', 'https://www.peter-voice.site'))")
 API_KEY=$(python3 -c "import json; print(json.load(open('$HOME/.claude-daemon/config.json'))['api_key'])")
 
 # 특정 프로젝트의 최근 메시지 조회
@@ -138,7 +138,7 @@ TTL(24시간) 초과 세션은 승인 없이 즉시 리셋. 리셋 후 보고.
 - NG: "[stall-check] 1단계 작업을 다시 시작하세요." ← 이런 지시 금지!
 
 ```bash
-API_URL=$(python3 -c "import json; c=json.load(open('$HOME/.claude-daemon/config.json')); print(c.get('api_url', 'https://peter-voice.vercel.app'))")
+API_URL=$(python3 -c "import json; c=json.load(open('$HOME/.claude-daemon/config.json')); print(c.get('api_url', 'https://www.peter-voice.site'))")
 API_KEY=$(python3 -c "import json; print(json.load(open('$HOME/.claude-daemon/config.json'))['api_key'])")
 
 curl -X POST "$API_URL/api/relay/message" \\

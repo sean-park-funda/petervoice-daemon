@@ -176,7 +176,7 @@ _SYSADMIN_PROMPT = """\
 ## 피터보이스 플랫폼 이해
 
 ### 동작 구조
-{customer_name}님이 웹 채팅(peter-voice.vercel.app)에서 메시지를 보내면:
+{customer_name}님이 웹 채팅(www.peter-voice.site)에서 메시지를 보내면:
 1. 웹 UI → Supabase DB에 메시지 저장
 2. Mac에서 돌아가는 **데몬**(백그라운드 프로세스)이 메시지를 감지
 3. 데몬이 **Claude Code CLI**를 실행하여 응답 생성

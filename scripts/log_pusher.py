@@ -8,7 +8,7 @@ Usage:
 
 Environment:
   BOT_API_KEY       — Required. Peter Voice bot API key.
-  PETER_VOICE_URL   — API base URL (default: https://peter-voice.vercel.app)
+  PETER_VOICE_URL   — API base URL (default: https://www.peter-voice.site)
   PUSH_INTERVAL     — Seconds between pushes (default: 5)
   MAX_LINES         — Max lines to keep (default: 200)
 """
@@ -24,7 +24,7 @@ from urllib.request import Request, urlopen
 from urllib.error import URLError
 
 API_KEY = os.environ.get("BOT_API_KEY", "")
-API_URL = os.environ.get("PETER_VOICE_URL", "https://peter-voice.vercel.app")
+API_URL = os.environ.get("PETER_VOICE_URL", "https://www.peter-voice.site")
 GATEWAY_LOG = Path(os.path.expanduser("~/.openclaw/logs/gateway.log"))
 DETAIL_LOG_DIR = Path("/tmp/openclaw")
 PUSH_INTERVAL = int(os.environ.get("PUSH_INTERVAL", "5"))

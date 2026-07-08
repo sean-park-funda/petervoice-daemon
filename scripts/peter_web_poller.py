@@ -9,7 +9,7 @@ import sys
 from datetime import datetime
 
 # --- Configuration ---
-WEB_API_URL = "https://peter-voice.vercel.app"
+WEB_API_URL = "https://www.peter-voice.site"
 BOT_API_KEY = "JUMSs3mtDbVaEwIxV571MZZxYUgtECaDpIl1BpB6ZLs"
 OPENCLAW_PATH = "/Users/a111/.nvm/versions/node/v24.13.0/bin/openclaw"
 REPLY_TOOL_PATH = "/Users/a111/.openclaw/workspace/scripts/web_reply.py"
