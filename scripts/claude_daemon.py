@@ -301,21 +301,181 @@ def _ensure_dns_route(api_key: str, username: str, tunnel_id: str):
     return f"https://{hostname}"
 
 
+# --- cloudflared 좀비 터널 자가치유 상태 (모듈 전역) ---
+_tunnel_unreachable_streak = 0          # 연속 외부 도달 실패 횟수
+_tunnel_kick_times: list[float] = []    # 최근 kickstart 타임스탬프(time.time), backoff용
+_TUNNEL_FAIL_THRESHOLD = 2              # 연속 N회 실패 시 조치(플래핑 방지)
+_TUNNEL_KICK_MAX_PER_HOUR = 2           # 시간당 최대 kickstart 횟수
+
+
+def _tunnel_url_from_config() -> str | None:
+    """config의 username으로 자기 Home Portal 터널 URL을 계산.
+
+    _ensure_dns_route()의 슬러그 규칙과 동일해야 함.
+    """
+    username = config.get("username")
+    if not username:
+        return None
+    slug = username.lower().replace("_", "-")
+    slug = "".join(c for c in slug if c.isalnum() or c == "-")
+    if not slug:
+        return None
+    return f"https://{slug}.peter-voice.site/"
+
+
+def _http_status(url: str, timeout: float = 8.0) -> tuple[int | None, str]:
+    """URL에 HEAD 요청(실패 시 GET 폴백). (status_code, note) 반환.
+
+    status_code=None 이면 연결 실패/timeout (엣지 미도달).
+    Cloudflare 엣지는 터널이 죽어도 응답은 하며 상태코드 530/1033 등으로 알림.
+    """
+    import urllib.request
+    import urllib.error
+
+    def _try(method: str):
+        req = urllib.request.Request(url, method=method)
+        req.add_header("User-Agent", "petervoice-daemon-healthcheck/1")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, method
+
+    for method in ("HEAD", "GET"):
+        try:
+            status, m = _try(method)
+            return status, f"{m} {status}"
+        except urllib.error.HTTPError as e:
+            # 4xx/5xx도 엣지가 응답한 것 — status는 유효
+            return e.code, f"{method} HTTP {e.code}"
+        except urllib.error.URLError as e:
+            # HEAD가 막히면 GET 재시도, 그 외엔 연결 실패로 처리
+            if method == "HEAD":
+                continue
+            return None, f"URLError {e.reason}"
+        except Exception as e:  # noqa: BLE001
+            if method == "HEAD":
+                continue
+            return None, f"{type(e).__name__}: {e}"
+    return None, "unreachable"
+
+
+def _tunnel_reachable(status: int | None) -> bool:
+    """엣지가 터널에 도달했는지 판정.
+
+    정상: 2xx/3xx/401/403 등 실제 오리진 응답(홈포탈 인증요구 401 포함).
+    비정상: 530/1033류(Cloudflare 터널 미연결), 502/504, 또는 연결 실패(None).
+    """
+    if status is None:
+        return False
+    # Cloudflare 터널/오리진 다운 시그널
+    if status in (502, 504, 520, 521, 522, 523, 524, 525, 526, 527, 530):
+        return False
+    # 그 외 HTTP 응답은 엣지→오리진 경로가 살아있다는 뜻(4xx 인증/권한 포함)
+    return True
+
+
+def _kickstart_cloudflared() -> bool:
+    """launchctl kickstart로 cloudflared(우리 label만) 재시작. 성공 여부 반환."""
+    import subprocess
+    uid = os.getuid()
+    target = f"gui/{uid}/com.cloudflare.cloudflared"
+    try:
+        result = subprocess.run(
+            ["launchctl", "kickstart", "-k", target],
+            capture_output=True, text=True, timeout=15,
+        )
+        if result.returncode == 0:
+            return True
+        logger.warning(f"[tunnel] kickstart failed rc={result.returncode}: {result.stderr.strip()}")
+        return False
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"[tunnel] kickstart error: {e}")
+        return False
+
+
 def _check_cloudflared_health():
-    """cloudflared가 죽었으면 _ensure_home_portal()을 다시 호출하여 복구."""
+    """2단계 헬스체크로 cloudflared 좀비 터널을 감지·자가치유.
+
+    1) pgrep: 프로세스가 죽었으면 _ensure_home_portal()로 복구(기존 동작).
+    2) 프로세스는 살아있지만 엣지 미연결('좀비')이면 launchctl kickstart로 재시작.
+       - 연속 실패 임계치/시간당 backoff로 플래핑·무한루프 방지.
+    """
+    global _tunnel_unreachable_streak
+
     if not config.get("home_portal_enabled", True):
         return
+    if sys.platform != "darwin":  # macOS 전용 (Windows 등 제외)
+        return
+
     import subprocess
+
+    # --- 1단계: 프로세스 생존 ---
     try:
         result = subprocess.run(
             ["pgrep", "-f", "cloudflared.*tunnel.*run"],
             capture_output=True, text=True
         )
-        if result.returncode != 0:
-            logger.warning("[tunnel] cloudflared not running, recovering...")
-            _ensure_home_portal()
     except Exception:
-        pass
+        return
+    if result.returncode != 0:
+        logger.warning("[tunnel] cloudflared not running, recovering...")
+        _tunnel_unreachable_streak = 0
+        _ensure_home_portal()
+        return
+
+    # --- 2단계: 외부 도달성(좀비 감지) ---
+    tunnel_url = _tunnel_url_from_config()
+    if not tunnel_url:
+        return  # URL 미상 → 도달성 체크 스킵
+
+    status, note = _http_status(tunnel_url)
+    if _tunnel_reachable(status):
+        if _tunnel_unreachable_streak:
+            logger.info(f"[tunnel] external reachability recovered ({note})")
+        _tunnel_unreachable_streak = 0
+        return
+
+    # 외부 실패 — 로컬 홈포탈(3000) 다운과 구분
+    local_status, _ = _http_status("http://127.0.0.1:3000/", timeout=4.0)
+    if local_status is None:
+        # 홈포탈 자체가 안 뜸 → 터널 문제 아님. 프로세스 복구 경로로.
+        logger.warning(
+            f"[tunnel] external failed ({note}) but localhost:3000 down "
+            f"— home portal issue, not tunnel; running _ensure_home_portal()"
+        )
+        _tunnel_unreachable_streak = 0
+        _ensure_home_portal()
+        return
+
+    _tunnel_unreachable_streak += 1
+    logger.warning(
+        f"[tunnel] external reachability failed "
+        f"({_tunnel_unreachable_streak} consecutive): {note} (local 3000 OK)"
+    )
+    if _tunnel_unreachable_streak < _TUNNEL_FAIL_THRESHOLD:
+        return  # 아직 임계치 미만 — 일시적 드롭 오탐 방지
+
+    # --- backoff: 시간당 최대 N회 ---
+    import time
+    now = time.time()
+    _tunnel_kick_times[:] = [t for t in _tunnel_kick_times if now - t < 3600]
+    if len(_tunnel_kick_times) >= _TUNNEL_KICK_MAX_PER_HOUR:
+        logger.warning(
+            f"[tunnel] zombie detected but kickstart backoff active "
+            f"({len(_tunnel_kick_times)}/{_TUNNEL_KICK_MAX_PER_HOUR} this hour) — skipping"
+        )
+        return
+
+    logger.warning(
+        f"[tunnel] zombie tunnel confirmed ({note}) -> kickstarting cloudflared"
+    )
+    if _kickstart_cloudflared():
+        _tunnel_kick_times.append(now)
+        _tunnel_unreachable_streak = 0
+        logger.info("[tunnel] cloudflared kickstarted; reachability will re-check next cycle")
+    else:
+        # kickstart 실패 시 전체 프로비저닝 경로로 폴백
+        logger.warning("[tunnel] kickstart failed, falling back to _ensure_home_portal()")
+        _ensure_home_portal()
+        _tunnel_unreachable_streak = 0
 
 
 def _ensure_home_portal():
