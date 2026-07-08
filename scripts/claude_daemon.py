@@ -578,6 +578,14 @@ def main():
                 except Exception as e:
                     logger.warning(f"force_restart check error: {e}")
 
+            # 설정 UI 재로그인 브리지 (5초 주기) — 채팅 플로우와 같은 엔진 공유
+            if watchdog_tick % 5 == 0 and user_id is not None:
+                try:
+                    from daemon.relogin_settings import poll_relogin
+                    poll_relogin(user_id)
+                except Exception as e:
+                    logger.warning(f"relogin poll error: {e}")
+
         worker._executor.shutdown(wait=False, cancel_futures=True)
         worker.join(timeout=5)
 

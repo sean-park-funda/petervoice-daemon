@@ -182,6 +182,29 @@ def clear_force_restart(user_id: int):
     api_request(api_key, "PATCH", "/api/bot/status", body={"force_restart": False}, timeout=5)
 
 
+def get_relogin_status(user_id: int) -> dict:
+    """user_status 의 relogin_state/relogin_url/relogin_code 조회 (설정 UI 폴링용)."""
+    api_key = config.get("api_key", "")
+    if not api_key:
+        return {}
+    result = api_request(api_key, "GET", "/api/bot/status", timeout=5)
+    if not result:
+        return {}
+    return {
+        "relogin_state": result.get("relogin_state"),
+        "relogin_url": result.get("relogin_url"),
+        "relogin_code": result.get("relogin_code"),
+    }
+
+
+def patch_relogin(fields: dict):
+    """user_status 의 relogin 필드 갱신. relogin_code=None 이면 즉시 소거."""
+    api_key = config.get("api_key", "")
+    if not api_key:
+        return
+    api_request(api_key, "PATCH", "/api/bot/status", body=fields, timeout=5)
+
+
 def check_stop_requested(user_id: int) -> bool:
     """user_status에서 stop_requested 플래그 확인."""
     api_key = config.get("api_key", "")
