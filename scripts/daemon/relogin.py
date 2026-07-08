@@ -439,8 +439,8 @@ class ReloginSession:
 _session = ReloginSession()
 
 
-def start(project: str, config_dir: str = None) -> dict:
-    return _session.start(project, config_dir)
+def start(project: str, config_dir: str = None, on_event=None) -> dict:
+    return _session.start(project, config_dir, on_event=on_event)
 
 
 def is_pending() -> bool:
