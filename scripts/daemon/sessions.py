@@ -88,8 +88,8 @@ def save_sessions():
         logger.warning(f"Failed to save sessions: {e}")
 
 
-def reset_session(project: str, reason: str = ""):
-    key = session_key(project)
+def reset_session(project: str, reason: str = "", key_override: str | None = None):
+    key = key_override or session_key(project)
     with sessions_lock:
         removed = g.sessions.pop(key, None)
     if removed:

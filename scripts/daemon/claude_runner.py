@@ -215,7 +215,7 @@ def run_claude(
         if prev_account != account_name:
             logger.info(f"Account changed for {project}: {prev_account} → {account_name}, auto-resetting session")
             save_session_context(project)
-            reset_session(project)
+            reset_session(project, key_override=_sid_key)
             sid = None
 
     if sid:
@@ -423,7 +423,7 @@ def run_claude(
                         conv = _fetch_recent_conversation(project, limit=10)
                         if conv:
                             _save_session_summary(project, f"[이미지 처리 오류로 자동 리셋 — 최근 대화 원본]\n\n{conv}")
-                        reset_session(project)
+                        reset_session(project, key_override=_sid_key)
                         proc.wait(timeout=5)
                         g.claude_semaphore.release()
                         if _retry_count >= MAX_CONTEXT_OVERFLOW_RETRIES:
@@ -435,7 +435,7 @@ def run_claude(
                         conv = _fetch_recent_conversation(project, limit=10)
                         if conv:
                             _save_session_summary(project, f"[컨텍스트 오버플로우로 자동 리셋 — 최근 대화 원본]\n\n{conv}")
-                        reset_session(project)
+                        reset_session(project, key_override=_sid_key)
                         proc.wait(timeout=5)
                         g.claude_semaphore.release()
                         if _retry_count >= MAX_CONTEXT_OVERFLOW_RETRIES:
@@ -460,7 +460,7 @@ def run_claude(
                 conv = _fetch_recent_conversation(project, limit=10)
                 if conv:
                     _save_session_summary(project, f"[컨텍스트 오버플로우(stderr)로 자동 리셋 — 최근 대화 원본]\n\n{conv}")
-                reset_session(project)
+                reset_session(project, key_override=_sid_key)
                 g.claude_semaphore.release()
                 if _retry_count >= MAX_CONTEXT_OVERFLOW_RETRIES:
                     return ("(컨텍스트 초과 - 최대 재시도 횟수 초과)", None, tool_lines, False)
@@ -468,7 +468,7 @@ def run_claude(
                     session_key_override=session_key_override, prompt_override=prompt_override, stream_to_chat=stream_to_chat)
             if "no conversation found" in stderr_output.lower():
                 logger.warning(f"[{bot_name}] Invalid session for {project}, clearing and retrying")
-                reset_session(project)
+                reset_session(project, key_override=_sid_key)
                 g.claude_semaphore.release()
                 if _retry_count >= MAX_CONTEXT_OVERFLOW_RETRIES:
                     return ("(세션 오류 - 최대 재시도 횟수 초과)", None, tool_lines, False)
@@ -486,7 +486,7 @@ def run_claude(
             conv = _fetch_recent_conversation(project, limit=10)
             if conv:
                 _save_session_summary(project, f"[프롬프트 초과로 자동 리셋 — 최근 대화 원본]\n\n{conv}")
-            reset_session(project)
+            reset_session(project, key_override=_sid_key)
             g.claude_semaphore.release()
             return run_claude(prompt, project, _retry_count + 1, 0,
                 session_key_override=session_key_override, prompt_override=prompt_override, stream_to_chat=stream_to_chat)
