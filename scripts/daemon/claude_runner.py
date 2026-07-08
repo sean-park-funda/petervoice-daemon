@@ -32,6 +32,86 @@ from daemon.tasks import get_current_task, get_task_description
 from daemon.prompts import get_prompt_file, build_system_prompt, build_connected_services_note
 
 
+# ── 인증만료 감지 & 재로그인 트리거 (macOS 셀프서비스) ─────────────
+# 완전 로그아웃(hoon 사례)은 401 텍스트 없이 exit 1 + stderr 빈값으로 새어나가고,
+# `claude auth status`는 거짓보고(loggedIn:true)하므로 status 로는 판별 불가.
+# → plain 프로브(echo | claude -p -- "ok")로 인증만료를 확정한다.
+_AUTH_EXPIRED_MARKERS = (
+    "not logged in", "please run /login", "please run `/login`",
+    "run /login", "invalid authentication", "authentication_error",
+    "oauth token has expired",
+)
+
+
+def _text_signals_auth_expired(text: str) -> bool:
+    if not text:
+        return False
+    low = text.lower()
+    if "401" in text:
+        return True
+    return any(m in low for m in _AUTH_EXPIRED_MARKERS)
+
+
+def _probe_auth_expired(config_dir: str | None = None) -> bool:
+    """원인 불명 오류(exit≠0 & stderr 빈값 & 응답 빈값) 시 plain 프로브로 인증만료 확정.
+    Keychain/credentials 는 절대 건드리지 않는다 — 읽기만 하는 무해한 프로브."""
+    if IS_WINDOWS:
+        return False
+    try:
+        env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
+        env["LANG"] = "en_US.UTF-8"
+        if config_dir:
+            env["CLAUDE_CONFIG_DIR"] = os.path.expanduser(config_dir)
+        r = subprocess.run(
+            [CLAUDE_CMD, "-p", "--", "ok"],
+            input="", capture_output=True, text=True, timeout=30, env=env,
+        )
+        out = (r.stdout or "") + (r.stderr or "")
+        return _text_signals_auth_expired(out)
+    except Exception as e:
+        logger.warning(f"[auth-probe] failed: {e}")
+        return False
+
+
+def resolve_account_config_dir(project: str) -> str | None:
+    """프로젝트의 account 설정에 해당하는 CLAUDE_CONFIG_DIR 반환 (default 면 None).
+    worker 의 명시적 재로그인 트리거에서 멀티계정을 올바른 config 로 띄우기 위함."""
+    try:
+        real = project
+        if project.startswith("branch:"):
+            from daemon.branches import fetch_branch
+            bd = fetch_branch(int(project.split(":")[1]))
+            real = bd.get("project_id", "general") if bd else "general"
+        elif project.startswith("kanban:"):
+            from daemon.kanban import _fetch_kanban_card
+            kc = _fetch_kanban_card(int(project.split(":")[1]))
+            real = kc.get("project_id", "general") if kc else "general"
+        settings = _fetch_project_settings(real)
+        account_name = settings.get("account") or "default"
+        if account_name == "default":
+            return None
+        accounts = config.get("accounts", {})
+        cd = accounts.get(account_name, {}).get("config_dir")
+        return os.path.expanduser(cd) if cd else None
+    except Exception:
+        return None
+
+
+def _trigger_relogin(project: str, config_dir: str | None = None) -> str:
+    """인증만료 확정 시 재로그인 플로우를 시작하고, 유저에게 보낼 즉시 안내문을 반환.
+    실제 로그인 URL 은 relogin 엔진이 준비되는 대로 채팅에 별도 안내한다.
+    macOS 전용 — Windows 는 기존 수동 안내 유지."""
+    if IS_WINDOWS:
+        return "(Claude 인증이 만료되었습니다. 관리자에게 재로그인을 요청해주세요.)"
+    try:
+        from daemon import relogin
+        relogin.start(project, config_dir=config_dir)
+        return "⚠️ Claude 인증이 만료되어 재로그인을 시작합니다. 잠시 후 안내 링크를 보내드릴게요..."
+    except Exception as e:
+        logger.error(f"[relogin] trigger failed: {e}", exc_info=True)
+        return "(Claude 인증이 만료되었습니다. 관리자에게 재로그인을 요청해주세요.)"
+
+
 def _load_wiki_index(project: str) -> str:
     """Load wiki/index.md for auto-memory injection. Returns empty string if not found."""
     project_dir = get_project_dir(project)
@@ -442,13 +522,14 @@ def run_claude(
                             return ("(컨텍스트 초과 - 최대 재시도 횟수 초과)", None, tool_lines, False)
                         return run_claude(prompt, project, _retry_count + 1, 0,
                             session_key_override=session_key_override, prompt_override=prompt_override, stream_to_chat=stream_to_chat)
-                    if "401" in error_text or "invalid authentication" in error_text.lower():
+                    if _text_signals_auth_expired(error_text):
                         # Do NOT touch credentials/Keychain — Claude CLI manages its own token
                         # refresh, and deleting the Keychain entry can destroy the only valid
                         # credential source (file may be expired while Keychain is valid).
-                        logger.warning(f"[{bot_name}] Auth 401 for {project}: Claude CLI auth needs re-login")
+                        logger.warning(f"[{bot_name}] Auth expired for {project}: starting self-service re-login")
+                        proc.kill()
                         g.claude_semaphore.release()
-                        return ("(Claude 인증이 만료되었습니다. 관리자에게 재로그인을 요청해주세요.)", new_session_id, tool_lines, False)
+                        return (_trigger_relogin(project, account_config_dir), new_session_id, tool_lines, False)
 
         proc.wait(timeout=300)
 
@@ -474,6 +555,16 @@ def run_claude(
                     return ("(세션 오류 - 최대 재시도 횟수 초과)", None, tool_lines, False)
                 return run_claude(prompt, project, _retry_count + 1, 0,
                     session_key_override=session_key_override, prompt_override=prompt_override, stream_to_chat=stream_to_chat)
+            # stderr 에 인증만료 텍스트가 직접 보이면 즉시 재로그인
+            if _text_signals_auth_expired(stderr_output):
+                logger.warning(f"[{bot_name}] Auth expired (stderr) for {project}: starting self-service re-login")
+                g.claude_semaphore.release()
+                return (_trigger_relogin(project, account_config_dir), new_session_id, tool_lines, False)
+            # 원인 불명(exit≠0 & stderr 빈값 & 응답 빈값) → plain 프로브로 인증만료 확정 (hoon 사례)
+            if not stderr_output and _probe_auth_expired(account_config_dir):
+                logger.warning(f"[{bot_name}] Auth expired (probe) for {project}: starting self-service re-login")
+                g.claude_semaphore.release()
+                return (_trigger_relogin(project, account_config_dir), new_session_id, tool_lines, False)
             return (f"(Claude 오류: exit {proc.returncode})", new_session_id, tool_lines, False)
 
         if not response_text:
