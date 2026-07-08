@@ -324,6 +324,9 @@ class Worker(threading.Thread):
 
         is_timeout_followup = msg.get("_is_timeout_followup", False)
 
+        # 팀 분기는 timed_out 을 반환하지 않으므로 기본값을 먼저 둔다
+        # (없으면 아래 `if timed_out ...` 이 UnboundLocalError 로 팀 프로젝트를 크래시시킴)
+        timed_out = False
         if _is_team and process_team_message:
             response, tool_lines = process_team_message(
                 prompt_text, project, self, msg_id, _branch_id,
