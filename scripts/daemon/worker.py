@@ -71,6 +71,7 @@ class Worker(threading.Thread):
             "current_task": current_task,
             "timestamp": datetime.now().isoformat(),
             "active_projects": projects_list,
+            "version": g.DAEMON_VERSION,   # 데몬 git HEAD — stale 고객 식별용
         }
         if project:
             payload["project"] = project

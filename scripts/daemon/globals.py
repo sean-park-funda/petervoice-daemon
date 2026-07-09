@@ -73,6 +73,26 @@ def _find_codex_cmd() -> str:
 
 CODEX_CMD = _find_codex_cmd()
 
+# ─── Daemon version (git HEAD short) — heartbeat 로 리포트해 stale 고객 식별 ──
+def _daemon_version() -> str:
+    """데몬 레포의 현재 git HEAD short. 시작 시 1회 계산(재시작하면 갱신). 실패 시 'unknown'."""
+    try:
+        import subprocess
+        d = Path(__file__).resolve().parent  # scripts/daemon/
+        for _ in range(5):
+            if (d / ".git").exists():
+                r = subprocess.run(
+                    ["git", "-C", str(d), "rev-parse", "--short", "HEAD"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                return r.stdout.strip() if r.returncode == 0 else "unknown"
+            d = d.parent
+    except Exception:
+        pass
+    return "unknown"
+
+DAEMON_VERSION = _daemon_version()
+
 # ─── Parse --config-dir before path setup ────────────────────────
 _parser = argparse.ArgumentParser(add_help=False)
 _parser.add_argument("--config-dir", default=None)
