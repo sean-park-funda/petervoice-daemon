@@ -233,9 +233,12 @@ def run_claude(
     model = branch_model or proj_settings.get("model") or config.get("claude_model") or "claude-sonnet-5"
     if model:
         cmd.extend(["--model", model])
-    effort = config.get("claude_effort")
+    # effort: 브랜치 > 프로젝트 > 전역 config 순 (모델과 동일 우선순위)
+    branch_effort = branch_data.get("effort") if is_branch and branch_data else None
+    effort = branch_effort or proj_settings.get("effort") or config.get("claude_effort")
     if effort:
         cmd.extend(["--effort", effort])
+    logger.info(f"[claude] project={project} model={model} effort={effort or '(none)'}")
 
     if prompt_override is not None:
         # D7: externally assembled prompt (team lead / team member)
