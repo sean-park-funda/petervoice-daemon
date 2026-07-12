@@ -2,22 +2,26 @@
 
 import json
 import os
+import re
+import subprocess
 import time
 import threading
 from datetime import datetime, timedelta, timezone
 
 import daemon.globals as g
-from daemon.globals import config, active_projects, active_projects_lock, shutdown_event, logger
+from daemon.globals import config, active_projects, active_projects_lock, shutdown_event, logger, CLAUDE_CMD
 from daemon.api import api_request, inject_system_message
 from daemon.supabase import get_project_dir
 
 
 class HeartbeatThread(threading.Thread):
     POLL_INTERVAL = 60
+    USAGE_INTERVAL = 15 * 60  # Claude 사용 한도 수집 주기(초)
     HEARTBEAT_MSG = "HEARTBEAT.md를 확인하고 할 일이 있으면 처리해줘. 없으면 '할 일 없음'이라고 답해."
 
     def __init__(self):
         super().__init__(daemon=True, name="heartbeat")
+        self._last_usage_fetch = 0.0
 
     def run(self):
         logger.info("[heartbeat] Thread started")
@@ -27,8 +31,63 @@ class HeartbeatThread(threading.Thread):
                 self._tick()
             except Exception as e:
                 logger.error(f"[heartbeat] tick error: {e}")
+            try:
+                self._maybe_update_usage()
+            except Exception as e:
+                logger.warning(f"[usage] update error: {e}")
             shutdown_event.wait(self.POLL_INTERVAL)
         logger.info("[heartbeat] Thread stopped")
+
+    # ─── Claude 사용 한도(/usage) 수집 ────────────────────────────
+    def _maybe_update_usage(self):
+        now = time.time()
+        if now - self._last_usage_fetch < self.USAGE_INTERVAL:
+            return
+        self._last_usage_fetch = now
+        limits = self._fetch_usage_limits()
+        if limits:
+            api_key = config.get("api_key", "")
+            if api_key:
+                api_request(api_key, "PATCH", "/api/bot/status", body={"usage_limits": limits}, timeout=10)
+                logger.info(f"[usage] session={limits.get('session_pct')}% week={limits.get('week_pct')}%")
+
+    def _fetch_usage_limits(self) -> dict | None:
+        """claude -p '/usage' 실행 후 세션/주간 리밋 % + 리셋 시각 파싱."""
+        try:
+            r = subprocess.run(
+                [CLAUDE_CMD, "-p", "/usage"],
+                capture_output=True, text=True, timeout=30,
+            )
+        except Exception as e:
+            logger.warning(f"[usage] claude /usage failed: {e}")
+            return None
+        out = (r.stdout or "") + "\n" + (r.stderr or "")
+        if not out.strip():
+            return None
+
+        def _pct(pattern: str):
+            m = re.search(pattern, out)
+            if not m:
+                return None, None
+            pct = int(m.group(1))
+            reset = (m.group(2).strip() if m.lastindex and m.lastindex >= 2 else "")
+            # "(Asia/Seoul)" 등 괄호 타임존 제거
+            reset = re.sub(r"\s*\(.*\)$", "", reset).strip()
+            return pct, reset
+
+        session_pct, session_reset = _pct(r"Current session:\s*(\d+)% used(?:\s*·\s*resets\s*(.+))?")
+        week_pct, week_reset = _pct(r"Current week \(all models\):\s*(\d+)% used(?:\s*·\s*resets\s*(.+))?")
+        fable_pct, _ = _pct(r"Current week \(Fable\):\s*(\d+)% used")
+        if session_pct is None and week_pct is None:
+            return None
+        return {
+            "session_pct": session_pct,
+            "week_pct": week_pct,
+            "week_fable_pct": fable_pct,
+            "session_reset": session_reset,
+            "week_reset": week_reset,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
 
     def _tick(self):
         tasks = self._fetch_due_tasks()
