@@ -738,6 +738,18 @@ def main():
                 except Exception as e:
                     logger.warning(f"force_restart check error: {e}")
 
+            # 사용량 즉시 새로고침 요청(배너 버튼) — 10초 주기 감지
+            if watchdog_tick % 10 == 0 and user_id is not None:
+                try:
+                    from daemon.supabase import check_usage_refresh, clear_usage_refresh
+                    if check_usage_refresh(user_id):
+                        logger.info("[usage] on-demand refresh requested")
+                        clear_usage_refresh()
+                        from daemon.heartbeat import collect_and_store_usage
+                        collect_and_store_usage()
+                except Exception as e:
+                    logger.warning(f"[usage] refresh check error: {e}")
+
             # 설정 UI 재로그인 브리지 (5초 주기) — 채팅 플로우와 같은 엔진 공유
             if watchdog_tick % 5 == 0 and user_id is not None:
                 try:

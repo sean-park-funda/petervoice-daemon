@@ -14,6 +14,58 @@ from daemon.api import api_request, inject_system_message
 from daemon.supabase import get_project_dir
 
 
+# ─── Claude 사용 한도(/usage) 수집 — 주기(heartbeat) + 온디맨드(main loop) 공용 ───
+def fetch_usage_limits() -> dict | None:
+    """claude -p '/usage' 실행 후 세션/주간 리밋 % + 리셋 시각 파싱."""
+    try:
+        r = subprocess.run(
+            [CLAUDE_CMD, "-p", "/usage"],
+            capture_output=True, text=True, timeout=30,
+        )
+    except Exception as e:
+        logger.warning(f"[usage] claude /usage failed: {e}")
+        return None
+    out = (r.stdout or "") + "\n" + (r.stderr or "")
+    if not out.strip():
+        return None
+
+    def _pct(pattern: str):
+        m = re.search(pattern, out)
+        if not m:
+            return None, None
+        pct = int(m.group(1))
+        reset = (m.group(2).strip() if m.lastindex and m.lastindex >= 2 else "")
+        reset = re.sub(r"\s*\(.*\)$", "", reset).strip()  # "(Asia/Seoul)" 제거
+        return pct, reset
+
+    session_pct, session_reset = _pct(r"Current session:\s*(\d+)% used(?:\s*·\s*resets\s*(.+))?")
+    week_pct, week_reset = _pct(r"Current week \(all models\):\s*(\d+)% used(?:\s*·\s*resets\s*(.+))?")
+    fable_pct, _ = _pct(r"Current week \(Fable\):\s*(\d+)% used")
+    if session_pct is None and week_pct is None:
+        return None
+    return {
+        "session_pct": session_pct,
+        "week_pct": week_pct,
+        "week_fable_pct": fable_pct,
+        "session_reset": session_reset,
+        "week_reset": week_reset,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def collect_and_store_usage() -> bool:
+    """즉시 /usage 수집 후 user_status.usage_limits 갱신. 성공 여부 반환."""
+    limits = fetch_usage_limits()
+    if not limits:
+        return False
+    api_key = config.get("api_key", "")
+    if not api_key:
+        return False
+    api_request(api_key, "PATCH", "/api/bot/status", body={"usage_limits": limits}, timeout=10)
+    logger.info(f"[usage] session={limits.get('session_pct')}% week={limits.get('week_pct')}%")
+    return True
+
+
 class HeartbeatThread(threading.Thread):
     POLL_INTERVAL = 60
     USAGE_INTERVAL = 15 * 60  # Claude 사용 한도 수집 주기(초)
@@ -38,56 +90,13 @@ class HeartbeatThread(threading.Thread):
             shutdown_event.wait(self.POLL_INTERVAL)
         logger.info("[heartbeat] Thread stopped")
 
-    # ─── Claude 사용 한도(/usage) 수집 ────────────────────────────
+    # ─── Claude 사용 한도(/usage) 주기 수집 ────────────────────────
     def _maybe_update_usage(self):
         now = time.time()
         if now - self._last_usage_fetch < self.USAGE_INTERVAL:
             return
         self._last_usage_fetch = now
-        limits = self._fetch_usage_limits()
-        if limits:
-            api_key = config.get("api_key", "")
-            if api_key:
-                api_request(api_key, "PATCH", "/api/bot/status", body={"usage_limits": limits}, timeout=10)
-                logger.info(f"[usage] session={limits.get('session_pct')}% week={limits.get('week_pct')}%")
-
-    def _fetch_usage_limits(self) -> dict | None:
-        """claude -p '/usage' 실행 후 세션/주간 리밋 % + 리셋 시각 파싱."""
-        try:
-            r = subprocess.run(
-                [CLAUDE_CMD, "-p", "/usage"],
-                capture_output=True, text=True, timeout=30,
-            )
-        except Exception as e:
-            logger.warning(f"[usage] claude /usage failed: {e}")
-            return None
-        out = (r.stdout or "") + "\n" + (r.stderr or "")
-        if not out.strip():
-            return None
-
-        def _pct(pattern: str):
-            m = re.search(pattern, out)
-            if not m:
-                return None, None
-            pct = int(m.group(1))
-            reset = (m.group(2).strip() if m.lastindex and m.lastindex >= 2 else "")
-            # "(Asia/Seoul)" 등 괄호 타임존 제거
-            reset = re.sub(r"\s*\(.*\)$", "", reset).strip()
-            return pct, reset
-
-        session_pct, session_reset = _pct(r"Current session:\s*(\d+)% used(?:\s*·\s*resets\s*(.+))?")
-        week_pct, week_reset = _pct(r"Current week \(all models\):\s*(\d+)% used(?:\s*·\s*resets\s*(.+))?")
-        fable_pct, _ = _pct(r"Current week \(Fable\):\s*(\d+)% used")
-        if session_pct is None and week_pct is None:
-            return None
-        return {
-            "session_pct": session_pct,
-            "week_pct": week_pct,
-            "week_fable_pct": fable_pct,
-            "session_reset": session_reset,
-            "week_reset": week_reset,
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-        }
+        collect_and_store_usage()
 
     def _tick(self):
         tasks = self._fetch_due_tasks()

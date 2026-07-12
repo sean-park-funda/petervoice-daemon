@@ -205,6 +205,25 @@ def patch_relogin(fields: dict):
     api_request(api_key, "PATCH", "/api/bot/status", body=fields, timeout=5)
 
 
+def check_usage_refresh(user_id: int) -> bool:
+    """user_status.usage_refresh 플래그 확인 (사용량 즉시 새로고침 요청)."""
+    api_key = config.get("api_key", "")
+    if not api_key:
+        return False
+    result = api_request(api_key, "GET", "/api/bot/status", timeout=5)
+    if result:
+        return result.get("usage_refresh", False)
+    return False
+
+
+def clear_usage_refresh():
+    """user_status.usage_refresh = false 로 초기화."""
+    api_key = config.get("api_key", "")
+    if not api_key:
+        return
+    api_request(api_key, "PATCH", "/api/bot/status", body={"usage_refresh": False}, timeout=5)
+
+
 def check_stop_requested(user_id: int) -> bool:
     """user_status에서 stop_requested 플래그 확인."""
     api_key = config.get("api_key", "")
