@@ -40,6 +40,9 @@ _AUTH_EXPIRED_MARKERS = (
     "not logged in", "please run /login", "please run `/login`",
     "run /login", "invalid authentication", "authentication_error",
     "oauth token has expired",
+    # karl(2026-07-09) 실사고: 실제 문구가 위에 없어 자동감지 실패했던 케이스 보완.
+    # "Failed to authenticate: OAuth session expired and could not be refreshed"
+    "failed to authenticate", "session expired", "could not be refreshed",
 )
 
 
