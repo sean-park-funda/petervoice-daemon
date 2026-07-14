@@ -234,6 +234,9 @@ def run_claude(
     branch_model = branch_data.get("model") if is_branch and branch_data else None
     # 기본 모델은 Sonnet 5. 브랜치/프로젝트/config에 지정이 없으면 sonnet-5로 폴백.
     model = branch_model or proj_settings.get("model") or config.get("claude_model") or "claude-sonnet-5"
+    # 엔진=claude인데 Codex(gpt-*) 모델 코드가 남아있으면 무시하고 Claude 기본값 사용.
+    if model.startswith("gpt-"):
+        model = config.get("claude_model") or "claude-sonnet-5"
     if model:
         cmd.extend(["--model", model])
     # effort: 브랜치 > 프로젝트 > 전역 config 순 (모델과 동일 우선순위)
@@ -772,8 +775,17 @@ def run_codex(prompt: str, project: str, _retry_count: int = 0) -> tuple[str, st
         _prepare_agents_md(project_dir, combined)
 
     # Build command
+    # Codex 모델 해석: model 컬럼 우선(통합 UI가 여기에 gpt-* 저장), codex_model은 하위호환 fallback.
     branch_model = branch_data.get("model") if is_branch and branch_data else None
-    model = branch_model or proj_settings.get("codex_model") or config.get("codex_default_model")
+    model = (
+        branch_model
+        or proj_settings.get("model")
+        or proj_settings.get("codex_model")
+        or config.get("codex_default_model")
+    )
+    # 엔진=codex인데 Claude 모델 코드가 남아있으면(과거 설정 잔재) 무시하고 Codex 기본값 사용.
+    if model and (model.startswith("claude") or model in ("opus", "sonnet", "haiku")):
+        model = config.get("codex_default_model")
     use_model_flag = bool(model)
     bot_name = config.get("bot_name", "bot")
 
