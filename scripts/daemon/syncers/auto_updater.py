@@ -1,5 +1,6 @@
 """Auto-updater: periodically git pull and restart if new commits found."""
 
+import re
 import subprocess
 import threading
 
@@ -292,7 +293,12 @@ class AutoUpdater(threading.Thread):
             ["codex", "--version"],
             capture_output=True, text=True, timeout=10, env=_env,
         )
-        current = r.stdout.strip().split()[0] if r.returncode == 0 else ""
+        # `codex --version` prints e.g. "codex-cli 0.144.3" — extract the semver token,
+        # not the leading "codex-cli" name (that caused every cycle to reinstall).
+        current = ""
+        if r.returncode == 0:
+            m = re.search(r"\d+\.\d+\.\d+", r.stdout)
+            current = m.group(0) if m else ""
         if not current:
             return
 
