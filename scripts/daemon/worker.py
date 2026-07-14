@@ -72,6 +72,7 @@ class Worker(threading.Thread):
             "timestamp": datetime.now().isoformat(),
             "active_projects": projects_list,
             "version": g.DAEMON_VERSION,   # 데몬 git HEAD — stale 고객 식별용
+            "codex_available": g.detect_codex_available(),  # 웹 헤더 Codex 선택지 활성화 여부
         }
         if project:
             payload["project"] = project

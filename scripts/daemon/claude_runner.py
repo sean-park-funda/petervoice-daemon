@@ -973,6 +973,14 @@ def run_codex(prompt: str, project: str, _retry_count: int = 0) -> tuple[str, st
         proc.kill()
         logger.error(f"[{bot_name}] Codex timed out for {project}")
         return ("(Codex 응답 시간 초과)", sid, [], True)
+    except FileNotFoundError:
+        logger.error(f"[{bot_name}] Codex not installed on this machine ({CODEX_CMD})")
+        return (
+            "이 기기에는 Codex(OpenAI CLI)가 설치되어 있지 않습니다. "
+            "Codex를 설치하고 로그인하면 이 모델을 사용할 수 있어요. "
+            "그 전까지는 헤더에서 Claude 모델을 선택해 주세요.",
+            sid, [], False,
+        )
     except Exception as e:
         logger.error(f"[{bot_name}] Codex error: {e}")
         return (f"(Codex 실행 오류: {e})", sid, [], False)

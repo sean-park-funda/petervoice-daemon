@@ -11,6 +11,8 @@ import logging
 import threading
 import argparse
 import shutil
+import subprocess
+import time
 from pathlib import Path
 
 # ─── Platform ────────────────────────────────────────────────────
@@ -72,6 +74,25 @@ def _find_codex_cmd() -> str:
     return "codex"
 
 CODEX_CMD = _find_codex_cmd()
+
+# ─── Codex 가용성(설치+인증) 감지 — 5분 캐시 ────────────────────
+# 웹 헤더가 이 값으로 Codex 모델 선택지를 활성/비활성("코덱스 미설치") 표시한다.
+_codex_avail_cache = {"ts": 0.0, "val": False}
+def detect_codex_available() -> bool:
+    """codex CLI 설치+인증 여부. 설치=`codex --version` 성공, 인증=~/.codex/auth.json 또는 config.openai_api_key."""
+    now = time.time()
+    if now - _codex_avail_cache["ts"] < 300 and _codex_avail_cache["ts"] > 0:
+        return _codex_avail_cache["val"]
+    val = False
+    try:
+        r = subprocess.run([CODEX_CMD, "--version"], capture_output=True, text=True, timeout=10)
+        if r.returncode == 0:
+            auth_json = Path.home() / ".codex" / "auth.json"
+            val = auth_json.exists() or bool(config.get("openai_api_key"))
+    except Exception:
+        val = False
+    _codex_avail_cache.update(ts=now, val=val)
+    return val
 
 # ─── Daemon version (git HEAD short) — heartbeat 로 리포트해 stale 고객 식별 ──
 def _daemon_version() -> str:
