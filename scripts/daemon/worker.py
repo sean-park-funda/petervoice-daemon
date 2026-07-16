@@ -354,6 +354,7 @@ class Worker(threading.Thread):
         # 팀 분기는 timed_out 을 반환하지 않으므로 기본값을 먼저 둔다
         # (없으면 아래 `if timed_out ...` 이 UnboundLocalError 로 팀 프로젝트를 크래시시킴)
         timed_out = False
+        _segments: list[str] = []
         if _is_team and process_team_message:
             response, tool_lines = process_team_message(
                 prompt_text, project, self, msg_id, _branch_id,
@@ -362,7 +363,9 @@ class Worker(threading.Thread):
         elif _engine == "codex":
             response, sid, tool_lines, timed_out = run_codex(prompt_text, project)
         else:
-            response, sid, tool_lines, timed_out = run_claude(prompt_text, project)
+            # 한 턴에 시각이 다른 발화가 여러 개 나올 수 있다(백그라운드 작업 완료로 턴 재개).
+            # 각 발화를 따로 받아 개별 메시지로 보내면 각자의 타임스탬프가 찍힌다.
+            response, sid, tool_lines, timed_out = run_claude(prompt_text, project, segments_out=_segments)
 
         # Timeout auto-followup: 타임아웃 시 자동으로 1회 후속 질문
         from daemon.globals import SESSION_MANAGER_PROJECT
@@ -378,12 +381,16 @@ class Worker(threading.Thread):
             # Rewriter — skip for manager-injected messages
             from daemon.manager.thread import ManagerThread
             is_manager_msg = text.startswith(ManagerThread.MANAGER_PREFIX)
-            if not text.startswith("/") and not is_manager_msg:
-                response = rewrite_for_voice(response)
+            _do_rewrite = not text.startswith("/") and not is_manager_msg
 
-            chunks = _split_text_chunks(response)
-            for chunk in chunks:
-                self.reply(chunk, reply_to=[msg_id], project=project, is_final=True)
+            # 발화가 여러 개면 각각 별도 메시지로 → 각자 자기 시각이 찍혀 맥락 파악이 쉬워진다.
+            # 하나뿐이면(대부분) 기존과 동일하게 합본 하나만 보낸다.
+            _outgoing = _segments if len(_segments) > 1 else [response]
+            for _msg_text in _outgoing:
+                if _do_rewrite:
+                    _msg_text = rewrite_for_voice(_msg_text)
+                for chunk in _split_text_chunks(_msg_text):
+                    self.reply(chunk, reply_to=[msg_id], project=project, is_final=True)
 
         self.reply("", reply_to=None, project=project, is_final=False)
 

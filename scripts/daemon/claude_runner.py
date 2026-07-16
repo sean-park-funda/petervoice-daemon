@@ -191,6 +191,11 @@ def run_claude(
     session_key_override: str | None = None,
     prompt_override: str | None = None,
     stream_to_chat: bool = True,
+    # 한 턴에서 나온 완결 발화들(result 이벤트별)을 받아갈 리스트.
+    # 백그라운드 작업이 끝나며 턴이 재개되면 발화가 여러 개 생기고, 서로 시각이 다르다.
+    # 리스트를 넘기면 각 발화가 따로 담긴다 → 호출자가 별도 메시지로 보낼 수 있다.
+    # 안 넘기면 기존과 동일하게 합쳐진 response_text만 쓰면 된다.
+    segments_out: list[str] | None = None,
 ) -> tuple[str, str | None, list[str], bool]:
     api_key = config["api_key"]
 
@@ -337,6 +342,7 @@ def run_claude(
         )
 
         response_text = ""
+        result_segments: list[str] = []
         new_session_id = sid
         last_stream_time = time.time()
         last_activity_time = time.time()
@@ -482,11 +488,11 @@ def run_claude(
                     # (run_in_background 서브에이전트 완료 시 턴이 재개되며 두 번째 result 발생)
                     # 각 result는 '완결된 메시지'이므로 첫 것만 남기지 말고 모두 이어붙인다.
                     # (예전엔 `not response_text.strip()` 가드가 2번째 이후 result를 버려 백그라운드 결과가 유실됨)
+                    # 각 result는 '다른 시각에 끝난' 별개의 발화다.
+                    # (예: "분석 중입니다" → 수 분 뒤 "분석 완료했습니다")
+                    result_segments.append(_rtxt)
                     if response_text.strip():
-                        # 각 result는 '다른 시각에 끝난' 별개의 발화다.
-                        # (예: "분석 중입니다" → 수 분 뒤 "분석 완료했습니다")
-                        # 그냥 이어붙이면 한 덩어리로 보여 시간 간격이 안 드러나므로
-                        # 마크다운 구분선을 넣어 발화 경계를 시각적으로 표시한다.
+                        # 합본(programmatic 호출자용)에는 구분선으로 발화 경계를 표시
                         response_text = response_text.rstrip() + "\n\n---\n\n" + _rtxt
                     else:
                         response_text = _rtxt
@@ -507,7 +513,8 @@ def run_claude(
                             time.sleep(wait)
                             # D9-B: forward team params on retry
                             return run_claude(prompt, project, _retry_count, _overload_retry + 1,
-                                session_key_override=session_key_override, prompt_override=prompt_override, stream_to_chat=stream_to_chat)
+                                session_key_override=session_key_override, prompt_override=prompt_override, stream_to_chat=stream_to_chat,
+                                segments_out=segments_out)
                         return ("(Anthropic 서버 과부하 - 잠시 후 다시 시도해주세요)", new_session_id, tool_lines, False)
                     if "could not process image" in error_text.lower() or "invalid_request_error" in error_text.lower():
                         logger.warning(f"[{bot_name}] Image/request error for {project}, resetting session (retry {_retry_count + 1})")
@@ -520,7 +527,8 @@ def run_claude(
                         if _retry_count >= MAX_CONTEXT_OVERFLOW_RETRIES:
                             return ("(이미지 처리 오류 - 세션이 초기화되었습니다. 다시 말씀해주세요.)", None, tool_lines, False)
                         return run_claude(prompt, project, _retry_count + 1, 0,
-                            session_key_override=session_key_override, prompt_override=prompt_override, stream_to_chat=stream_to_chat)
+                            session_key_override=session_key_override, prompt_override=prompt_override, stream_to_chat=stream_to_chat,
+                                segments_out=segments_out)
                     if "context" in error_text.lower() or "prompt is too long" in error_text.lower():
                         logger.warning(f"[{bot_name}] Context overflow for {project}, resetting (retry {_retry_count + 1})")
                         conv = _fetch_recent_conversation(project, limit=10)
@@ -532,7 +540,8 @@ def run_claude(
                         if _retry_count >= MAX_CONTEXT_OVERFLOW_RETRIES:
                             return ("(컨텍스트 초과 - 최대 재시도 횟수 초과)", None, tool_lines, False)
                         return run_claude(prompt, project, _retry_count + 1, 0,
-                            session_key_override=session_key_override, prompt_override=prompt_override, stream_to_chat=stream_to_chat)
+                            session_key_override=session_key_override, prompt_override=prompt_override, stream_to_chat=stream_to_chat,
+                                segments_out=segments_out)
                     if _text_signals_auth_expired(error_text):
                         # Do NOT touch credentials/Keychain — Claude CLI manages its own token
                         # refresh, and deleting the Keychain entry can destroy the only valid
@@ -557,7 +566,8 @@ def run_claude(
                 if _retry_count >= MAX_CONTEXT_OVERFLOW_RETRIES:
                     return ("(컨텍스트 초과 - 최대 재시도 횟수 초과)", None, tool_lines, False)
                 return run_claude(prompt, project, _retry_count + 1, 0,
-                    session_key_override=session_key_override, prompt_override=prompt_override, stream_to_chat=stream_to_chat)
+                    session_key_override=session_key_override, prompt_override=prompt_override, stream_to_chat=stream_to_chat,
+                                segments_out=segments_out)
             if "no conversation found" in stderr_output.lower():
                 logger.warning(f"[{bot_name}] Invalid session for {project}, clearing and retrying")
                 reset_session(project, key_override=_sid_key)
@@ -565,7 +575,8 @@ def run_claude(
                 if _retry_count >= MAX_CONTEXT_OVERFLOW_RETRIES:
                     return ("(세션 오류 - 최대 재시도 횟수 초과)", None, tool_lines, False)
                 return run_claude(prompt, project, _retry_count + 1, 0,
-                    session_key_override=session_key_override, prompt_override=prompt_override, stream_to_chat=stream_to_chat)
+                    session_key_override=session_key_override, prompt_override=prompt_override, stream_to_chat=stream_to_chat,
+                                segments_out=segments_out)
             # stderr 에 인증만료 텍스트가 직접 보이면 즉시 재로그인
             if _text_signals_auth_expired(stderr_output):
                 logger.warning(f"[{bot_name}] Auth expired (stderr) for {project}: starting self-service re-login")
@@ -591,7 +602,8 @@ def run_claude(
             reset_session(project, key_override=_sid_key)
             g.claude_semaphore.release()
             return run_claude(prompt, project, _retry_count + 1, 0,
-                session_key_override=session_key_override, prompt_override=prompt_override, stream_to_chat=stream_to_chat)
+                session_key_override=session_key_override, prompt_override=prompt_override, stream_to_chat=stream_to_chat,
+                                segments_out=segments_out)
 
         if new_session_id:
             # D7: save session by overridden key when team member
@@ -601,6 +613,9 @@ def run_claude(
             if is_branch and new_session_id != sid and not session_key_override:
                 from daemon.branches import update_branch_session
                 update_branch_session(int(project.split(":")[1]), new_session_id)
+
+        if segments_out is not None:
+            segments_out[:] = [s.strip() for s in result_segments if s.strip()]
 
         return (response_text, new_session_id, tool_lines, False)
 
