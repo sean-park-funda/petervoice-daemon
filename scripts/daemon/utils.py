@@ -41,6 +41,31 @@ def download_files(files: list[dict]) -> list[Path]:
     return local_paths
 
 
+def resolve_files(files: list[dict]) -> tuple[list[Path], list[Path]]:
+    """첨부 파일들을 (전체 경로 목록, 정리 대상 임시 경로 목록)으로 변환한다.
+
+    - `local_path`가 있고 실재하면: 맥미니에 이미 있는 파일(채팅→docs/uploaded 직행 업로드).
+      그대로 사용하고 **절대 삭제하지 않는다** (유저의 문서 폴더 원본).
+    - 그 외(구 메시지/봇 발신/폴백): 기존처럼 URL에서 다운로드 → 처리 후 삭제 대상.
+    """
+    if not files:
+        return [], []
+    local_paths: list[Path] = []
+    remote_files: list[dict] = []
+    for f in files:
+        lp = f.get("local_path")
+        if lp:
+            p = Path(lp)
+            if p.exists() and p.is_file():
+                local_paths.append(p)
+                logger.info(f"Using local upload: {f.get('name', p.name)} → {p}")
+                continue
+            logger.warning(f"local_path missing on disk, falling back to URL: {lp}")
+        remote_files.append(f)
+    downloaded = download_files(remote_files)
+    return local_paths + downloaded, downloaded
+
+
 def cleanup_downloads(paths: list[Path]):
     """Clean up downloaded files after processing."""
     for p in paths:

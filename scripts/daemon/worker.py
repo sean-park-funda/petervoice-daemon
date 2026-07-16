@@ -27,7 +27,7 @@ from daemon.tasks import (
 from daemon.prompts import get_prompt_file, build_system_prompt
 from daemon.claude_runner import run_claude, run_codex, rewrite_for_voice, SHUTDOWN_INTERRUPTED
 from daemon.queue import enqueue_message, dequeue_message
-from daemon.utils import download_files, cleanup_downloads, _split_text_chunks, _read_json, _write_json
+from daemon.utils import resolve_files, cleanup_downloads, _split_text_chunks, _read_json, _write_json
 from daemon.encryption import decrypt_message, get_encryptor
 # kanban messages now flow through messages table — no separate kanban import needed
 
@@ -103,7 +103,9 @@ class Worker(threading.Thread):
             mark_message_processed(msg_id)
 
         files = msg.get("files", [])
-        downloaded_paths = download_files(files) if files else []
+        # downloaded_paths = 프롬프트에 넘길 전체 경로, _ephemeral_paths = 처리 후 삭제할 임시 다운로드만
+        # (local_path 파일은 유저 docs/uploaded 원본이라 삭제 금지)
+        downloaded_paths, _ephemeral_paths = resolve_files(files) if files else ([], [])
 
         if not text and not downloaded_paths:
             return
@@ -403,8 +405,8 @@ class Worker(threading.Thread):
 
         self.reply("", reply_to=None, project=project, is_final=False)
 
-        if downloaded_paths:
-            cleanup_downloads(downloaded_paths)
+        if _ephemeral_paths:
+            cleanup_downloads(_ephemeral_paths)
 
         dequeue_message(msg_id)
 
