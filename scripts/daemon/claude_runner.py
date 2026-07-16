@@ -53,6 +53,13 @@ _AUTH_EXPIRED_MARKERS = (
 )
 
 
+def _auth_diag(spawn_concurrency: int) -> str:
+    """인증만료 시점의 진단 정보. 만료 순간 병렬 스폰이 겹치면 refresh-token 갱신 경합으로
+    토큰 패밀리가 폐기된다는 가설(2026-07-10~15 연쇄 로그아웃)을 데이터로 확증하기 위함."""
+    idle = (time.time() - g.last_claude_ok) if g.last_claude_ok else -1
+    return f"[auth-diag concurrent_spawns={spawn_concurrency} idle_before={idle:.0f}s]"
+
+
 def _text_signals_auth_expired(text: str) -> bool:
     if not text:
         return False
@@ -331,8 +338,15 @@ def run_claude(
         logger.info(f"[{bot_name}] Claude: project={project}, dir={project_dir}, session={sid or 'new'}")
 
     total_usage = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "model": ""}
+    _counted = False
+    _spawn_concurrency = 0   # 진단용 기본값 (로그 경로에서 NameError 나지 않도록)
     try:
         g.claude_semaphore.acquire()
+        # 인증만료 진단: 이 스폰 시점의 동시 실행 수 기록 (RT 갱신 레이스 가설 확증용)
+        with g.claude_inflight_lock:
+            g.claude_inflight += 1
+            _spawn_concurrency = g.claude_inflight
+        _counted = True
         claude_env = {
             **{k: v for k, v in os.environ.items() if k != "CLAUDECODE"},
             "LANG": "en_US.UTF-8",
@@ -563,7 +577,7 @@ def run_claude(
                         # Do NOT touch credentials/Keychain — Claude CLI manages its own token
                         # refresh, and deleting the Keychain entry can destroy the only valid
                         # credential source (file may be expired while Keychain is valid).
-                        logger.warning(f"[{bot_name}] Auth expired for {project}: starting self-service re-login")
+                        logger.warning(f"[{bot_name}] Auth expired for {project}: starting self-service re-login {_auth_diag(_spawn_concurrency)}")
                         proc.kill()
                         g.claude_semaphore.release()
                         return (_trigger_relogin(project, account_config_dir), new_session_id, tool_lines, False)
@@ -596,12 +610,12 @@ def run_claude(
                                 segments_out=segments_out)
             # stderr 에 인증만료 텍스트가 직접 보이면 즉시 재로그인
             if _text_signals_auth_expired(stderr_output):
-                logger.warning(f"[{bot_name}] Auth expired (stderr) for {project}: starting self-service re-login")
+                logger.warning(f"[{bot_name}] Auth expired (stderr) for {project}: starting self-service re-login {_auth_diag(_spawn_concurrency)}")
                 g.claude_semaphore.release()
                 return (_trigger_relogin(project, account_config_dir), new_session_id, tool_lines, False)
             # 원인 불명(exit≠0 & stderr 빈값 & 응답 빈값) → plain 프로브로 인증만료 확정 (hoon 사례)
             if not stderr_output and _probe_auth_expired(account_config_dir):
-                logger.warning(f"[{bot_name}] Auth expired (probe) for {project}: starting self-service re-login")
+                logger.warning(f"[{bot_name}] Auth expired (probe) for {project}: starting self-service re-login {_auth_diag(_spawn_concurrency)}")
                 g.claude_semaphore.release()
                 return (_trigger_relogin(project, account_config_dir), new_session_id, tool_lines, False)
             return (f"(Claude 오류: exit {proc.returncode})", new_session_id, tool_lines, False)
@@ -636,6 +650,8 @@ def run_claude(
             # (안 벗기면 발화가 2개 이상일 때만 raw escape 가 채팅에 노출되는 불일치가 생김)
             segments_out[:] = [t for t in (_strip_ansi(s).strip() for s in result_segments) if t]
 
+        # 정상 완료 = 이 시점엔 access token 이 유효했다는 뜻 (토큰 신선도 기준점)
+        g.last_claude_ok = time.time()
         return (response_text, new_session_id, tool_lines, False)
 
     except subprocess.TimeoutExpired:
@@ -658,6 +674,9 @@ def run_claude(
                 })
             except Exception as e:
                 logger.warning(f"[{bot_name}] Usage report failed: {e}")
+        if _counted:
+            with g.claude_inflight_lock:
+                g.claude_inflight -= 1
         try:
             g.claude_semaphore.release()
         except ValueError:
