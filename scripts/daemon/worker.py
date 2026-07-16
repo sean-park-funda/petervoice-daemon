@@ -25,7 +25,7 @@ from daemon.tasks import (
     get_current_task, get_task_description, set_current_task, list_tasks,
 )
 from daemon.prompts import get_prompt_file, build_system_prompt
-from daemon.claude_runner import run_claude, run_codex, rewrite_for_voice
+from daemon.claude_runner import run_claude, run_codex, rewrite_for_voice, SHUTDOWN_INTERRUPTED
 from daemon.queue import enqueue_message, dequeue_message
 from daemon.utils import download_files, cleanup_downloads, _split_text_chunks, _read_json, _write_json
 from daemon.encryption import decrypt_message, get_encryptor
@@ -41,6 +41,9 @@ class Worker(threading.Thread):
         self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="msg")
         self._spawned_ids: set[int] = set()
         self._spawned_lock = threading.Lock()
+        # 실제 처리 중인 턴 수 — 종료 드레인 시 main()이 0이 될 때까지 대기
+        self._inflight = 0
+        self._inflight_lock = threading.Lock()
 
     def poll(self) -> list | None:
         result = api_request(self.api_key, "GET", "/api/bot/poll", timeout=30)
@@ -367,6 +370,12 @@ class Worker(threading.Thread):
             # 각 발화를 따로 받아 개별 메시지로 보내면 각자의 타임스탬프가 찍힌다.
             response, sid, tool_lines, timed_out = run_claude(prompt_text, project, segments_out=_segments)
 
+        # 종료 드레인 상한 초과로 턴이 kill됨 — 응답 전송/dequeue 없이 종료해
+        # 메시지를 큐에 남긴다. 재시작 후 _recover_after_restart가 --resume으로 재처리.
+        if response == SHUTDOWN_INTERRUPTED:
+            logger.info(f"[{self.bot_name}] msg #{msg_id} interrupted by shutdown — left in queue for auto-resume")
+            return
+
         # Timeout auto-followup: 타임아웃 시 자동으로 1회 후속 질문
         from daemon.globals import SESSION_MANAGER_PROJECT
         _is_manager_project = (_check_project == SESSION_MANAGER_PROJECT or project == SESSION_MANAGER_PROJECT)
@@ -401,8 +410,8 @@ class Worker(threading.Thread):
 
         logger.info(f"[{self.bot_name}] Replied msg #{msg_id}: {len(response)} chars, team={_is_team}")
 
-        # Timeout auto-followup: 타임아웃 후 자동 1회 후속 질문 실행
-        if timed_out and not is_timeout_followup and not _is_team and not _is_manager_project:
+        # Timeout auto-followup: 타임아웃 후 자동 1회 후속 질문 실행 (종료 중엔 새 턴 시작 금지)
+        if timed_out and not is_timeout_followup and not _is_team and not _is_manager_project and not shutdown_event.is_set():
             logger.info(f"[{self.bot_name}] Executing timeout auto-followup for {project}")
             followup_msg = {
                 "id": f"timeout_followup_{msg_id}",
@@ -425,21 +434,35 @@ class Worker(threading.Thread):
         msg_id = msg.get("id")
         project = msg.get("project", "general") or "general"
         lock = self._get_project_lock(project)
-        with lock:
-            try:
-                self.process_message(msg)
-            except Exception as e:
-                logger.error(f"[{self.bot_name}] Error msg {msg_id}: {e}", exc_info=True)
+        with self._inflight_lock:
+            self._inflight += 1
+        try:
+            with lock:
+                if shutdown_event.is_set():
+                    # 종료 중 새 턴 시작 금지 — 메시지는 서버에 미처리로 남아
+                    # (또는 큐에 남아) 재시작 후 재전달/재처리된다.
+                    logger.info(f"[{self.bot_name}] msg {msg_id} skipped (shutting down) — will be reprocessed after restart")
+                    return
                 try:
-                    self.reply(f"(처리 오류: {e})", reply_to=[msg_id], project=project)
-                except Exception:
-                    pass
-            finally:
-                with active_projects_lock:
-                    active_projects.discard(project)
-                with self._spawned_lock:
-                    self._spawned_ids.discard(msg_id)
-                self.heartbeat(is_working=False)
+                    self.process_message(msg)
+                except Exception as e:
+                    logger.error(f"[{self.bot_name}] Error msg {msg_id}: {e}", exc_info=True)
+                    try:
+                        self.reply(f"(처리 오류: {e})", reply_to=[msg_id], project=project)
+                    except Exception:
+                        pass
+        finally:
+            with active_projects_lock:
+                active_projects.discard(project)
+            with self._spawned_lock:
+                self._spawned_ids.discard(msg_id)
+            with self._inflight_lock:
+                self._inflight -= 1
+            self.heartbeat(is_working=False)
+
+    def inflight_count(self) -> int:
+        with self._inflight_lock:
+            return self._inflight
 
     def run(self):
         import time

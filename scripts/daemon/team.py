@@ -441,6 +441,11 @@ def run_members_parallel(
                 logger.error(f"[team] Member {member['member_key']} failed: {e}")
                 response = f"(응답 실패: {e})"
 
+            from daemon.claude_runner import SHUTDOWN_INTERRUPTED
+            if response == SHUTDOWN_INTERRUPTED:
+                logger.info(f"[team] Member {member['member_key']} interrupted by shutdown — skipping reply")
+                continue
+
             display = format_crosstalk_for_display(
                 strip_crosstalk(response) if not parse_crosstalk(response) else response,
                 member, member_map,
@@ -509,6 +514,11 @@ def run_lead_followup_round(
         prompt_override=lead_prompt,
         stream_to_chat=False,
     )
+
+    from daemon.claude_runner import SHUTDOWN_INTERRUPTED
+    if lead_response == SHUTDOWN_INTERRUPTED:
+        logger.info("[team] Lead followup interrupted by shutdown — skipping")
+        return []
 
     followup_delegates = parse_delegates(lead_response)
 
@@ -583,6 +593,11 @@ def run_crosstalk_round(
             except Exception as e:
                 logger.error(f"[team] Crosstalk member {recipient_key} failed: {e}")
                 response = f"(응답 실패: {e})"
+
+            from daemon.claude_runner import SHUTDOWN_INTERRUPTED
+            if response == SHUTDOWN_INTERRUPTED:
+                logger.info(f"[team] Crosstalk member {recipient_key} interrupted by shutdown — skipping reply")
+                continue
 
             outgoing = parse_crosstalk(response)
             for out in outgoing:
@@ -797,6 +812,11 @@ def handle_direct_member_message(
         stream_to_chat=False,
     )
 
+    from daemon.claude_runner import SHUTDOWN_INTERRUPTED
+    if response == SHUTDOWN_INTERRUPTED:
+        # 종료 드레인 초과 — 응답 없이 센티널 전파 (worker가 dequeue를 건너뜀)
+        return (SHUTDOWN_INTERRUPTED, tools)
+
     worker.reply(
         response,
         reply_to=[msg_id], project=project, is_final=True,
@@ -854,6 +874,11 @@ def process_team_message(
         stream_to_chat=False,
     )
     all_tool_lines.extend(lead_tools)
+
+    from daemon.claude_runner import SHUTDOWN_INTERRUPTED
+    if lead_response == SHUTDOWN_INTERRUPTED:
+        # 종료 드레인 초과 — 센티널 전파 (worker가 응답/dequeue를 건너뛰어 자동재개)
+        return (SHUTDOWN_INTERRUPTED, all_tool_lines)
 
     delegates = parse_delegates(lead_response)
     member_map = {m["member_key"]: m for m in team["members"]}
@@ -938,6 +963,9 @@ def process_team_message(
         stream_to_chat=True,
     )
     all_tool_lines.extend(summary_tools)
+
+    if summary_response == SHUTDOWN_INTERRUPTED:
+        return (SHUTDOWN_INTERRUPTED, all_tool_lines)
 
     worker.reply(summary_response, reply_to=[msg_id], project=project, is_final=True)
 

@@ -98,6 +98,14 @@ def _recover_after_restart(worker):
                     logger.info(f"[recovery] {project}: response missing, reprocessing")
                 with worker._spawned_lock:
                     worker._spawned_ids.add(msg_id)
+                # 같은 세션을 --resume 하므로 완료된 작업의 반복(이중 부작용)을 막는 안내를 붙인다.
+                # 큐에는 원본 msg가 남아있어(id 기준 dedupe) 프리픽스가 중첩되지 않는다.
+                msg = dict(msg)
+                msg["text"] = (
+                    "[안내: 직전 턴이 데몬 재시작으로 중단되었습니다. "
+                    "이미 완료된 작업은 반복하지 말고, 중단 지점부터 이어서 진행한 뒤 결과를 보고하세요.]\n\n"
+                    + msg.get("text", "")
+                )
                 worker._executor.submit(worker._process_message_safe, msg)
 
 
@@ -613,6 +621,38 @@ def _migrate_manager_config():
     logger.info("[migrate] Added default manager block (enabled, projects=[]) to config")
 
 
+def _ensure_launchd_exit_timeout():
+    """launchd SIGKILL grace(ExitTimeOut)를 드레인 상한보다 길게 보정.
+
+    현재 로드된 job의 grace는 기본 5초라 launchctl stop 시 드레인이 불가능하다.
+    plist 수정은 다음 로드(재부팅 또는 bootout/bootstrap)부터 적용된다.
+    적용 전까지 launchctl stop 경로는 짧은 grace로 SIGKILL되지만, 그 경우에도
+    메시지가 큐에 남아 자동재개되므로 동작은 올바르다(드레인만 못 할 뿐).
+    AutoUpdater//restart/웹 강제재시작은 자체 exit 경로라 launchd grace와 무관하게
+    항상 드레인된다.
+    """
+    if sys.platform != "darwin":
+        return
+    try:
+        import plistlib
+        from pathlib import Path
+        plist_path = Path.home() / "Library" / "LaunchAgents" / "com.petervoice.claude-daemon.plist"
+        if not plist_path.exists():
+            return
+        with open(plist_path, "rb") as f:
+            plist = plistlib.load(f)
+        desired = int(config.get("shutdown_drain_sec", 90)) + 30
+        current = plist.get("ExitTimeOut")
+        if isinstance(current, int) and current >= desired:
+            return
+        plist["ExitTimeOut"] = desired
+        with open(plist_path, "wb") as f:
+            plistlib.dump(plist, f)
+        logger.info(f"[migrate] Set ExitTimeOut={desired} in daemon plist (applies on next launchd load)")
+    except Exception as e:
+        logger.warning(f"[migrate] Could not update daemon plist ExitTimeOut: {e}")
+
+
 def main():
     setup_logging()
     logger.info("=" * 60)
@@ -629,6 +669,7 @@ def main():
         load_config()
         _sanitize_config()
         _migrate_manager_config()
+        _ensure_launchd_exit_timeout()
         load_sessions()
         load_codex_sessions()
         load_tasks()
@@ -758,7 +799,25 @@ def main():
                 except Exception as e:
                     logger.warning(f"relogin poll error: {e}")
 
+        # 드레인 종료: 새 작업 수령은 이미 중단됨(worker 루프 종료 + pending future 취소).
+        # 진행 중인 claude/codex 턴은 완주를 기다린다. 각 턴은 claude_runner가
+        # shutdown_drain_sec 상한에서 스스로 kill + 센티널 반환하므로(큐 보존 → 자동재개)
+        # 여기서는 그보다 약간 긴 상한으로 in-flight가 0이 되기를 기다린다.
+        # 유휴 상태(in-flight 0)면 대기 없이 즉시 종료된다.
+        import time as _time
         worker._executor.shutdown(wait=False, cancel_futures=True)
+        _drain_sec = config.get("shutdown_drain_sec", 90)
+        _deadline = _time.time() + _drain_sec + 15
+        _inflight = worker.inflight_count()
+        if _inflight:
+            logger.info(f"Draining {_inflight} in-flight turn(s) before exit (up to {_drain_sec}s)...")
+        while worker.inflight_count() > 0 and _time.time() < _deadline:
+            _time.sleep(0.5)
+        _remaining = worker.inflight_count()
+        if _remaining:
+            logger.warning(f"Drain window elapsed with {_remaining} turn(s) still running — exiting; queued messages will auto-resume")
+        elif _inflight:
+            logger.info("Drain complete — all in-flight turns finished")
         worker.join(timeout=5)
 
     except KeyboardInterrupt:

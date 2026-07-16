@@ -32,6 +32,13 @@ from daemon.tasks import get_current_task, get_task_description
 from daemon.prompts import get_prompt_file, build_system_prompt, build_connected_services_note
 
 
+# ── 종료 드레인 센티널 ─────────────────────────────────────────
+# 드레인 상한 초과로 턴이 kill됐음을 나타내는 내부 마커.
+# worker/team은 이 값을 받으면 응답 전송·dequeue를 모두 건너뛴다
+# → 메시지가 큐에 남아 재시작 후 _recover_after_restart가 --resume으로 재처리.
+SHUTDOWN_INTERRUPTED = "__PV_SHUTDOWN_INTERRUPTED__"
+
+
 # ── 인증만료 감지 & 재로그인 트리거 (macOS 셀프서비스) ─────────────
 # 완전 로그아웃(hoon 사례)은 401 텍스트 없이 exit 1 + stderr 빈값으로 새어나가고,
 # `claude auth status`는 거짓보고(loggedIn:true)하므로 status 로는 판별 불가.
@@ -354,11 +361,21 @@ def run_claude(
         stream_interval = config.get("stream_interval_sec", 2.0)
         tool_lines = []
         total_usage = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "model": ""}
+        _drain_deadline = None
 
         while True:
             if shutdown_event.is_set():
-                proc.terminate()
-                return ("(데몬 종료 중)", new_session_id, tool_lines, False)
+                # 드레인 종료: 진행 중 턴은 상한까지 완주시킨다.
+                # 상한 초과 시에만 kill — 이때 응답을 보내지 않고 센티널을 반환해
+                # 메시지가 큐에 남게 한다 (재시작 후 --resume 자동재개).
+                if _drain_deadline is None:
+                    _drain_sec = config.get("shutdown_drain_sec", 90)
+                    _drain_deadline = time.time() + _drain_sec
+                    logger.info(f"[{bot_name}] Shutdown requested — draining claude turn for {project} (up to {_drain_sec}s)")
+                elif time.time() >= _drain_deadline:
+                    logger.warning(f"[{bot_name}] Drain limit exceeded for {project} — killing claude; message stays queued for auto-resume")
+                    proc.kill()
+                    return (SHUTDOWN_INTERRUPTED, new_session_id, tool_lines, False)
 
             elapsed = time.time() - process_start_time
             effective_hard_timeout = hard_timeout_with_tools if last_tool_time > 0 else hard_timeout
@@ -862,10 +879,19 @@ def run_codex(prompt: str, project: str, _retry_count: int = 0) -> tuple[str, st
         hard_timeout = config.get("claude_hard_timeout_sec", 900)
         stream_interval = config.get("stream_interval_sec", 2.0)
 
+        _drain_deadline = None
+
         while True:
             if shutdown_event.is_set():
-                proc.terminate()
-                return ("(데몬 종료 중)", new_session_id, tool_lines, False)
+                # 드레인 종료 (run_claude와 동일): 상한까지 완주, 초과 시에만 kill+센티널
+                if _drain_deadline is None:
+                    _drain_sec = config.get("shutdown_drain_sec", 90)
+                    _drain_deadline = time.time() + _drain_sec
+                    logger.info(f"[{bot_name}] Shutdown requested — draining codex turn for {project} (up to {_drain_sec}s)")
+                elif time.time() >= _drain_deadline:
+                    logger.warning(f"[{bot_name}] Drain limit exceeded for {project} — killing codex; message stays queued for auto-resume")
+                    proc.kill()
+                    return (SHUTDOWN_INTERRUPTED, new_session_id, tool_lines, False)
 
             elapsed = time.time() - process_start_time
             if elapsed > hard_timeout:
