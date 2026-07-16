@@ -615,7 +615,9 @@ def run_claude(
                 update_branch_session(int(project.split(":")[1]), new_session_id)
 
         if segments_out is not None:
-            segments_out[:] = [s.strip() for s in result_segments if s.strip()]
+            # response_text 와 동일하게 ANSI 이스케이프를 벗긴다.
+            # (안 벗기면 발화가 2개 이상일 때만 raw escape 가 채팅에 노출되는 불일치가 생김)
+            segments_out[:] = [t for t in (_strip_ansi(s).strip() for s in result_segments) if t]
 
         return (response_text, new_session_id, tool_lines, False)
 
