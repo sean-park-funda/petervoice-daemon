@@ -1,4 +1,4 @@
-"""Session health checker thread with stall detection."""
+"""Session health checker thread."""
 
 from datetime import datetime
 import time
@@ -14,10 +14,9 @@ from daemon.api import api_request
 
 
 class SessionHealthChecker(threading.Thread):
-    """Periodically checks session health and detects stalled conversations."""
+    """Periodically reports active-session health to session-manager."""
 
     HEALTH_CHECK_INTERVAL = 2 * 3600  # 2 hours
-    STALL_CHECK_INTERVAL = 3600       # 60 minutes
 
     def __init__(self):
         super().__init__(daemon=True, name="session-health-checker")
@@ -85,7 +84,6 @@ class SessionHealthChecker(threading.Thread):
 
 ## 역할
 1. **세션 건강 관리**: 정기 리포트를 받고, 리셋이 필요한 세션을 Sean에게 제안
-2. **Stall Detection**: 에이전트가 응답해야 하는데 못 하고 있으면 릴레이로 깨움
 
 ## 대화 조회 방법
 
@@ -118,38 +116,6 @@ with open('$HOME/.claude-daemon/pending_resets.json', 'w') as f:
 
 ### TTL 초과 세션
 TTL(24시간) 초과 세션은 승인 없이 즉시 리셋. 리셋 후 보고.
-
-## Stall Detection ([stall-check 리포트] 수신 시)
-
-### 깨워야 하는 경우
-- "잠시만요", "확인해드릴게요" 등 미완료 약속 후 30분 이상 침묵
-- 타임아웃/에러로 끊긴 흔적
-
-### 깨우지 않아야 하는 경우
-- 자연스럽게 끝난 대화 ("감사합니다", "다 됐어", 결과 보고 후 침묵)
-- 유저가 의도적 보류 ("나중에", "내일")
-- 유저 메시지가 마지막
-
-### 깨우는 방법 (중요: 지시 금지)
-
-**절대 구체적 작업 지시를 하지 말 것.** 당신은 깨우기만 하고, 무엇을 할지는 해당 에이전트가 스스로 판단한다.
-
-- OK: "[stall-check] 비정상 종료로 보입니다. 이전 작업 상태를 확인해주세요."
-- NG: "[stall-check] 1단계 작업을 다시 시작하세요." ← 이런 지시 금지!
-
-```bash
-API_URL=$(python3 -c "import json; c=json.load(open('$HOME/.claude-daemon/config.json')); print(c.get('api_url', 'https://www.peter-voice.site'))")
-API_KEY=$(python3 -c "import json; print(json.load(open('$HOME/.claude-daemon/config.json'))['api_key'])")
-
-curl -X POST "$API_URL/api/relay/message" \\
-  -H "X-Api-Key: $API_KEY" -H "Content-Type: application/json" \\
-  -d '{"from_project": "session-manager", "to_project": "대상", "text": "[stall-check] 비정상 종료로 보입니다. 이전 작업 상태를 확인해주세요."}'
-```
-
-### 응답 규칙 (토큰 절약)
-- 깨울 대상 없으면: **"없음"** 한 마디로 끝
-- 깨울 대상 있으면: nudge 후 한 줄 보고
-- 같은 대상에 연속 nudge 금지
 
 ## 원칙
 - 기계적 임계값이 아니라 맥락으로 판단
@@ -250,94 +216,11 @@ curl -X POST "$API_URL/api/relay/message" \\
         else:
             logger.error("[session-health] Failed to send report")
 
-    MAX_REPORT_CHARS = 3000  # session-manager가 꼼꼼히 읽을 수 있는 크기
-    SNIPPET_CHARS = 1200     # 세션별 대화 스니펫 최대 길이
-
-    def _build_session_block(self, info: dict) -> str:
-        """Build a single session block for the stall report."""
-        project = info["project"]
-        conv = _fetch_recent_conversation(project, limit=5)
-        recent = conv[-self.SNIPPET_CHARS:] if conv else "(최근 대화 없음)"
-        return (
-            f"### {project}\n"
-            f"- 미사용: {info['idle_hours']}시간\n"
-            f"- 최근 대화:\n```\n{recent}\n```"
-        )
-
-    def _make_report_header(self, batch_num: int, total_batches: int, total_sessions: int) -> str:
-        ts = datetime.now().strftime('%Y-%m-%d %H:%M')
-        batch_label = f" ({batch_num}/{total_batches})" if total_batches > 1 else ""
-        return (
-            f"[stall-check 리포트{batch_label} — {ts}]\n\n"
-            f"활성 세션 {total_sessions}개 중 아래 세션들의 최근 대화입니다.\n"
-            f"중단된 세션이 있으면 릴레이로 깨워주세요.\n"
-            f"단, 릴레이는 '이어서 진행해주세요' 정도만 — 구체적 작업 지시는 절대 금지.\n"
-            f"없으면 '없음' 한 마디로.\n\n"
-        )
-
-    def _check_stalls(self):
-        """Collect conversation snippets and ask session-manager to judge stalls."""
-        if not self._ensure_session_manager():
-            return
-        infos = self._get_all_sessions_info()
-        if not infos:
-            return
-
-        # Build blocks per session
-        blocks = []
-        for info in infos:
-            block = self._build_session_block(info)
-            blocks.append(block)
-
-        # Pack blocks into batches that fit within MAX_REPORT_CHARS
-        batches: list[list[str]] = []
-        current_batch: list[str] = []
-        current_size = 0
-        header_size = len(self._make_report_header(1, 1, len(infos)))
-
-        for block in blocks:
-            block_size = len(block) + 2  # +2 for "\n\n" separator
-            if current_batch and current_size + block_size > self.MAX_REPORT_CHARS - header_size:
-                batches.append(current_batch)
-                current_batch = []
-                current_size = 0
-            current_batch.append(block)
-            current_size += block_size
-
-        if current_batch:
-            batches.append(current_batch)
-
-        # Send each batch
-        api_key = config.get("api_key", "")
-        if not api_key:
-            return
-
-        sent = 0
-        for i, batch in enumerate(batches):
-            header = self._make_report_header(i + 1, len(batches), len(infos))
-            report = header + "\n\n".join(batch)
-
-            result = api_request(api_key, "POST", "/api/bot/message", body={
-                "project": SESSION_MANAGER_PROJECT,
-                "text": report,
-                "type": "user",
-                "subtype": "stall_check_report",
-                "processed": False,
-            }, timeout=10)
-
-            if result and result.get("id"):
-                sent += 1
-            else:
-                logger.error(f"[stall-check] Failed to send batch {i+1}/{len(batches)}")
-
-        logger.info(f"[stall-check] Sent {sent}/{len(batches)} batches ({len(infos)} sessions)")
-
     def run(self):
-        logger.info("[session-health] Started (health=2h, stall=30m)")
+        logger.info("[session-health] Started (health=2h)")
         shutdown_event.wait(1800)  # initial wait
 
         last_health = 0.0
-        last_stall = 0.0
 
         while not shutdown_event.is_set():
             now = time.time()
@@ -348,13 +231,6 @@ curl -X POST "$API_URL/api/relay/message" \\
                 except Exception as e:
                     logger.error(f"[session-health] Check error: {e}")
                 last_health = now
-
-            if now - last_stall >= self.STALL_CHECK_INTERVAL:
-                try:
-                    self._check_stalls()
-                except Exception as e:
-                    logger.error(f"[stall-check] Error: {e}")
-                last_stall = now
 
             shutdown_event.wait(60)  # tick every 60s
 
