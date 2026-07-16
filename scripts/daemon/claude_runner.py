@@ -483,9 +483,11 @@ def run_claude(
                     # 각 result는 '완결된 메시지'이므로 첫 것만 남기지 말고 모두 이어붙인다.
                     # (예전엔 `not response_text.strip()` 가드가 2번째 이후 result를 버려 백그라운드 결과가 유실됨)
                     if response_text.strip():
-                        if not response_text.endswith("\n\n"):
-                            response_text += "\n\n"
-                        response_text += _rtxt
+                        # 각 result는 '다른 시각에 끝난' 별개의 발화다.
+                        # (예: "분석 중입니다" → 수 분 뒤 "분석 완료했습니다")
+                        # 그냥 이어붙이면 한 덩어리로 보여 시간 간격이 안 드러나므로
+                        # 마크다운 구분선을 넣어 발화 경계를 시각적으로 표시한다.
+                        response_text = response_text.rstrip() + "\n\n---\n\n" + _rtxt
                     else:
                         response_text = _rtxt
                 if event.get("is_error"):
