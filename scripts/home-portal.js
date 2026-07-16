@@ -2033,6 +2033,12 @@ const server = http.createServer((req, res) => {
         const resolvedImg = docDir ? `${docDir}/${cleanPath}` : cleanPath;
         return `![${alt}](/api/docs/file?dir=${encodeURIComponent(dir)}&path=${encodeURIComponent(resolvedImg)}${token ? "&token=" + token : ""})`;
       });
+      // 상대 .md 링크를 공유 뷰어 URL로 변환 (안 하면 포탈이 인증 필요 응답)
+      content = content.replace(/(?<!!)\[([^\]]*)\]\((?!https?:|data:|mailto:|#|\/)([^)#]+\.md)(#[^)]*)?\)/g, (match, text, linkPath, hash) => {
+        const cleanPath = linkPath.startsWith("./") ? linkPath.slice(2) : linkPath;
+        const resolvedDoc = docDir ? `${docDir}/${cleanPath}` : cleanPath;
+        return `[${text}](/share?dir=${encodeURIComponent(dir)}&path=${encodeURIComponent(resolvedDoc)}${token ? "&token=" + token : ""}${hash || ""})`;
+      });
     }
 
     const escapedContent = content.replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/&/g, "&amp;");
