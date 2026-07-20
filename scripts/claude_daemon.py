@@ -315,6 +315,31 @@ _tunnel_kick_times: list[float] = []    # 최근 kickstart 타임스탬프(time.
 _TUNNEL_FAIL_THRESHOLD = 2              # 연속 N회 실패 시 조치(플래핑 방지)
 _TUNNEL_KICK_MAX_PER_HOUR = 2           # 시간당 최대 kickstart 횟수
 
+# --- 로컬 자원 고갈 방어 (hoon 2026-07-16 포트고갈 사고) ---
+# 포트 고갈(TIME_WAIT 폭증)로 프로브가 errno49(EADDRNOTAVAIL)로 실패하면, 이는
+# 원격 터널/홈포탈 고장이 아니라 로컬 자원 고갈이다. 그런데 기존 헬스체크는 이를
+# "홈포탈 다운"으로 오판하고 _ensure_home_portal()로 복구 → Cloudflare API 에 새
+# 연결을 더 만들어 포트를 더 소진 → 악순환(자가치유가 기름을 붓는다).
+# → 자원 고갈로 판별되면 복구를 트리거하지 않고 경고+지수백오프만 한다.
+_RESOURCE_EXHAUSTION_MARKERS = (
+    "can't assign requested address", "cannot assign requested address",
+    "errno 49", "eaddrnotavail",
+    "cannot allocate memory", "errno 12", "enomem",
+    "too many open files", "errno 24", "emfile",
+)
+_tunnel_exhaustion_streak = 0            # 연속 자원고갈 감지 횟수
+_last_recover_ts = 0.0                   # 마지막 _ensure_home_portal 복구 시각
+_recover_streak = 0                      # 연속 복구 시도 횟수 (지수 백오프용)
+_RECOVER_BACKOFF_BASE = 20               # 백오프 시작 간격(초): 20 → 40 → 80 … 최대 300
+
+
+def _looks_like_resource_exhaustion(note: str | None) -> bool:
+    """프로브 실패 사유가 로컬 자원 고갈(포트/메모리/FD)인지 판별."""
+    if not note:
+        return False
+    low = note.lower()
+    return any(m in low for m in _RESOURCE_EXHAUSTION_MARKERS)
+
 
 def _tunnel_url_from_config() -> str | None:
     """config의 username으로 자기 Home Portal 터널 URL을 계산.
@@ -336,6 +361,10 @@ def _http_status(url: str, timeout: float = 8.0) -> tuple[int | None, str]:
 
     status_code=None 이면 연결 실패/timeout (엣지 미도달).
     Cloudflare 엣지는 터널이 죽어도 응답은 하며 상태코드 530/1033 등으로 알림.
+
+    ⚠️ 계약: 실패 시 note 에는 OSError 의 원문(예: "[Errno 49] Can't assign requested
+    address")이 그대로 담긴다. _looks_like_resource_exhaustion() 이 이 문자열의 errno
+    토큰으로 로컬 자원고갈을 판별하므로, note 포맷을 바꾸면 그 가드가 깨진다.
     """
     import urllib.request
     import urllib.error
@@ -399,6 +428,26 @@ def _kickstart_cloudflared() -> bool:
         return False
 
 
+def _recover_home_portal(reason: str) -> bool:
+    """_ensure_home_portal() 을 지수 백오프로 호출. 스톰(고정 20s 재시도)로 인한
+    자원 소진을 막는다. 실제 호출 시 True, 백오프로 스킵 시 False."""
+    global _last_recover_ts, _recover_streak
+    import time
+    now = time.time()
+    interval = min(300, _RECOVER_BACKOFF_BASE * (2 ** _recover_streak))
+    if _last_recover_ts and now - _last_recover_ts < interval:
+        logger.warning(
+            f"[tunnel] recovery backoff active ({reason}); "
+            f"skipping _ensure_home_portal (next in {interval - (now - _last_recover_ts):.0f}s, streak={_recover_streak})"
+        )
+        return False
+    logger.warning(f"[tunnel] recovery trigger #{_recover_streak + 1} ({reason}) -> _ensure_home_portal()")
+    _last_recover_ts = now
+    _recover_streak += 1
+    _ensure_home_portal()
+    return True
+
+
 def _check_cloudflared_health():
     """2단계 헬스체크로 cloudflared 좀비 터널을 감지·자가치유.
 
@@ -406,7 +455,7 @@ def _check_cloudflared_health():
     2) 프로세스는 살아있지만 엣지 미연결('좀비')이면 launchctl kickstart로 재시작.
        - 연속 실패 임계치/시간당 backoff로 플래핑·무한루프 방지.
     """
-    global _tunnel_unreachable_streak
+    global _tunnel_unreachable_streak, _tunnel_exhaustion_streak, _recover_streak
 
     if not config.get("home_portal_enabled", True):
         return
@@ -426,7 +475,7 @@ def _check_cloudflared_health():
     if result.returncode != 0:
         logger.warning("[tunnel] cloudflared not running, recovering...")
         _tunnel_unreachable_streak = 0
-        _ensure_home_portal()
+        _recover_home_portal("cloudflared process dead")
         return
 
     # --- 2단계: 외부 도달성(좀비 감지) ---
@@ -436,21 +485,44 @@ def _check_cloudflared_health():
 
     status, note = _http_status(tunnel_url)
     if _tunnel_reachable(status):
-        if _tunnel_unreachable_streak:
+        if _tunnel_unreachable_streak or _tunnel_exhaustion_streak:
             logger.info(f"[tunnel] external reachability recovered ({note})")
         _tunnel_unreachable_streak = 0
+        _tunnel_exhaustion_streak = 0
+        _recover_streak = 0   # 건강 회복 → 백오프 리셋
         return
 
+    # 외부 실패가 로컬 자원 고갈(errno49 등)이면 터널/홈포탈 문제가 아님.
+    # 복구를 트리거하면 새 연결로 자원을 더 소진해 악화되므로 손대지 않는다 (hoon 사고).
+    if _looks_like_resource_exhaustion(note):
+        _tunnel_exhaustion_streak += 1
+        if _tunnel_exhaustion_streak <= 3 or _tunnel_exhaustion_streak % 10 == 0:
+            logger.warning(
+                f"[tunnel] LOCAL RESOURCE EXHAUSTION detected ({note}), "
+                f"streak={_tunnel_exhaustion_streak} — skipping recovery (would amplify). "
+                f"Likely ephemeral-port/FD exhaustion; needs local remediation."
+            )
+        return
+    _tunnel_exhaustion_streak = 0
+
     # 외부 실패 — 로컬 홈포탈(3000) 다운과 구분
-    local_status, _ = _http_status("http://127.0.0.1:3000/", timeout=4.0)
+    local_status, local_note = _http_status("http://127.0.0.1:3000/", timeout=4.0)
     if local_status is None:
-        # 홈포탈 자체가 안 뜸 → 터널 문제 아님. 프로세스 복구 경로로.
+        # 로컬 프로브도 자원 고갈로 실패한 것이면 홈포탈 문제가 아니다 → 복구 금지(악화 방지)
+        if _looks_like_resource_exhaustion(local_note):
+            _tunnel_exhaustion_streak += 1
+            logger.warning(
+                f"[tunnel] local probe failed by resource exhaustion ({local_note}) "
+                f"— NOT triggering recovery (would amplify)"
+            )
+            return
+        # 진짜 홈포탈 다운 → 프로세스 복구 경로로(지수 백오프)
         logger.warning(
-            f"[tunnel] external failed ({note}) but localhost:3000 down "
-            f"— home portal issue, not tunnel; running _ensure_home_portal()"
+            f"[tunnel] external failed ({note}) but localhost:3000 down ({local_note}) "
+            f"— home portal issue, not tunnel"
         )
         _tunnel_unreachable_streak = 0
-        _ensure_home_portal()
+        _recover_home_portal("home portal down")
         return
 
     _tunnel_unreachable_streak += 1
@@ -480,9 +552,9 @@ def _check_cloudflared_health():
         _tunnel_unreachable_streak = 0
         logger.info("[tunnel] cloudflared kickstarted; reachability will re-check next cycle")
     else:
-        # kickstart 실패 시 전체 프로비저닝 경로로 폴백
-        logger.warning("[tunnel] kickstart failed, falling back to _ensure_home_portal()")
-        _ensure_home_portal()
+        # kickstart 실패 시 전체 프로비저닝 경로로 폴백 (지수 백오프 경유)
+        logger.warning("[tunnel] kickstart failed, falling back to recovery")
+        _recover_home_portal("kickstart failed")
         _tunnel_unreachable_streak = 0
 
 
