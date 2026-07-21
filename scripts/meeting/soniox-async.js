@@ -131,7 +131,13 @@ async function transcribeFile(apiKey, filePath, opts = {}) {
     // Tolerate a few consecutive poll errors before giving up.
     let pollErrors = 0;
     const MAX_POLL_ERRORS = 5;
+    let polls = 0;
     for (;;) {
+      // Heartbeat every ~2 min so the meeting's updated_at stays fresh during a
+      // long Soniox wait — the stuck-meeting sweep uses staleness to detect
+      // orphans and must not mistake an actively-processing meeting for one.
+      if (polls > 0 && polls % 24 === 0) onProgress("processing");
+      polls++;
       let st;
       try {
         st = await soniox(apiKey, "GET", `/v1/transcriptions/${transcriptionId}`);

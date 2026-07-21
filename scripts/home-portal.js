@@ -14,11 +14,11 @@ const os = require("os");
 const { execSync, spawnSync, spawn } = require("child_process");
 
 // ─── Meeting mode (modular) ──────────────────────────
-let meetingStore = null, processMeeting = null, meetingLabel = null;
+let meetingStore = null, processMeeting = null, meetingLabel = null, meetingSweep = null;
 try {
   const MDIR = path.join(path.dirname(__filename), "meeting");
   meetingStore = require(path.join(MDIR, "meeting-store"));
-  ({ processMeeting, labelMeeting: meetingLabel } = require(path.join(MDIR, "processor")));
+  ({ processMeeting, labelMeeting: meetingLabel, sweepStuckMeetings: meetingSweep } = require(path.join(MDIR, "processor")));
 } catch (e) {
   console.warn("[meeting] module not available:", e.message);
 }
@@ -100,6 +100,19 @@ function loadConfig() {
   try {
     return JSON.parse(fs.readFileSync(path.join(CONFIG_DIR, "config.json"), "utf-8"));
   } catch { return {}; }
+}
+
+// ─── Stuck-meeting sweep ─────────────────────────────
+// A restart of this process (AutoUpdater does it whenever meeting code changes)
+// kills in-flight transcriptions, leaving meetings stuck in "processing".
+// Sweep shortly after boot and periodically to retry or fall back.
+if (meetingSweep) {
+  const runSweep = () => {
+    Promise.resolve(meetingSweep({ configDir: CONFIG_DIR, config: loadConfig(), log: (m) => console.log(m) }))
+      .catch((e) => console.warn("[meeting] sweep failed:", e.message));
+  };
+  setTimeout(runSweep, 60 * 1000);
+  setInterval(runSweep, 6 * 60 * 60 * 1000);
 }
 
 function loadSites() {
@@ -1687,6 +1700,9 @@ const server = http.createServer((req, res) => {
         title: fields.title || "제목 없는 회의",
         duration_sec: parseInt(fields.duration || "0") || null,
         live_transcript: fields.liveTranscript || null,
+        // Stored up front so the stuck-meeting sweep can retry processing after
+        // a Home Portal restart (previously only recorded on success).
+        docs_dir: docsDir || null,
         status: "processing",
         created_at: now,
         updated_at: now,
