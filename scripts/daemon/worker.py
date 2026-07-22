@@ -141,6 +141,13 @@ class Worker(threading.Thread):
             dequeue_message(msg_id)
             return
 
+        # ── BP Runner: 설정>Best Practice의 [검사]/[적용] 지시 가로채기 ──
+        # 일반 세션(유저별 프롬프트/모델)에 보내지 않고 표준화된 일회성 실행으로 처리.
+        from daemon import bp
+        if bp.handle_bp_task(self, msg_id, text, project):
+            dequeue_message(msg_id)
+            return
+
         # Special commands
         if text.startswith("/restart"):
             g.restart_requested = True
