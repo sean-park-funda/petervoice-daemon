@@ -75,6 +75,43 @@ def cleanup_downloads(paths: list[Path]):
             pass
 
 
+def count_dirty_files(project_dir: str | None) -> int | None:
+    """중단 보고용: 프로젝트 디렉토리의 커밋 안 된 변경 파일 수. git 레포 아니면/실패하면 None."""
+    if not project_dir:
+        return None
+    import subprocess
+    try:
+        r = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=project_dir, capture_output=True, text=True, timeout=5,
+        )
+        if r.returncode != 0:
+            return None
+        return len([l for l in r.stdout.splitlines() if l.strip()])
+    except Exception:
+        return None
+
+
+# ── 강제중단 마크 (D6): 강제 킬로 끝난 프로젝트는 다음 턴에 상태확인 가드를 1회 주입 ──
+_INTERRUPTED_PATH = Path.home() / ".claude-daemon" / "interrupted_projects.json"
+
+
+def mark_interrupted(project: str):
+    data = _read_json(_INTERRUPTED_PATH, {})
+    data[project] = int(time.time())
+    _write_json(_INTERRUPTED_PATH, data)
+
+
+def pop_interrupted_flag(project: str) -> bool:
+    """마크가 있으면 True 반환 후 제거 (1회성)."""
+    data = _read_json(_INTERRUPTED_PATH, {})
+    if project in data:
+        data.pop(project, None)
+        _write_json(_INTERRUPTED_PATH, data)
+        return True
+    return False
+
+
 def _write_json(path: Path, data):
     """Atomic JSON write: write to tmp, then rename."""
     path.parent.mkdir(parents=True, exist_ok=True)

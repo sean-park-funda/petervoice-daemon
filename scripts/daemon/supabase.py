@@ -235,12 +235,27 @@ def check_stop_requested(user_id: int) -> bool:
     return False
 
 
+def get_stop_request(user_id: int) -> dict:
+    """stop 요청 상태 조회 — {"requested": bool, "project": str|None}.
+    project 는 신형 웹이 보내는 대상 프로젝트. 구형 웹(불리언만)이면 None → 모든 턴이 매칭."""
+    api_key = config.get("api_key", "")
+    if not api_key:
+        return {"requested": False, "project": None}
+    result = api_request(api_key, "GET", "/api/bot/status", timeout=5)
+    if not result:
+        return {"requested": False, "project": None}
+    return {
+        "requested": bool(result.get("stop_requested", False)),
+        "project": result.get("stop_project") or None,
+    }
+
+
 def clear_stop_requested(user_id: int):
     """user_status.stop_requested = false 로 초기화."""
     api_key = config.get("api_key", "")
     if not api_key:
         return
-    api_request(api_key, "PATCH", "/api/bot/status", body={"stop_requested": False, "stop_requested_at": None}, timeout=5)
+    api_request(api_key, "PATCH", "/api/bot/status", body={"stop_requested": False, "stop_requested_at": None, "stop_project": None}, timeout=5)
 
 
 def _fetch_recent_conversation(project: str, limit: int = 10) -> str:

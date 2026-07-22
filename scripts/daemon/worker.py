@@ -331,6 +331,14 @@ class Worker(threading.Thread):
                 hint = "Read 도구로 확인하세요"
             prompt_text = f"{text}\n\n[첨부 파일 ({hint})]\n{file_lines}"
 
+        # 직전 턴이 강제 킬로 끝난 프로젝트면 상태확인 가드를 1회 주입 (계획서 D6)
+        from daemon.utils import pop_interrupted_flag
+        if pop_interrupted_flag(project):
+            prompt_text = (
+                "[안내: 직전 턴이 사용자에 의해 강제 중단되었습니다. 파일/작업이 반쪽 상태일 수 있으니 "
+                "git status 와 관련 파일 상태를 먼저 확인한 뒤 진행하세요.]\n\n" + prompt_text
+            )
+
         uid = resolve_user_id()
         if uid:
             clear_stop_requested(uid)

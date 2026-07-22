@@ -16,11 +16,15 @@ from daemon.globals import (
     config, sessions_lock, shutdown_event, logger,
 )
 import daemon.globals as g
-from daemon.utils import _strip_ansi
+import signal
+import threading
+
+from daemon.utils import _strip_ansi, count_dirty_files, mark_interrupted
 from daemon.api import api_request
 from daemon.supabase import (
     resolve_user_id, _fetch_project_settings, _fetch_recent_conversation,
     get_project_dir, fetch_prompt_from_supabase, check_stop_requested, clear_stop_requested,
+    get_stop_request,
 )
 from daemon.sessions import (
     get_session_id, update_session, update_session_by_key,
@@ -360,7 +364,32 @@ def run_claude(
             cwd=project_dir,
             env=claude_env,
             shell=IS_WINDOWS,
+            # 강제 킬 에스컬레이션 시 killpg 로 자식(도구/서브에이전트)까지 정리하기 위해 그룹 분리
+            start_new_session=not IS_WINDOWS,
         )
+
+        # ── 멈춤 감지 폴러 (2초 간격, 별도 스레드 — 스트리밍 루프를 API 지연으로 막지 않기 위함) ──
+        # 이 턴의 project 와 일치하는(또는 구형 웹의 전역) stop 요청만 잡는다.
+        stop_event = threading.Event()
+        def _stop_poller():
+            while not shutdown_event.is_set():
+                if proc.poll() is not None:
+                    return
+                time.sleep(2.0)
+                uid = resolve_user_id()
+                if not uid:
+                    continue
+                try:
+                    sr = get_stop_request(uid)
+                except Exception:
+                    continue
+                if sr.get("requested") and (not sr.get("project") or sr.get("project") == project):
+                    stop_event.set()
+                    return
+        threading.Thread(target=_stop_poller, daemon=True).start()
+        stop_initiated = False
+        stop_forced = False
+        stop_deadline = 0.0
 
         response_text = ""
         result_segments: list[str] = []
@@ -391,6 +420,39 @@ def run_claude(
                     proc.kill()
                     return (SHUTDOWN_INTERRUPTED, new_session_id, tool_lines, False)
 
+            # ── 멈춤 처리: SIGINT(협조적, Esc 상당) → 10초 내 미종료 시 killpg SIGTERM → 5초 후 SIGKILL ──
+            # SIGINT 후에는 루프를 계속 돌며 stdout 을 드레인한다 — CLI 가 도구를 취소하고
+            # 마지막 result 이벤트를 방출한 뒤 스스로 종료한다 (실측 확인, 계획서 D3).
+            if stop_event.is_set() and not stop_initiated:
+                stop_initiated = True
+                stop_deadline = time.time() + 10
+                logger.info(f"[{bot_name}] Stop requested for {project} — sending SIGINT")
+                uid = resolve_user_id()
+                if uid:
+                    clear_stop_requested(uid)
+                try:
+                    if IS_WINDOWS:
+                        proc.terminate()
+                    else:
+                        proc.send_signal(signal.SIGINT)
+                except Exception as e:
+                    logger.warning(f"[{bot_name}] SIGINT failed: {e}")
+            if stop_initiated and proc.poll() is None and time.time() > stop_deadline:
+                stop_forced = True
+                logger.warning(f"[{bot_name}] Graceful stop timed out for {project} — killing process group")
+                try:
+                    if IS_WINDOWS:
+                        proc.kill()
+                    else:
+                        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                        try:
+                            proc.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+                break
+
             elapsed = time.time() - process_start_time
             effective_hard_timeout = hard_timeout_with_tools if last_tool_time > 0 else hard_timeout
             if elapsed > effective_hard_timeout:
@@ -410,10 +472,11 @@ def run_claude(
                         _line_ready.set()
                 _t = _thr.Thread(target=_check_readable, daemon=True)
                 _t.start()
-                _t.join(timeout=10)
+                _t.join(timeout=2)
                 ready = _line_ready.is_set()
             else:
-                ready_list, _, _ = select.select([proc.stdout], [], [], 10)
+                # 2초 — 조용한 구간(긴 도구 실행 등)에도 멈춤 요청에 빠르게 반응
+                ready_list, _, _ = select.select([proc.stdout], [], [], 2)
                 ready = bool(ready_list)
             if not ready:
                 if proc.poll() is not None:
@@ -422,18 +485,7 @@ def run_claude(
                     logger.error(f"[{bot_name}] Claude stdout timeout ({stdout_timeout}s) for {project}, killing")
                     proc.kill()
                     return (f"(Claude 응답 시간 초과 - {stdout_timeout}초 동안 출력 없음)", sid, tool_lines, True)
-                uid = resolve_user_id()
-                if uid and check_stop_requested(uid):
-                    logger.info(f"[{bot_name}] Stop requested for {project}, terminating claude process")
-                    proc.terminate()
-                    try:
-                        proc.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        proc.kill()
-                    clear_stop_requested(uid)
-                    partial = _strip_ansi(response_text).strip()
-                    result = partial + "\n\n(작업이 중단되었습니다)" if partial else "(작업이 중단되었습니다)"
-                    return (result, new_session_id, tool_lines, False)
+                # (멈춤 처리는 루프 상단의 stop_event 메커니즘이 담당 — 폴러 스레드가 2초 간격 감지)
                 continue
 
             raw = proc.stdout.readline()
@@ -624,6 +676,19 @@ def run_claude(
             response_text = "(작업 완료)" if tool_lines else "(응답 없음)"
 
         response_text = _strip_ansi(response_text)
+
+        # ── 멈춤으로 끝난 턴: 정직한 중단 보고 (계획서 D5/D6/D7) ──
+        if stop_initiated:
+            dirty = count_dirty_files(project_dir)
+            note = "⏹ 작업이 중단되었습니다"
+            if dirty:
+                note += f" — 커밋되지 않은 변경 {dirty}개 파일이 남아 있습니다"
+            note += ". 이미 실행된 외부 작업(배포·발송 등)은 취소되지 않습니다."
+            if stop_forced:
+                # 강제 킬 — 세션 transcript 가 온전치 않을 수 있으니 다음 턴에 상태확인 가드 주입
+                mark_interrupted(project)
+            result_segments.append(note)
+            response_text = (response_text.rstrip() + "\n\n" + note) if response_text.strip() else note
 
         if response_text.strip().lower() == "prompt is too long" and _retry_count < MAX_CONTEXT_OVERFLOW_RETRIES:
             logger.warning(f"[{bot_name}] Prompt too long for {project}, resetting (retry {_retry_count + 1})")
@@ -929,10 +994,11 @@ def run_codex(prompt: str, project: str, _retry_count: int = 0) -> tuple[str, st
                         _line_ready.set()
                 _t = _thr.Thread(target=_check_readable, daemon=True)
                 _t.start()
-                _t.join(timeout=10)
+                _t.join(timeout=2)
                 ready = _line_ready.is_set()
             else:
-                ready_list, _, _ = select.select([proc.stdout], [], [], 10)
+                # 2초 — 조용한 구간(긴 도구 실행 등)에도 멈춤 요청에 빠르게 반응
+                ready_list, _, _ = select.select([proc.stdout], [], [], 2)
                 ready = bool(ready_list)
 
             if not ready:
@@ -942,9 +1008,10 @@ def run_codex(prompt: str, project: str, _retry_count: int = 0) -> tuple[str, st
                     logger.error(f"[{bot_name}] Codex stdout timeout ({stdout_timeout}s) for {project}, killing")
                     proc.kill()
                     return (f"(Codex 응답 시간 초과 - {stdout_timeout}초 동안 출력 없음)", sid, tool_lines, True)
-                # Check stop request
+                # Check stop request (project 매칭 — 구형 웹의 전역 stop 도 허용)
                 uid = resolve_user_id()
-                if uid and check_stop_requested(uid):
+                _sr = get_stop_request(uid) if uid else {"requested": False}
+                if _sr.get("requested") and (not _sr.get("project") or _sr.get("project") == project):
                     logger.info(f"[{bot_name}] Stop requested for {project}, terminating codex process")
                     proc.terminate()
                     try:
