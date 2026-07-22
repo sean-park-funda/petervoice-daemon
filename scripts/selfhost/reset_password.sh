@@ -20,7 +20,8 @@ command -v docker >/dev/null || { echo "❌ docker가 없습니다 (colima start
 docker ps --format '{{.Names}}' | grep -q '^supabase-db$' || { echo "❌ supabase-db 컨테이너가 실행 중이 아닙니다"; exit 1; }
 [ -d "$WEB_DIR/node_modules/bcryptjs" ] || { echo "❌ bcryptjs를 찾을 수 없습니다: $WEB_DIR (SELFHOST_WEB_DIR로 지정 가능)"; exit 1; }
 
-psql_cmd() { docker exec -i supabase-db psql -U postgres -d postgres -t -A -c "$1"; }
+# 주의: -i 금지 — stdin(비밀번호 입력)을 삼켜버림
+psql_cmd() { docker exec supabase-db psql -U postgres -d postgres -t -A -c "$1" </dev/null; }
 
 # 대상 유저 결정: 미지정 시 유일 유저 자동 선택
 if [ -z "$USERNAME" ]; then
