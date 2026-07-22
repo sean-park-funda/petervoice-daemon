@@ -39,6 +39,9 @@ _RUNNER_PROMPT = """당신은 PeterVoice BP Runner입니다. 유저가 웹 설�
 - 유저에게 질문하거나 확인을 요청할 수 없습니다(단발 실행). 판단이 애매하면 보수적으로
   not_applied, 실행 자체가 불가하면 unavailable로 판정하고 사유를 남기세요.
 - Setup 중 파괴적 작업(파일 삭제, 기존 프롬프트 섹션 삭제 등)은 금지. 추가(append)만 허용.
+- 중요: 이 시스템의 에이전트 프롬프트는 로컬 파일(CLAUDE.md)이 아니라 서버에서 주입됩니다.
+  "프롬프트에 규칙이 있는지" 류의 검사는 반드시 아래 첨부된 "주입 프롬프트" 컨텍스트에서
+  확인하세요. 로컬 CLAUDE.md에 없다는 이유로 미적용 판정하지 마세요.
 
 최종 출력은 반드시 아래 JSON 한 개만 출력하세요(다른 텍스트 금지):
 {"results": [{"bp_id": "...", "status": "applied|not_applied|unavailable", "detail": "근거/사유 한 줄"}]}
@@ -125,7 +128,27 @@ def _run(worker, msg_id: int, project: str, mode: str, bp_ids: list[str]):
     doc_blocks = "\n\n".join(
         f"=== BP 문서: {bp_id} (mode={mode}) ===\n{doc}" for bp_id, doc in docs.items()
     )
-    prompt = f"{_RUNNER_PROMPT}\n\n{doc_blocks}"
+
+    # 주입 프롬프트 레이어 첨부 — "프롬프트에 규칙이 있나" 류 Probe는 로컬 CLAUDE.md가
+    # 아니라 이걸 봐야 한다 (2026-07-22 Sean 환경 오탐: 규칙이 _common에 있는데
+    # 러너가 CLAUDE.md만 보고 미적용 판정).
+    from daemon.supabase import fetch_prompt_from_supabase
+    injected_parts = []
+    try:
+        sys_p = fetch_prompt_from_supabase("_petervoice_system", user_id_override=0) or ""
+        common_p = fetch_prompt_from_supabase("_common") or ""
+        if sys_p:
+            injected_parts.append(f"--- _petervoice_system ---\n{sys_p}")
+        if common_p:
+            injected_parts.append(f"--- _common ---\n{common_p}")
+    except Exception as e:
+        logger.warning(f"[bp] injected prompt fetch failed: {e}")
+    injected_block = (
+        "=== 주입 프롬프트 (서버에서 모든 에이전트 세션에 주입됨 — 프롬프트 관련 Probe는 여기서 확인) ===\n"
+        + "\n\n".join(injected_parts)
+    ) if injected_parts else ""
+
+    prompt = "\n\n".join(p for p in [_RUNNER_PROMPT, injected_block, doc_blocks] if p)
 
     cmd = [
         CLAUDE_CMD, "-p",
