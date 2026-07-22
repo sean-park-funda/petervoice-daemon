@@ -332,6 +332,19 @@ _last_recover_ts = 0.0                   # 마지막 _ensure_home_portal 복구 
 _recover_streak = 0                      # 연속 복구 시도 횟수 (지수 백오프용)
 _RECOVER_BACKOFF_BASE = 20               # 백오프 시작 간격(초): 20 → 40 → 80 … 최대 300
 
+# --- 서킷브레이커 (터널 불통이 장시간 지속 시 재시도 중단) ---
+# 진짜 터널 불통(좀비/홈포탈다운, 자원고갈 제외)이 복구 없이 오래 지속되면, 60초마다
+# 프로브+시간당 kickstart를 무한히 반복하는 건 자원 낭비이고 kickstart로 못 고치는
+# 상황(엣지 장애·설정 손상 등 사람 개입 필요)일 가능성이 높다. 일정 시간(1h) 넘게
+# 복구 실패가 이어지면 OPEN 으로 전환해 능동 조치를 멈추고 알림만 남긴다. 이후
+# 주기적(30m)으로 half-open 프로브 1회만 시도해 스스로 회복됐는지 확인한다.
+_CB_OPEN_AFTER = 3600                    # 연속 불통 이 시간(초) 넘으면 CLOSED→OPEN
+_CB_HALFOPEN_EVERY = 1800               # OPEN 상태에서 half-open 프로브 간격(초)
+_cb_state = "closed"                     # closed | open | half_open
+_cb_fail_since = 0.0                     # 현재 연속 불통 시작 시각(건강 시 0)
+_cb_opened_ts = 0.0                      # OPEN 진입 시각(로깅용)
+_cb_last_probe_ts = 0.0                  # OPEN 상태 마지막 half-open 프로브 시각
+
 
 def _looks_like_resource_exhaustion(note: str | None) -> bool:
     """프로브 실패 사유가 로컬 자원 고갈(포트/메모리/FD)인지 판별."""
@@ -448,6 +461,23 @@ def _recover_home_portal(reason: str) -> bool:
     return True
 
 
+def _report_tunnel_health(state: str, note: str = ""):
+    """서킷브레이커 상태를 서버에 능동 보고(로그만으로는 인지 누락 위험).
+
+    기존 PATCH /api/bot/status 채널 재사용(전 고객 공통, 고객별 api_key). OPEN 은
+    '진짜 다운도 복구를 멈춘' 상태이므로 system-admin 이 어드민/고객관리 뷰에서
+    인지할 수 있게 tunnel_health 를 실어 보낸다. 실패해도 헬스체크는 계속.
+    """
+    api_key = config.get("api_key", "")
+    if not api_key:
+        return
+    try:
+        api_request(api_key, "PATCH", "/api/bot/status",
+                    body={"tunnel_health": state, "tunnel_health_note": note[:200]})
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"[tunnel][circuit] health report failed: {e}")
+
+
 def _check_cloudflared_health():
     """2단계 헬스체크로 cloudflared 좀비 터널을 감지·자가치유.
 
@@ -456,6 +486,7 @@ def _check_cloudflared_health():
        - 연속 실패 임계치/시간당 backoff로 플래핑·무한루프 방지.
     """
     global _tunnel_unreachable_streak, _tunnel_exhaustion_streak, _recover_streak
+    global _cb_state, _cb_fail_since, _cb_opened_ts, _cb_last_probe_ts
 
     if not config.get("home_portal_enabled", True):
         return
@@ -483,10 +514,33 @@ def _check_cloudflared_health():
     if not tunnel_url:
         return  # URL 미상 → 도달성 체크 스킵
 
+    import time
+    now = time.time()
+
+    # --- 서킷브레이커 게이트: OPEN 이면 프로브도 30분에 1회(half-open)만 ---
+    if _cb_state == "open":
+        if now - _cb_last_probe_ts < _CB_HALFOPEN_EVERY:
+            return  # OPEN 유지 — 조용히 스킵(프로브/kickstart 없음)
+        _cb_state = "half_open"
+        _cb_last_probe_ts = now
+        logger.warning(
+            f"[tunnel][circuit] HALF-OPEN trial probe "
+            f"(OPEN for {(now - _cb_opened_ts) / 60:.0f}m)"
+        )
+
     status, note = _http_status(tunnel_url)
     if _tunnel_reachable(status):
-        if _tunnel_unreachable_streak or _tunnel_exhaustion_streak:
+        if _cb_state != "closed":
+            down_min = (now - _cb_fail_since) / 60 if _cb_fail_since else 0
+            logger.warning(
+                f"[tunnel][circuit] CLOSED — tunnel recovered after "
+                f"~{down_min:.0f}m down ({note})"
+            )
+            _report_tunnel_health("closed", note)  # OPEN 해제 서버 통지
+        elif _tunnel_unreachable_streak or _tunnel_exhaustion_streak:
             logger.info(f"[tunnel] external reachability recovered ({note})")
+        _cb_state = "closed"
+        _cb_fail_since = 0.0
         _tunnel_unreachable_streak = 0
         _tunnel_exhaustion_streak = 0
         _recover_streak = 0   # 건강 회복 → 백오프 리셋
@@ -504,6 +558,30 @@ def _check_cloudflared_health():
             )
         return
     _tunnel_exhaustion_streak = 0
+
+    # --- 서킷브레이커: 진짜 불통(좀비/홈포탈다운) 연속 지속 시간 추적 ---
+    if not _cb_fail_since:
+        _cb_fail_since = now
+    down_for = now - _cb_fail_since
+    if _cb_state == "closed" and down_for >= _CB_OPEN_AFTER:
+        # 1시간 넘게 복구 실패 → 능동 조치 중단(OPEN). kickstart로 못 고치는 상황.
+        _cb_state = "open"
+        _cb_opened_ts = now
+        _cb_last_probe_ts = now
+        logger.error(
+            f"[tunnel][circuit] OPEN — tunnel unreachable ~{down_for / 60:.0f}m "
+            f"despite recovery attempts; pausing active remediation "
+            f"(half-open probe every {_CB_HALFOPEN_EVERY // 60}m). "
+            f"Manual attention likely needed. last={note}"
+        )
+        _report_tunnel_health("open", note)  # 서버에도 능동 알림
+        return
+    if _cb_state == "half_open":
+        # half-open 프로브가 여전히 실패 → OPEN 유지, 쿨다운 재시작(30m 대기)
+        _cb_state = "open"
+        _cb_last_probe_ts = now
+        logger.warning(f"[tunnel][circuit] half-open trial still failing ({note}) — back to OPEN")
+        return
 
     # 외부 실패 — 로컬 홈포탈(3000) 다운과 구분
     local_status, local_note = _http_status("http://127.0.0.1:3000/", timeout=4.0)
@@ -534,8 +612,6 @@ def _check_cloudflared_health():
         return  # 아직 임계치 미만 — 일시적 드롭 오탐 방지
 
     # --- backoff: 시간당 최대 N회 ---
-    import time
-    now = time.time()
     _tunnel_kick_times[:] = [t for t in _tunnel_kick_times if now - t < 3600]
     if len(_tunnel_kick_times) >= _TUNNEL_KICK_MAX_PER_HOUR:
         logger.warning(
