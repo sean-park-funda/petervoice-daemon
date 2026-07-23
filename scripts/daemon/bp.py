@@ -173,14 +173,30 @@ def _run(worker, msg_id: int, project: str, mode: str, bp_ids: list[str]):
             timeout=BP_TIMEOUT_SEC,
         )
         out = proc.stdout.decode("utf-8", errors="replace")
+        stderr = proc.stderr.decode("utf-8", errors="replace")
         try:
             envelope = json.loads(out)
             result_text = envelope.get("result", "") if isinstance(envelope, dict) else out
         except json.JSONDecodeError:
             result_text = out
-        if proc.returncode != 0:
-            stderr = proc.stderr.decode("utf-8", errors="replace")[:300]
-            logger.error(f"[bp] runner exit {proc.returncode}: {stderr}")
+
+        # 실행 자체가 실패한 경우 — "결과 해석 실패"라는 오해 문구 대신 원인을 구분해 보고.
+        # (2026-07-22 현준 자체호스팅: Claude 인증 만료로 3초 만에 죽었는데 해석 실패로 표시됨)
+        if proc.returncode != 0 or not result_text.strip():
+            logger.error(f"[bp] runner exit {proc.returncode}: {stderr[:300]}")
+            probe_text = f"{result_text}\n{stderr}".lower()
+            auth_markers = ("oauth", "log in", "login", "authentication", "api key",
+                            "credential", "unauthorized", "expired")
+            if any(k in probe_text for k in auth_markers):
+                reason = "Claude 인증이 만료되어 검사를 실행하지 못했습니다 — 재로그인 후 다시 검사해 주세요"
+                chat = "Claude 인증이 만료되어 BP 검사를 실행하지 못했습니다. '재로그인' 이라고 입력해 인증을 갱신한 뒤 다시 검사해 주세요."
+            else:
+                reason = f"검사 실행 실패 (exit {proc.returncode}) — 잠시 후 다시 시도해 주세요"
+                chat = f"BP {mode} 실행에 실패했습니다 (exit {proc.returncode}). 잠시 후 다시 시도해 주세요."
+            for bp_id in docs:
+                _report(bp_id, "unavailable", reason, versions.get(bp_id, 0))
+            worker.reply(chat, reply_to=[msg_id], project=project)
+            return
     except subprocess.TimeoutExpired:
         for bp_id in docs:
             _report(bp_id, "unavailable", f"검사 시간 초과({BP_TIMEOUT_SEC}s)", versions.get(bp_id, 0))
