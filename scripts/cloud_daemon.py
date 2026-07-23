@@ -90,7 +90,12 @@ def host_api(method: str, path: str, body: dict | None = None) -> dict | None:
 
 
 def user_api(api_key: str, method: str, path: str, body: dict | None = None) -> dict | None:
-    return http_json(method, path, headers={"X-Api-Key": api_key}, body=body)
+    # 기존 맥 데몬과 동일하게 두 헤더 모두 전송 — 엔드포인트마다 요구 헤더가 다름
+    # (heartbeat=Bearer, 다수 라우트=X-Api-Key)
+    return http_json(method, path, headers={
+        "Authorization": f"Bearer {api_key}",
+        "X-Api-Key": api_key,
+    }, body=body)
 
 
 # ── Roster ───────────────────────────────────────────────────────
