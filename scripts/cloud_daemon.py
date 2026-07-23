@@ -98,6 +98,42 @@ def user_api(api_key: str, method: str, path: str, body: dict | None = None) -> 
     }, body=body)
 
 
+# ── Per-user secrets (외부 연동 토큰 주입) ───────────────────────
+# 유저별 SecretsPanel 시크릿 + OAuth 토큰(구글/슬랙/노션)을 해당 유저의 api_key 로
+# 조회해 claude 서브프로세스 env 에만 주입한다.
+# 보안 원칙:
+# - 값은 절대 argv 에 싣지 않는다 (다른 pv 유저가 /proc cmdline 으로 볼 수 있음)
+#   → sudo --preserve-env=<이름목록> + Popen(env=...) 조합: 이름만 argv, 값은 env 로 전달
+# - 유저 A 의 시크릿은 유저 A 의 턴에만 주입 (전역 os.environ 오염 금지)
+
+_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_secrets_cache: dict[int, tuple[float, dict]] = {}
+_secrets_lock = threading.Lock()
+SECRETS_TTL_SEC = 60
+
+
+def fetch_user_secrets(user_id: int, api_key: str) -> dict:
+    now = time.time()
+    with _secrets_lock:
+        cached = _secrets_cache.get(user_id)
+        if cached and now - cached[0] < SECRETS_TTL_SEC:
+            return cached[1]
+    result = user_api(api_key, "GET", "/api/secrets?raw=true")
+    secrets: dict[str, str] = {}
+    if result:
+        for s in result.get("secrets", []):
+            k = (s.get("key") or "").strip()
+            v = (s.get("value") or "").strip()
+            if k and v and _ENV_NAME_RE.match(k):
+                secrets[k] = v
+    with _secrets_lock:
+        # 조회 실패(None) 시 이전 캐시 유지 — 일시 장애로 연동이 끊기지 않게
+        if result is None and cached:
+            return cached[1]
+        _secrets_cache[user_id] = (now, secrets)
+    return secrets
+
+
 # ── Roster ───────────────────────────────────────────────────────
 
 class Roster:
@@ -184,6 +220,13 @@ def provision_unix_user(user_id: int):
             # 루트(700)에 ubuntu traverse(x)만 허용 — 목록/읽기는 불가, 하위 진입만 가능
             subprocess.run(["sudo", "-n", "setfacl", "-m", "u:ubuntu:--x", str(root)],
                            check=True, capture_output=True)
+            # 번들 스킬 공유: 유저 claude/skills → 공용 스킬 디렉토리 심링크
+            shared_skills = config.get("shared_skills_dir", "/srv/pv/shared/skills")
+            skills_link = root / "claude" / "skills"
+            if Path(shared_skills).exists() and not skills_link.exists():
+                subprocess.run(
+                    ["sudo", "-n", "-u", name, "env", "ln", "-s", shared_skills, str(skills_link)],
+                    capture_output=True)
             # workspace 에 ACL: 포탈/데몬(ubuntu)과 claude(pv<id>) 모두 접근,
             # 다른 pv 유저는 여전히 차단 (root 700 이 1차 방어)
             subprocess.run(["sudo", "-n", "setfacl", "-R",
@@ -198,14 +241,20 @@ def provision_unix_user(user_id: int):
             raise
 
 
-def wrap_isolated(user_id: int, cmd: list[str], env_overrides: dict, cwd: str) -> list[str]:
+def wrap_isolated(user_id: int, cmd: list[str], env_overrides: dict, cwd: str,
+                  preserve_env_names: list[str] | None = None) -> list[str]:
     """cmd 를 해당 유저로 강등 실행하는 명령으로 감싼다.
-    env_overrides 는 sudo 경계를 넘기기 위해 `env K=V` 로, cwd 는 sudo -D 로 전달."""
+    env_overrides 는 sudo 경계를 넘기기 위해 `env K=V` 로, cwd 는 sudo -D 로 전달.
+    preserve_env_names: 값 노출 없이(argv 에는 이름만) 부모 env 에서 전달할 변수들
+    (시크릿 주입용 — sudoers SETENV 태그 필요)."""
     if not isolation_enabled():
         return cmd
     name = unix_user(user_id)
+    args = ["sudo", "-n", "-u", name, "-H", "-D", cwd]
+    if preserve_env_names:
+        args.append("--preserve-env=" + ",".join(preserve_env_names))
     env_args = [f"{k}={v}" for k, v in env_overrides.items()]
-    return ["sudo", "-n", "-u", name, "-H", "-D", cwd, "env", *env_args, *cmd]
+    return [*args, "env", *env_args, *cmd]
 
 
 def user_claude_dir(user_id: int) -> Path:
@@ -311,12 +360,20 @@ def run_claude_turn(user_id: int, project: str, prompt: str) -> tuple[str, bool]
     except Exception:
         pass
     ws = str(pdir)
-    wrapped = wrap_isolated(user_id, cmd, isolated_env_overrides(user_id), ws)
-    # 비격리 모드는 부모가 직접 cwd/env 지정, 격리 모드는 sudo 가 대신 처리
+
+    # 유저 본인의 시크릿/OAuth 토큰 주입 (값은 env 로만 — argv 노출 금지)
+    user = roster.get(user_id)
+    secrets = fetch_user_secrets(user_id, user["apiKey"]) if user else {}
+
+    wrapped = wrap_isolated(user_id, cmd, isolated_env_overrides(user_id), ws,
+                            preserve_env_names=sorted(secrets.keys()))
     run_kwargs = {"capture_output": True, "text": True, "timeout": TURN_TIMEOUT_SEC}
-    if not isolation_enabled():
+    if isolation_enabled():
+        # sudo 프로세스의 env 에 시크릿을 실어 --preserve-env 로 통과시킨다
+        run_kwargs["env"] = {**os.environ, **secrets}
+    else:
         run_kwargs["cwd"] = ws
-        run_kwargs["env"] = claude_env(user_id)
+        run_kwargs["env"] = {**claude_env(user_id), **secrets}
 
     try:
         result = subprocess.run(wrapped, **run_kwargs)
