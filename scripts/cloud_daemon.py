@@ -181,6 +181,9 @@ def provision_unix_user(user_id: int):
             subprocess.run(["sudo", "-n", "install", "-d", "-m", "700",
                             "-o", name, "-g", "pvusers", str(root)],
                            check=True, capture_output=True)
+            # 루트(700)에 ubuntu traverse(x)만 허용 — 목록/읽기는 불가, 하위 진입만 가능
+            subprocess.run(["sudo", "-n", "setfacl", "-m", "u:ubuntu:--x", str(root)],
+                           check=True, capture_output=True)
             # workspace 에 ACL: 포탈/데몬(ubuntu)과 claude(pv<id>) 모두 접근,
             # 다른 pv 유저는 여전히 차단 (root 700 이 1차 방어)
             subprocess.run(["sudo", "-n", "setfacl", "-R",
