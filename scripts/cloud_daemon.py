@@ -347,37 +347,70 @@ class LoginSession:
         self._lock = threading.Lock()
 
     def start(self) -> str | None:
-        """setup-token 프로세스를 띄우고 인증 URL을 캡처해 반환."""
+        """`claude auth login --claudeai` 를 띄우고 완전한 인증 URL을 캡처해 반환.
+        맥 데몬(relogin.py)과 동일한 명령/방식 — setup-token 은 redirect_uri 없는
+        불완전 URL을 내므로 쓰지 않는다."""
         claude_cmd = config.get("claude_cmd", "claude")
         ws = str(user_workspace(self.user_id))
-        base_cmd = [claude_cmd, "setup-token"]
+        base_cmd = [claude_cmd, "auth", "login", "--claudeai"]
         wrapped = wrap_isolated(self.user_id, base_cmd,
                                 isolated_env_overrides(self.user_id), ws)
         env = os.environ.copy() if isolation_enabled() else claude_env(self.user_id)
+        env = {k: v for k, v in env.items() if k != "CLAUDECODE"}
+        env["LANG"] = "en_US.UTF-8"
         pid, fd = pty.fork()
         if pid == 0:  # child
             if not isolation_enabled():
                 os.chdir(ws)
             os.execvpe(wrapped[0], wrapped, env)
         self._pid, self._fd = pid, fd
+
         buf = ""
+        enter_sent = 0
         deadline = time.time() + LOGIN_URL_TIMEOUT_SEC
         while time.time() < deadline:
             r, _, _ = select.select([fd], [], [], 1.0)
             if not r:
                 continue
             try:
-                chunk = os.read(fd, 4096).decode(errors="replace")
+                chunk = os.read(fd, 4096)
             except OSError:
                 break
-            buf += re.sub(r"\x1b\[[0-9;?]*[a-zA-Z]", "", chunk)
-            m = _URL_RE.search(buf)
-            if m:
-                self.url = m.group(0).strip()
+            if not chunk:
+                break
+            buf += re.sub(r"\x1b\[[0-9;?]*[a-zA-Z]", "", chunk.decode(errors="replace"))
+            url = self._extract_complete_url(buf)
+            if url:
+                self.url = url
                 self.state = "waiting_code"
-                return self.url
+                return url
+            # 온보딩 화면(테마 선택 등)이면 Enter 로 진행 (최대 2회)
+            low = buf.lower()
+            if enter_sent < 2 and any(mk in low for mk in
+                                      ("choose", "theme", "select", "press enter", "dark mode")):
+                try:
+                    os.write(fd, b"\r")
+                except OSError:
+                    pass
+                enter_sent += 1
+                time.sleep(0.5)
         self.terminate()
         self.state = "failed"
+        return None
+
+    @staticmethod
+    def _extract_complete_url(buf: str) -> str | None:
+        """OAuth URL을 **완전히** 출력된 경우에만 반환.
+        pty 출력이 버퍼 경계에 걸쳐 잘리는 것을 막기 위해, URL 뒤에 공백/개행이
+        온(=출력이 끝난) 경우 + redirect_uri 포함을 조건으로 한다."""
+        for m in _URL_RE.finditer(buf):
+            cand = m.group(0).rstrip(").,")
+            low = cand.lower()
+            if not ("oauth" in low or "authorize" in low or "claude.ai" in low or "claude.com" in low):
+                continue
+            terminated = m.end() < len(buf)  # 매치 뒤에 문자가 더 있음 = URL 종료 확인
+            if terminated and "redirect_uri=" in low:
+                return cand
         return None
 
     def submit_code(self, code: str) -> bool:
