@@ -1492,9 +1492,12 @@ const server = http.createServer((req, res) => {
   const pathname = url.pathname;
 
   // CORS — 특정 origin만 허용 (브라우저 직접 통신)
+  // 중앙(www/canary) + 모든 자체호스팅 인스턴스({username}.peter-voice.site)를 허용.
+  // peter-voice.site 존은 본사 소유라 서브도메인 전체 허용이 안전.
   const ALLOWED_ORIGINS = ["https://canary.peter-voice.site", "https://www.peter-voice.site", "http://localhost:3001"];
+  const PV_SUBDOMAIN = /^https:\/\/[a-z0-9-]+\.peter-voice\.site$/;
   const origin = req.headers.origin;
-  if (origin && ALLOWED_ORIGINS.includes(origin)) {
+  if (origin && (ALLOWED_ORIGINS.includes(origin) || PV_SUBDOMAIN.test(origin))) {
     res.setHeader("Access-Control-Allow-Origin", origin);
     res.setHeader("Access-Control-Allow-Credentials", "true");
   } else if (!origin) {
