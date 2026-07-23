@@ -1545,13 +1545,27 @@ const server = http.createServer((req, res) => {
   if (CLOUD_MODE && !pathname.startsWith("/api/docs") && pathname !== "/api/graph") {
     return json({ error: "cloud mode: not available" }, 404);
   }
+  // 클라우드 모드: 쿼리 dir 중앙 검증 (일부 핸들러가 개별 검증을 생략하므로 초크포인트 필수)
+  if (CLOUD_MODE) {
+    const qDir = url.searchParams.get("dir");
+    if (qDir && !validateDocsDir(qDir)) {
+      return json({ error: "접근 불가 경로" }, 403);
+    }
+  }
 
   // Read body helper
   const readBody = () => new Promise((resolve) => {
     let body = "";
     req.on("data", c => body += c);
     req.on("end", () => {
-      try { resolve(JSON.parse(body)); } catch { resolve({}); }
+      try {
+        const parsed = JSON.parse(body);
+        // 클라우드 모드: body.dir 도 중앙 검증 — 무효면 dir 제거 (핸들러가 400 처리)
+        if (CLOUD_MODE && parsed && parsed.dir && !validateDocsDir(parsed.dir)) {
+          delete parsed.dir;
+        }
+        resolve(parsed);
+      } catch { resolve({}); }
     });
   });
 
