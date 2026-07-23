@@ -172,7 +172,7 @@ def provision_unix_user(user_id: int):
                     ["sudo", "-n", "useradd", "-M", "-d", str(root),
                      "-s", "/usr/sbin/nologin", "-g", "pvusers", name],
                     check=True, capture_output=True)
-            for sub in ("claude", "workspace", "workspace/docs"):
+            for sub in ("claude", "workspace", "workspace/general", "workspace/general/docs"):
                 subprocess.run(["sudo", "-n", "mkdir", "-p", str(root / sub)],
                                check=True, capture_output=True)
             subprocess.run(["sudo", "-n", "chown", "-R", f"{name}:pvusers", str(root)],
@@ -180,6 +180,13 @@ def provision_unix_user(user_id: int):
             # 700: 소유자(pv<id>)만 접근 — 교차 유저 읽기 차단
             subprocess.run(["sudo", "-n", "install", "-d", "-m", "700",
                             "-o", name, "-g", "pvusers", str(root)],
+                           check=True, capture_output=True)
+            # workspace 에 ACL: 포탈/데몬(ubuntu)과 claude(pv<id>) 모두 접근,
+            # 다른 pv 유저는 여전히 차단 (root 700 이 1차 방어)
+            subprocess.run(["sudo", "-n", "setfacl", "-R",
+                            "-m", "u:ubuntu:rwx", "-m", f"u:{name}:rwx",
+                            "-m", "d:u:ubuntu:rwx", "-m", f"d:u:{name}:rwx",
+                            str(root / "workspace")],
                            check=True, capture_output=True)
             _provisioned_uids.add(user_id)
             logger.info(f"provisioned unix user {name}")
@@ -204,6 +211,13 @@ def user_claude_dir(user_id: int) -> Path:
 
 def user_workspace(user_id: int) -> Path:
     return user_root(user_id) / "workspace"
+
+
+def project_dir(user_id: int, project: str) -> Path:
+    """프로젝트별 작업 폴더 (맥 데몬의 프로젝트 디렉토리와 동일 개념).
+    branch:N / kanban:N 은 부모 프로젝트 구분이 어려우므로 v1은 general 로 통합."""
+    name = project if re.fullmatch(r"[a-z0-9_\-]{1,60}", project or "") else "general"
+    return user_workspace(user_id) / name
 
 
 def ensure_user_dirs(user_id: int):
@@ -288,7 +302,12 @@ def run_claude_turn(user_id: int, project: str, prompt: str) -> tuple[str, bool]
     cmd.append("--")
     cmd.append(prompt)
 
-    ws = str(user_workspace(user_id))
+    pdir = project_dir(user_id, project)
+    try:
+        (pdir / "docs").mkdir(parents=True, exist_ok=True)  # ACL 덕에 ubuntu 가 생성 가능
+    except Exception:
+        pass
+    ws = str(pdir)
     wrapped = wrap_isolated(user_id, cmd, isolated_env_overrides(user_id), ws)
     # 비격리 모드는 부모가 직접 cwd/env 지정, 격리 모드는 sudo 가 대신 처리
     run_kwargs = {"capture_output": True, "text": True, "timeout": TURN_TIMEOUT_SEC}

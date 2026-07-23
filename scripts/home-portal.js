@@ -864,9 +864,14 @@ function execUnpublish(body) {
 // ─── Docs API ───────────────────────────────────────
 
 function validateDocsDir(dir) {
+  const resolved = path.resolve(dir);
+  if (CLOUD_MODE) {
+    // 클라우드: 유저 워크스페이스 루트 하위만 허용.
+    // 유저별 바인딩(본인 uid 폴더 강제)은 웹 프록시가 세션 기준으로 수행 — 여긴 2차 방어.
+    return resolved.startsWith(path.resolve(CLOUD_USERS_ROOT) + path.sep) ? resolved : null;
+  }
   // path traversal 방지: 홈 디렉토리 하위만 허용
   const homeDir = os.homedir();
-  const resolved = path.resolve(dir);
   if (!resolved.startsWith(homeDir)) return null;
   return resolved;
 }
@@ -1299,7 +1304,18 @@ function isTunnelRequest(req) {
   return !!req.headers["cf-connecting-ip"];
 }
 
+// ── 클라우드 모드 (공용 클라우드 데몬 호스트 전용) ──
+// PV_CLOUD_MODE=1 로 실행될 때만 활성. 고객 맥미니에선 env 가 없어 완전 무변화.
+const CLOUD_MODE = process.env.PV_CLOUD_MODE === "1";
+const CLOUD_HOST_KEY = process.env.PV_CLOUD_HOST_KEY || "";
+const CLOUD_USERS_ROOT = process.env.PV_USERS_ROOT || "/srv/pv/users";
+
 function verifyAuth(req) {
+  if (CLOUD_MODE) {
+    // 클라우드: host_key 헤더만 인정 (웹 프록시 전용).
+    // 로컬호스트 바이패스 금지 — 호스트 위 pv유저 프로세스의 타 유저 접근 차단.
+    return !!CLOUD_HOST_KEY && req.headers["x-host-key"] === CLOUD_HOST_KEY;
+  }
   // 로컬 요청은 인증 불필요
   if (!isTunnelRequest(req)) return true;
 
@@ -1523,6 +1539,11 @@ const server = http.createServer((req, res) => {
   // Auth check: 모든 경로에 인증 적용 (localhost는 스킵)
   if (!verifyAuth(req)) {
     return json({ error: "인증 필요" }, 401);
+  }
+
+  // 클라우드 모드: docs API만 노출 (공유/사이트/기타 로컬 기능 차단)
+  if (CLOUD_MODE && !pathname.startsWith("/api/docs") && pathname !== "/api/graph") {
+    return json({ error: "cloud mode: not available" }, 404);
   }
 
   // Read body helper
