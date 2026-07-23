@@ -18,7 +18,7 @@
 설정: /etc/pv-cloud/config.json
   {"api_url": "https://www.peter-voice.site", "host_key": "...",
    "users_root": "/srv/pv/users", "poll_interval_sec": 3,
-   "max_concurrent": 5, "claude_cmd": "claude"}
+   "max_concurrent": 5, "claude_cmd": "claude", "isolate_users": true}
 """
 
 import json
@@ -138,6 +138,66 @@ def user_root(user_id: int) -> Path:
     return Path(config.get("users_root", "/srv/pv/users")) / str(user_id)
 
 
+# ── OS 유저 격리 ─────────────────────────────────────────────────
+# 각 클라우드 유저를 별도 unix 계정(pv<id>)으로 강등 실행해 파일시스템을 격리한다.
+# 데몬은 ubuntu 로 돌고, 제한적 sudo(useradd/chown/mkdir + pvusers 그룹 강등 실행)만 사용.
+# config.isolate_users=false 면 (예: 로컬 개발) 강등 없이 현재 유저로 실행.
+
+_provisioned_uids: set[int] = set()
+_provision_lock = threading.Lock()
+
+
+def unix_user(user_id: int) -> str:
+    return f"pv{user_id}"
+
+
+def isolation_enabled() -> bool:
+    return bool(config.get("isolate_users", True))
+
+
+def provision_unix_user(user_id: int):
+    """유저별 unix 계정 + 소유권 격리 (idempotent). 첫 등장 시 1회."""
+    if not isolation_enabled():
+        ensure_user_dirs(user_id)
+        return
+    with _provision_lock:
+        if user_id in _provisioned_uids:
+            return
+        name = unix_user(user_id)
+        root = user_root(user_id)
+        try:
+            exists = subprocess.run(["id", name], capture_output=True).returncode == 0
+            if not exists:
+                subprocess.run(
+                    ["sudo", "-n", "useradd", "-M", "-d", str(root),
+                     "-s", "/usr/sbin/nologin", "-g", "pvusers", name],
+                    check=True, capture_output=True)
+            for sub in ("claude", "workspace", "workspace/docs"):
+                subprocess.run(["sudo", "-n", "mkdir", "-p", str(root / sub)],
+                               check=True, capture_output=True)
+            subprocess.run(["sudo", "-n", "chown", "-R", f"{name}:pvusers", str(root)],
+                           check=True, capture_output=True)
+            # 700: 소유자(pv<id>)만 접근 — 교차 유저 읽기 차단
+            subprocess.run(["sudo", "-n", "install", "-d", "-m", "700",
+                            "-o", name, "-g", "pvusers", str(root)],
+                           check=True, capture_output=True)
+            _provisioned_uids.add(user_id)
+            logger.info(f"provisioned unix user {name}")
+        except subprocess.CalledProcessError as e:
+            logger.error(f"provision {name} failed: {e.stderr.decode()[:200] if e.stderr else e}")
+            raise
+
+
+def wrap_isolated(user_id: int, cmd: list[str], env_overrides: dict, cwd: str) -> list[str]:
+    """cmd 를 해당 유저로 강등 실행하는 명령으로 감싼다.
+    env_overrides 는 sudo 경계를 넘기기 위해 `env K=V` 로, cwd 는 sudo -D 로 전달."""
+    if not isolation_enabled():
+        return cmd
+    name = unix_user(user_id)
+    env_args = [f"{k}={v}" for k, v in env_overrides.items()]
+    return ["sudo", "-n", "-u", name, "-H", "-D", cwd, "env", *env_args, *cmd]
+
+
 def user_claude_dir(user_id: int) -> Path:
     return user_root(user_id) / "claude"
 
@@ -152,8 +212,15 @@ def ensure_user_dirs(user_id: int):
     (ws / "docs").mkdir(parents=True, exist_ok=True)
 
 
+def _state_dir() -> Path:
+    # 데몬(ubuntu) 소유 메타 영역 — 유저의 700 격리 폴더 밖에 둔다
+    d = Path(config.get("users_root", "/srv/pv/users")).parent / "state"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
 def _sessions_path(user_id: int) -> Path:
-    return user_root(user_id) / "sessions.json"
+    return _state_dir() / f"{user_id}.json"
 
 
 def load_session(user_id: int, project: str) -> str | None:
@@ -177,17 +244,32 @@ def save_session(user_id: int, project: str, session_id: str | None):
     path.write_text(json.dumps(data))
 
 
+def isolated_env_overrides(user_id: int) -> dict:
+    """강등 실행 시 sudo 경계를 넘겨야 하는 환경변수."""
+    return {
+        "CLAUDE_CONFIG_DIR": str(user_claude_dir(user_id)),
+        "HOME": str(user_root(user_id)),
+    }
+
+
 def claude_env(user_id: int) -> dict:
+    """비격리 모드(로컬)용 전체 env."""
     env = os.environ.copy()
-    env["CLAUDE_CONFIG_DIR"] = str(user_claude_dir(user_id))
-    # 유저 워크스페이스를 HOME 처럼 참조하는 도구 대비 — 단 시스템 HOME 은 유지
+    env.update(isolated_env_overrides(user_id))
     return env
 
 
 def has_credentials(user_id: int) -> bool:
-    """자격증명 파일 존재 여부만 확인 (내용은 절대 읽지 않음)."""
-    d = user_claude_dir(user_id)
-    return (d / ".credentials.json").exists()
+    """자격증명 파일 존재 여부만 확인 (내용은 절대 읽지 않음).
+    격리 모드에서는 파일이 pv<id> 소유라 sudo -u 로 확인."""
+    cred = user_claude_dir(user_id) / ".credentials.json"
+    if not isolation_enabled():
+        return cred.exists()
+    # sudoers 는 pvusers 강등 실행으로 env/claude 만 허용 → env 로 test 를 exec
+    r = subprocess.run(
+        ["sudo", "-n", "-u", unix_user(user_id), "env", "test", "-f", str(cred)],
+        capture_output=True)
+    return r.returncode == 0
 
 
 # ── Claude 실행 ──────────────────────────────────────────────────
@@ -206,14 +288,16 @@ def run_claude_turn(user_id: int, project: str, prompt: str) -> tuple[str, bool]
     cmd.append("--")
     cmd.append(prompt)
 
+    ws = str(user_workspace(user_id))
+    wrapped = wrap_isolated(user_id, cmd, isolated_env_overrides(user_id), ws)
+    # 비격리 모드는 부모가 직접 cwd/env 지정, 격리 모드는 sudo 가 대신 처리
+    run_kwargs = {"capture_output": True, "text": True, "timeout": TURN_TIMEOUT_SEC}
+    if not isolation_enabled():
+        run_kwargs["cwd"] = ws
+        run_kwargs["env"] = claude_env(user_id)
+
     try:
-        result = subprocess.run(
-            cmd,
-            cwd=str(user_workspace(user_id)),
-            env=claude_env(user_id),
-            capture_output=True, text=True,
-            timeout=TURN_TIMEOUT_SEC,
-        )
+        result = subprocess.run(wrapped, **run_kwargs)
     except subprocess.TimeoutExpired:
         return ("작업이 너무 오래 걸려 중단됐어요. 다시 시도해주세요.", False)
 
@@ -265,11 +349,16 @@ class LoginSession:
     def start(self) -> str | None:
         """setup-token 프로세스를 띄우고 인증 URL을 캡처해 반환."""
         claude_cmd = config.get("claude_cmd", "claude")
-        env = claude_env(self.user_id)
+        ws = str(user_workspace(self.user_id))
+        base_cmd = [claude_cmd, "setup-token"]
+        wrapped = wrap_isolated(self.user_id, base_cmd,
+                                isolated_env_overrides(self.user_id), ws)
+        env = os.environ.copy() if isolation_enabled() else claude_env(self.user_id)
         pid, fd = pty.fork()
         if pid == 0:  # child
-            os.chdir(str(user_workspace(self.user_id)))
-            os.execvpe(claude_cmd, [claude_cmd, "setup-token"], env)
+            if not isolation_enabled():
+                os.chdir(ws)
+            os.execvpe(wrapped[0], wrapped, env)
         self._pid, self._fd = pid, fd
         buf = ""
         deadline = time.time() + LOGIN_URL_TIMEOUT_SEC
@@ -398,7 +487,12 @@ class CloudWorker:
             self._processed = {msg_id}
 
         self.mark_processed(api_key, msg_id)
-        ensure_user_dirs(user_id)
+        try:
+            provision_unix_user(user_id)
+        except Exception as e:
+            logger.error(f"provision failed user={user_id}: {e}")
+            self.reply(api_key, "(일시적 오류로 준비에 실패했어요. 잠시 후 다시 시도해주세요.)", [msg_id], project)
+            return
         logger.info(f"msg #{msg_id} user={user_id} project={project}: {text[:60]}")
 
         # ── 로그인 플로우 ──
