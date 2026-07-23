@@ -1,0 +1,563 @@
+#!/usr/bin/env python3
+"""PeterVoice Cloud Daemon — 멀티테넌트 단일 프로세스.
+
+공용 클라우드 호스트에서 daemon_target=cloud 유저 전원을 서비스한다.
+고객 맥미니의 claude_daemon.py 와는 완전히 별개의 진입점 (기존 코드 무변경 원칙).
+
+구조 (계획: peter-voice/docs/plans/2026-07-23-cloud-first-signup.md):
+- 통합 폴링: GET /api/cloud/poll (host_key) — 전 유저 pending 을 요청 1개로
+- 로스터: GET /api/cloud/roster — user_id ↔ api_key 매핑 (60초 주기)
+- 유저 격리: Claude CLI 서브프로세스에 CLAUDE_CONFIG_DIR/cwd 주입
+  · /srv/pv/users/<id>/claude    — 유저 본인의 클로드 OAuth 토큰 (격리)
+  · /srv/pv/users/<id>/workspace — 파일 작업 디렉토리
+- 미로그인 유저: "재로그인" 트리거 → claude setup-token 기반 로그인 플로우
+  (기존 relogin 원칙 준수: 자격증명을 직접 읽거나 고치지 않고 정식 CLI 플로우만 실행,
+   코드는 로그에 남기지 않음)
+- 세션: (user_id, project) 단위 --resume
+
+설정: /etc/pv-cloud/config.json
+  {"api_url": "https://www.peter-voice.site", "host_key": "...",
+   "users_root": "/srv/pv/users", "poll_interval_sec": 3,
+   "max_concurrent": 5, "claude_cmd": "claude"}
+"""
+
+import json
+import logging
+import os
+import pty
+import re
+import select
+import signal
+import subprocess
+import sys
+import threading
+import time
+import urllib.request
+import urllib.error
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+CONFIG_PATH = Path(os.environ.get("PV_CLOUD_CONFIG", "/etc/pv-cloud/config.json"))
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(threadName)s] %(levelname)s %(message)s",
+)
+logger = logging.getLogger("pv-cloud")
+
+config: dict = {}
+shutdown_event = threading.Event()
+
+TURN_TIMEOUT_SEC = 30 * 60
+LOGIN_URL_TIMEOUT_SEC = 60
+LOGIN_CODE_TTL_SEC = 600
+CODE_RE = re.compile(r"[A-Za-z0-9_\-]{20,}#[A-Za-z0-9_\-]{8,}")
+_URL_RE = re.compile(r"https?://[^\s\x00-\x1f\"']+")
+
+NEED_LOGIN_MESSAGE = (
+    "아직 클로드(Claude) 계정이 연결되지 않아 AI 비서가 잠들어 있어요. 🌙\n\n"
+    "**연결 방법** (2분이면 돼요)\n"
+    "1. 여기에 `재로그인` 이라고 입력해주세요.\n"
+    "2. 제가 보내드리는 링크를 열어 클로드 계정으로 로그인해주세요.\n"
+    "3. 화면에 나오는 코드를 복사해서 이 채팅에 붙여넣어 주세요.\n\n"
+    "클로드 구독 계정이 없다면, 다른 사용자의 프로젝트에 초대받아 대화하는 것은 지금도 가능해요."
+)
+
+
+# ── HTTP helpers ─────────────────────────────────────────────────
+
+def http_json(method: str, path: str, *, headers: dict, body: dict | None = None,
+              timeout: int = 30) -> dict | None:
+    url = config["api_url"].rstrip("/") + path
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(url, data=data, method=method)
+    req.add_header("Content-Type", "application/json")
+    for k, v in headers.items():
+        req.add_header(k, v)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as res:
+            return json.loads(res.read().decode())
+    except urllib.error.HTTPError as e:
+        logger.warning(f"HTTP {e.code} {method} {path}: {e.read()[:200]}")
+        return None
+    except Exception as e:
+        logger.warning(f"HTTP error {method} {path}: {e}")
+        return None
+
+
+def host_api(method: str, path: str, body: dict | None = None) -> dict | None:
+    return http_json(method, path, headers={"X-Host-Key": config["host_key"]}, body=body)
+
+
+def user_api(api_key: str, method: str, path: str, body: dict | None = None) -> dict | None:
+    return http_json(method, path, headers={"X-Api-Key": api_key}, body=body)
+
+
+# ── Roster ───────────────────────────────────────────────────────
+
+class Roster:
+    """user_id → {apiKey, username, botName} 매핑. 60초 주기 + 미스 시 즉시 갱신."""
+
+    def __init__(self):
+        self._users: dict[int, dict] = {}
+        self._lock = threading.Lock()
+        self._last_sync = 0.0
+
+    def sync(self, force: bool = False):
+        now = time.time()
+        if not force and now - self._last_sync < 60:
+            return
+        result = host_api("GET", "/api/cloud/roster")
+        if result and "users" in result:
+            with self._lock:
+                self._users = {u["userId"]: u for u in result["users"]}
+                self._last_sync = now
+            logger.info(f"roster synced: {len(self._users)} cloud users")
+
+    def get(self, user_id: int) -> dict | None:
+        with self._lock:
+            user = self._users.get(user_id)
+        if user is None:
+            self.sync(force=True)  # 신규 가입 직후 로스터 미스 → 즉시 재동기화
+            with self._lock:
+                user = self._users.get(user_id)
+        return user
+
+
+roster = Roster()
+
+
+# ── Per-user dirs / sessions ─────────────────────────────────────
+
+def user_root(user_id: int) -> Path:
+    return Path(config.get("users_root", "/srv/pv/users")) / str(user_id)
+
+
+def user_claude_dir(user_id: int) -> Path:
+    return user_root(user_id) / "claude"
+
+
+def user_workspace(user_id: int) -> Path:
+    return user_root(user_id) / "workspace"
+
+
+def ensure_user_dirs(user_id: int):
+    user_claude_dir(user_id).mkdir(parents=True, exist_ok=True)
+    ws = user_workspace(user_id)
+    (ws / "docs").mkdir(parents=True, exist_ok=True)
+
+
+def _sessions_path(user_id: int) -> Path:
+    return user_root(user_id) / "sessions.json"
+
+
+def load_session(user_id: int, project: str) -> str | None:
+    try:
+        data = json.loads(_sessions_path(user_id).read_text())
+        return data.get(project)
+    except Exception:
+        return None
+
+
+def save_session(user_id: int, project: str, session_id: str | None):
+    path = _sessions_path(user_id)
+    try:
+        data = json.loads(path.read_text()) if path.exists() else {}
+    except Exception:
+        data = {}
+    if session_id:
+        data[project] = session_id
+    else:
+        data.pop(project, None)
+    path.write_text(json.dumps(data))
+
+
+def claude_env(user_id: int) -> dict:
+    env = os.environ.copy()
+    env["CLAUDE_CONFIG_DIR"] = str(user_claude_dir(user_id))
+    # 유저 워크스페이스를 HOME 처럼 참조하는 도구 대비 — 단 시스템 HOME 은 유지
+    return env
+
+
+def has_credentials(user_id: int) -> bool:
+    """자격증명 파일 존재 여부만 확인 (내용은 절대 읽지 않음)."""
+    d = user_claude_dir(user_id)
+    return (d / ".credentials.json").exists()
+
+
+# ── Claude 실행 ──────────────────────────────────────────────────
+
+def run_claude_turn(user_id: int, project: str, prompt: str) -> tuple[str, bool]:
+    """한 턴 실행. returns (응답 텍스트, 인증오류 여부)."""
+    claude_cmd = config.get("claude_cmd", "claude")
+    cmd = [
+        claude_cmd, "-p",
+        "--output-format", "json",
+        "--dangerously-skip-permissions",
+    ]
+    sid = load_session(user_id, project)
+    if sid:
+        cmd.extend(["--resume", sid])
+    cmd.append("--")
+    cmd.append(prompt)
+
+    try:
+        result = subprocess.run(
+            cmd,
+            cwd=str(user_workspace(user_id)),
+            env=claude_env(user_id),
+            capture_output=True, text=True,
+            timeout=TURN_TIMEOUT_SEC,
+        )
+    except subprocess.TimeoutExpired:
+        return ("작업이 너무 오래 걸려 중단됐어요. 다시 시도해주세요.", False)
+
+    out = (result.stdout or "").strip()
+    err = (result.stderr or "").strip()
+
+    auth_markers = ("Invalid API key", "not logged in", "Please run /login",
+                    "OAuth token has expired", "authentication_error")
+    if result.returncode != 0:
+        combined = f"{out}\n{err}"
+        if any(m.lower() in combined.lower() for m in auth_markers):
+            return ("", True)
+        # --resume 대상 세션 소실 → 세션 리셋 후 1회 재시도
+        if sid and ("No conversation found" in combined or "session" in combined.lower()):
+            save_session(user_id, project, None)
+            return run_claude_turn(user_id, project, prompt)
+        logger.error(f"claude exit {result.returncode} user={user_id}: {combined[:300]}")
+        return ("(처리 중 오류가 발생했어요. 다시 시도해주세요.)", False)
+
+    try:
+        payload = json.loads(out)
+        text = payload.get("result", "")
+        new_sid = payload.get("session_id")
+        if new_sid:
+            save_session(user_id, project, new_sid)
+        if payload.get("is_error"):
+            combined = text or err
+            if any(m.lower() in combined.lower() for m in auth_markers):
+                return ("", True)
+        return (text or "(응답이 비어 있어요)", False)
+    except json.JSONDecodeError:
+        return (out[:4000] or "(응답이 비어 있어요)", False)
+
+
+# ── 로그인 플로우 (claude setup-token, pty) ──────────────────────
+
+class LoginSession:
+    """유저별 setup-token 로그인 세션. 코드/토큰은 로그에 절대 남기지 않는다."""
+
+    def __init__(self, user_id: int):
+        self.user_id = user_id
+        self.state = "starting"      # starting → waiting_code → done/failed
+        self.url: str | None = None
+        self.created = time.time()
+        self._pid: int | None = None
+        self._fd: int | None = None
+        self._lock = threading.Lock()
+
+    def start(self) -> str | None:
+        """setup-token 프로세스를 띄우고 인증 URL을 캡처해 반환."""
+        claude_cmd = config.get("claude_cmd", "claude")
+        env = claude_env(self.user_id)
+        pid, fd = pty.fork()
+        if pid == 0:  # child
+            os.chdir(str(user_workspace(self.user_id)))
+            os.execvpe(claude_cmd, [claude_cmd, "setup-token"], env)
+        self._pid, self._fd = pid, fd
+        buf = ""
+        deadline = time.time() + LOGIN_URL_TIMEOUT_SEC
+        while time.time() < deadline:
+            r, _, _ = select.select([fd], [], [], 1.0)
+            if not r:
+                continue
+            try:
+                chunk = os.read(fd, 4096).decode(errors="replace")
+            except OSError:
+                break
+            buf += re.sub(r"\x1b\[[0-9;?]*[a-zA-Z]", "", chunk)
+            m = _URL_RE.search(buf)
+            if m:
+                self.url = m.group(0).strip()
+                self.state = "waiting_code"
+                return self.url
+        self.terminate()
+        self.state = "failed"
+        return None
+
+    def submit_code(self, code: str) -> bool:
+        with self._lock:
+            if self.state != "waiting_code" or self._fd is None:
+                return False
+            try:
+                os.write(self._fd, (code.strip() + "\n").encode())
+            except OSError:
+                self.state = "failed"
+                return False
+            # 성공/실패 판정: 프로세스 종료 대기 (최대 60초)
+            deadline = time.time() + 60
+            while time.time() < deadline:
+                pid_done, status = os.waitpid(self._pid, os.WNOHANG)
+                if pid_done:
+                    ok = os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+                    self.state = "done" if ok else "failed"
+                    self._cleanup()
+                    return ok
+                # 남은 출력 소진 (블록 방지)
+                r, _, _ = select.select([self._fd], [], [], 0.5)
+                if r:
+                    try:
+                        os.read(self._fd, 4096)
+                    except OSError:
+                        pass
+            self.state = "failed"
+            self.terminate()
+            return False
+
+    def expired(self) -> bool:
+        return time.time() - self.created > LOGIN_CODE_TTL_SEC
+
+    def terminate(self):
+        if self._pid:
+            try:
+                os.kill(self._pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        self._cleanup()
+
+    def _cleanup(self):
+        if self._fd is not None:
+            try:
+                os.close(self._fd)
+            except OSError:
+                pass
+            self._fd = None
+
+
+login_sessions: dict[int, LoginSession] = {}
+login_lock = threading.Lock()
+
+
+# ── 메시지 처리 ──────────────────────────────────────────────────
+
+class CloudWorker:
+    def __init__(self):
+        self._executor = ThreadPoolExecutor(
+            max_workers=config.get("max_concurrent", 5), thread_name_prefix="turn")
+        self._locks: dict[tuple, threading.Lock] = {}
+        self._locks_guard = threading.Lock()
+        self._spawned: set = set()
+        self._spawned_guard = threading.Lock()
+        self._processed: set = set()
+
+    def _key_lock(self, user_id: int, project: str) -> threading.Lock:
+        key = (user_id, project)
+        with self._locks_guard:
+            if key not in self._locks:
+                self._locks[key] = threading.Lock()
+            return self._locks[key]
+
+    def reply(self, api_key: str, text: str, reply_to, project: str):
+        user_api(api_key, "POST", "/api/bot/reply", {
+            "text": text, "reply_to": reply_to, "project": project, "is_final": True,
+        })
+
+    def mark_processed(self, api_key: str, msg_id):
+        # 마킹 유실 = pending 영구 잔류 = 폴링 핫루프 (2026-07-06 사고) → 백오프 재시도
+        for attempt in range(3):
+            result = user_api(api_key, "PATCH", "/api/bot/message",
+                              {"id": msg_id, "updates": {"processed": True}})
+            if result is not None:
+                return
+            time.sleep(1 + attempt * 2)
+        logger.error(f"mark_processed FAILED after retries: msg #{msg_id}")
+
+    def process(self, msg: dict):
+        msg_id = msg.get("id")
+        user_id = msg.get("user_id")
+        project = msg.get("project", "general") or "general"
+        text = (msg.get("text") or "").strip()
+
+        user = roster.get(user_id)
+        if not user:
+            logger.warning(f"msg #{msg_id}: unknown cloud user {user_id}, skipping")
+            return
+        api_key = user["apiKey"]
+
+        if msg_id in self._processed:
+            self.mark_processed(api_key, msg_id)
+            return
+        self._processed.add(msg_id)
+        if len(self._processed) > 2000:
+            self._processed = {msg_id}
+
+        self.mark_processed(api_key, msg_id)
+        ensure_user_dirs(user_id)
+        logger.info(f"msg #{msg_id} user={user_id} project={project}: {text[:60]}")
+
+        # ── 로그인 플로우 ──
+        with login_lock:
+            session = login_sessions.get(user_id)
+            if session and session.expired():
+                session.terminate()
+                del login_sessions[user_id]
+                session = None
+
+        code_match = CODE_RE.search(text.split("https://")[0]) if text else None
+        if session and session.state == "waiting_code" and code_match:
+            self.reply(api_key, "코드를 확인하고 있어요...", [msg_id], project)
+            ok = session.submit_code(code_match.group(0))
+            with login_lock:
+                login_sessions.pop(user_id, None)
+            if ok:
+                self.reply(api_key,
+                           "✅ 클로드 계정이 연결됐어요! 이제 뭐든 시켜보세요.",
+                           [msg_id], project)
+            else:
+                self.reply(api_key,
+                           "연결에 실패했어요. `재로그인` 이라고 입력해 다시 시도해주세요.",
+                           [msg_id], project)
+            return
+
+        if text in ("재로그인", "/relogin", "리로그인", "로그인", "클로드 연결", "연결"):
+            self.reply(api_key, "클로드 로그인을 시작할게요. 잠시만요...", [msg_id], project)
+            new_session = LoginSession(user_id)
+            with login_lock:
+                old = login_sessions.pop(user_id, None)
+                if old:
+                    old.terminate()
+                login_sessions[user_id] = new_session
+            url = new_session.start()
+            if url:
+                self.reply(api_key,
+                           f"아래 링크를 열어 클로드 계정으로 로그인한 뒤, 표시되는 코드를 여기에 붙여넣어 주세요:\n\n{url}",
+                           [msg_id], project)
+            else:
+                with login_lock:
+                    login_sessions.pop(user_id, None)
+                self.reply(api_key,
+                           "로그인 준비에 실패했어요. 잠시 후 `재로그인` 으로 다시 시도해주세요.",
+                           [msg_id], project)
+            return
+
+        # ── 미연결 유저: 안내만 ──
+        if not has_credentials(user_id):
+            self.reply(api_key, NEED_LOGIN_MESSAGE, [msg_id], project)
+            return
+
+        # ── 일반 턴 ──
+        response, auth_error = run_claude_turn(user_id, project, text)
+        if auth_error:
+            self.reply(api_key,
+                       "클로드 로그인이 만료됐어요. `재로그인` 이라고 입력해 다시 연결해주세요.",
+                       [msg_id], project)
+            return
+        for chunk in _split_chunks(response):
+            self.reply(api_key, chunk, [msg_id], project)
+
+    def _process_safe(self, msg: dict):
+        key = (msg.get("user_id"), msg.get("project", "general") or "general")
+        msg_id = msg.get("id")
+        try:
+            with self._key_lock(*key):
+                if shutdown_event.is_set():
+                    return
+                self.process(msg)
+        except Exception as e:
+            logger.error(f"process error msg #{msg_id}: {e}", exc_info=True)
+            user = roster.get(msg.get("user_id"))
+            if user:
+                try:
+                    self.reply(user["apiKey"], f"(처리 오류: {e})", [msg_id], key[1])
+                except Exception:
+                    pass
+        finally:
+            with self._spawned_guard:
+                self._spawned.discard(msg_id)
+
+    def heartbeats(self):
+        """전 유저 온라인 표시 — 로스터의 각 유저로 heartbeat 전송."""
+        with roster._lock:
+            users = list(roster._users.values())
+        for u in users:
+            user_api(u["apiKey"], "POST", "/api/bot/heartbeat", {
+                "is_working": False, "cloud": True,
+            })
+
+    def run(self):
+        logger.info("cloud daemon started")
+        roster.sync(force=True)
+        last_heartbeat = 0.0
+        poll_interval = config.get("poll_interval_sec", 3)
+        errors = 0
+        while not shutdown_event.is_set():
+            try:
+                now = time.time()
+                roster.sync()
+                if now - last_heartbeat > 30:
+                    threading.Thread(target=self.heartbeats, daemon=True).start()
+                    last_heartbeat = now
+
+                result = host_api("GET", "/api/cloud/poll")
+                if result is None:
+                    errors += 1
+                    shutdown_event.wait(min(30, 2 ** errors))
+                    continue
+                errors = 0
+
+                spawned_any = False
+                for msg in result.get("pending", []):
+                    msg_id = msg.get("id")
+                    with self._spawned_guard:
+                        if msg_id in self._spawned:
+                            continue
+                        self._spawned.add(msg_id)
+                    spawned_any = True
+                    self._executor.submit(self._process_safe, msg)
+
+                if not spawned_any:
+                    shutdown_event.wait(poll_interval)
+            except Exception as e:
+                errors += 1
+                logger.error(f"loop error: {e}", exc_info=True)
+                shutdown_event.wait(min(30, 2 ** errors))
+        logger.info("cloud daemon stopped")
+
+
+def _split_chunks(text: str, limit: int = 3500) -> list[str]:
+    if len(text) <= limit:
+        return [text]
+    chunks, cur = [], ""
+    for line in text.split("\n"):
+        if len(cur) + len(line) + 1 > limit:
+            chunks.append(cur)
+            cur = line
+        else:
+            cur = f"{cur}\n{line}" if cur else line
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+
+def main():
+    global config
+    if not CONFIG_PATH.exists():
+        print(f"config not found: {CONFIG_PATH}", file=sys.stderr)
+        sys.exit(1)
+    config = json.loads(CONFIG_PATH.read_text())
+    for k in ("api_url", "host_key"):
+        if not config.get(k):
+            print(f"config missing: {k}", file=sys.stderr)
+            sys.exit(1)
+
+    def handle_sig(_sig, _frm):
+        shutdown_event.set()
+    signal.signal(signal.SIGTERM, handle_sig)
+    signal.signal(signal.SIGINT, handle_sig)
+
+    CloudWorker().run()
+
+
+if __name__ == "__main__":
+    main()
