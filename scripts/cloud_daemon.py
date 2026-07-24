@@ -220,13 +220,9 @@ def provision_unix_user(user_id: int):
             # 루트(700)에 ubuntu traverse(x)만 허용 — 목록/읽기는 불가, 하위 진입만 가능
             subprocess.run(["sudo", "-n", "setfacl", "-m", "u:ubuntu:--x", str(root)],
                            check=True, capture_output=True)
-            # 번들 스킬 공유: 유저 claude/skills → 공용 스킬 디렉토리 심링크
-            shared_skills = config.get("shared_skills_dir", "/srv/pv/shared/skills")
-            skills_link = root / "claude" / "skills"
-            if Path(shared_skills).exists() and not skills_link.exists():
-                subprocess.run(
-                    ["sudo", "-n", "-u", name, "env", "ln", "-s", shared_skills, str(skills_link)],
-                    capture_output=True)
+            # 번들 스킬: 유저 소유 skills/ 폴더 안에 번들 스킬을 개별 심링크
+            # → 유저(claude)가 자기 스킬을 옆에 설치할 수 있음 (통짜 심링크는 읽기전용이라 불가했음)
+            self_provision_skills(user_id)
             # workspace 에 ACL: 포탈/데몬(ubuntu)과 claude(pv<id>) 모두 접근,
             # 다른 pv 유저는 여전히 차단 (root 700 이 1차 방어)
             subprocess.run(["sudo", "-n", "setfacl", "-R",
@@ -239,6 +235,58 @@ def provision_unix_user(user_id: int):
         except subprocess.CalledProcessError as e:
             logger.error(f"provision {name} failed: {e.stderr.decode()[:200] if e.stderr else e}")
             raise
+
+
+_disk_cache: dict[int, tuple[float, bool]] = {}
+_disk_lock = threading.Lock()
+DISK_CHECK_TTL_SEC = 600
+
+
+def over_disk_quota(user_id: int) -> bool:
+    """유저 워크스페이스 사용량이 한도 초과인지 (10분 캐시). du 는 무거우니 드물게."""
+    gb = config.get("limits", {}).get("disk_quota_gb", 0)
+    if not gb:
+        return False
+    now = time.time()
+    with _disk_lock:
+        c = _disk_cache.get(user_id)
+        if c and now - c[0] < DISK_CHECK_TTL_SEC:
+            return c[1]
+    try:
+        r = subprocess.run(["sudo", "-n", "-u", unix_user(user_id), "env",
+                            "du", "-sb", str(user_workspace(user_id))],
+                           capture_output=True, text=True, timeout=30)
+        used = int((r.stdout or "0").split()[0]) if r.stdout.strip() else 0
+        over = used > gb * 1024 ** 3
+    except Exception:
+        over = False
+    with _disk_lock:
+        _disk_cache[user_id] = (now, over)
+    return over
+
+
+def self_provision_skills(user_id: int):
+    """유저 skills/ 폴더(유저 소유)에 번들 스킬을 개별 심링크로 채운다.
+    유저가 자기 스킬을 같은 폴더에 추가 설치할 수 있게 하려는 목적.
+    번들 스킬이 늘면 새 것만 추가된다 (기존 유지)."""
+    shared = Path(config.get("shared_skills_dir", "/srv/pv/shared/skills"))
+    if not shared.exists():
+        return
+    name = unix_user(user_id)
+    skills_dir = user_claude_dir(user_id) / "skills"
+    if skills_dir.is_symlink():  # 과거 통짜 심링크 → 실제 폴더로 전환
+        subprocess.run(["sudo", "-n", "-u", name, "env", "rm", "-f", str(skills_dir)],
+                       capture_output=True)
+    subprocess.run(["sudo", "-n", "-u", name, "env", "mkdir", "-p", str(skills_dir)],
+                   capture_output=True)
+    for skill in shared.iterdir():
+        if not skill.is_dir():
+            continue
+        link = skills_dir / skill.name
+        if not link.exists():
+            subprocess.run(
+                ["sudo", "-n", "-u", name, "env", "ln", "-sfn", str(skill), str(link)],
+                capture_output=True)
 
 
 def wrap_isolated(user_id: int, cmd: list[str], env_overrides: dict, cwd: str,
@@ -794,6 +842,22 @@ class CloudWorker:
         # ── 미연결 유저: 안내만 ──
         if not has_credentials(user_id):
             self.reply(api_key, NEED_LOGIN_MESSAGE, [msg_id], project)
+            return
+
+        # ── 디스크 쿼터 초과 → 전환 안내 ──
+        if over_disk_quota(user_id):
+            gb = config.get("limits", {}).get("disk_quota_gb", 10)
+            user_api(api_key, "POST", "/api/bot/reply", {
+                "text": (f"⚠️ 저장 공간 한도({gb}GB)를 초과했어요.\n\n"
+                         "클라우드는 저장 공간이 제한돼 있어요. 큰 파일을 다루거나 더 많은 공간이 "
+                         "필요하면 **내 컴퓨터(맥/PC)에 피터를 설치**하면 제한 없이 쓸 수 있어요. "
+                         "설정에서 '내 AI 비서 설치'를 신청해주세요.\n\n"
+                         "(문서탭에서 필요 없는 파일을 지우면 공간을 확보할 수 있어요.)"),
+                "reply_to": [msg_id], "project": project, "is_final": True,
+                "subtype": "provision_suggest",
+            })
+            user_api(api_key, "POST", "/api/cloud/heavy-event",
+                     {"kind": "heavy_disk", "project": project, "context": "disk quota exceeded"})
             return
 
         # ── 일반 턴 ──
