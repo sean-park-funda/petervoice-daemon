@@ -418,12 +418,12 @@ def build_systemd_run(user_id: int, cmd: list[str], env: dict, cwd: str, unit: s
         "sudo", "-n", "systemd-run",
         f"--uid={unix_user(user_id)}", "--gid=pvusers",
         f"--unit={unit}", "--wait", "--pipe", "--quiet",
-        f"-p=EnvironmentFile={env_file}",
-        f"-p=WorkingDirectory={cwd}",
-        f"-p=MemoryMax={mem}", "-p=MemorySwapMax=0",
-        f"-p=CPUQuota={cpu}", f"-p=TasksMax={tasks}",
-        f"-p=RuntimeMaxSec={runtime_max}",
-        "-p=PrivateTmp=yes", "-p=NoNewPrivileges=yes",
+        f"--property=EnvironmentFile={env_file}",
+        f"--property=WorkingDirectory={cwd}",
+        f"--property=MemoryMax={mem}", "--property=MemorySwapMax=0",
+        f"--property=CPUQuota={cpu}", f"--property=TasksMax={tasks}",
+        f"--property=RuntimeMaxSec={runtime_max}",
+        "--property=PrivateTmp=yes", "--property=NoNewPrivileges=yes",
         *cmd,
     ]
 
