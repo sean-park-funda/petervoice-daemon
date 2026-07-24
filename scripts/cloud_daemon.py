@@ -37,6 +37,8 @@ import urllib.error
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import cloud_container as ctr
+
 CONFIG_PATH = Path(os.environ.get("PV_CLOUD_CONFIG", "/etc/pv-cloud/config.json"))
 
 logging.basicConfig(
@@ -376,6 +378,8 @@ def claude_env(user_id: int) -> dict:
 def has_credentials(user_id: int) -> bool:
     """자격증명 파일 존재 여부만 확인 (내용은 절대 읽지 않음).
     격리 모드에서는 파일이 pv<id> 소유라 sudo -u 로 확인."""
+    if ctr.enabled_for(user_id):
+        return ctr.has_credentials(user_id)
     cred = user_claude_dir(user_id) / ".credentials.json"
     if not isolation_enabled():
         return cred.exists()
@@ -384,6 +388,27 @@ def has_credentials(user_id: int) -> bool:
         ["sudo", "-n", "-u", unix_user(user_id), "env", "test", "-f", str(cred)],
         capture_output=True)
     return r.returncode == 0
+
+
+CLOUD_CONTAINER_SYSTEM_PROMPT = """# 실행 환경: 피터보이스 클라우드 (전용 컨테이너)
+
+당신은 이 사용자 전용 리눅스 컨테이너에서 실행됩니다. 이 안에서는 자유롭게 작업하세요.
+
+## 가능한 것
+- 패키지 설치 자유: `apt-get install`(sudo 필요 시 그대로), `pip install`, `npm install -g` 모두 가능.
+  설치물은 홈(/home/agent)과 시스템에 유지됩니다.
+- 서버/포트도 컨테이너 내부라 자유롭게 사용 가능 (다른 사용자와 격리됨).
+
+## 제약
+- 메모리 3GB, CPU, 30분/턴 제한. 초과 시 강제 종료됩니다. 대규모 학습·장시간 렌더링은 피하세요.
+- 대용량 파일은 디스크 한도(사용자별)를 넘지 않게.
+- **반복/예약 작업**: crontab 대신 피터보이스 HeartBeat 를 쓰세요
+  (`docs/HEARTBEAT.md` + `POST $API_URL/api/tasks`, interval_min>=30).
+
+무거운 작업(딥러닝 학습, GPU, 대량 처리)이 필요하면 응답에 `[HEAVY_TASK]` 를 포함하고,
+사용자에게 "내 컴퓨터에 설치하면 제한 없이 가능하다"고 안내하세요.
+가벼운·중간 작업은 자유롭게 하세요.
+"""
 
 
 CLOUD_SYSTEM_PROMPT = """# 실행 환경: 피터보이스 클라우드 (공유 서버)
@@ -500,6 +525,19 @@ def _reset_unit(unit: str):
 def run_claude_turn(user_id: int, project: str, prompt: str) -> tuple[str, str]:
     """한 턴 실행. returns (응답 텍스트, 상태).
     상태: "ok" | "auth" (재로그인 필요) | "heavy_mem" (메모리 초과) | "heavy_time" (시간 초과)."""
+    # T3: 컨테이너 모드 유저는 podman exec 경로
+    if ctr.enabled_for(user_id):
+        user = roster.get(user_id)
+        secrets = fetch_user_secrets(user_id, user["apiKey"]) if user else {}
+        sp = ctr.sysprompt_path_in_home(user_id, CLOUD_CONTAINER_SYSTEM_PROMPT)
+        sid = load_session(user_id, project)
+        rc, out, err = ctr.exec_claude_turn(user_id, project, prompt, sid, secrets, sp)
+        if rc == 137:
+            return ("", "heavy_mem")
+        if rc == 124:
+            return ("", "heavy_time")
+        return _parse_turn_result(rc, out, err, user_id, project, prompt, sid)
+
     claude_cmd = config.get("claude_cmd", "claude")
     cmd = [
         claude_cmd, "-p",
@@ -621,6 +659,14 @@ class LoginSession:
         """`claude auth login --claudeai` 를 띄우고 완전한 인증 URL을 캡처해 반환.
         맥 데몬(relogin.py)과 동일한 명령/방식 — setup-token 은 redirect_uri 없는
         불완전 URL을 내므로 쓰지 않는다."""
+        if ctr.enabled_for(self.user_id):
+            pid, fd, url = ctr.login_start(self.user_id)
+            if url:
+                self._pid, self._fd, self.url = pid, fd, url
+                self.state = "waiting_code"
+                return url
+            self.state = "failed"
+            return None
         claude_cmd = config.get("claude_cmd", "claude")
         ws = str(user_workspace(self.user_id))
         base_cmd = [claude_cmd, "auth", "login", "--claudeai"]
@@ -956,6 +1002,7 @@ class CloudWorker:
             pass
         roster.sync(force=True)
         last_heartbeat = 0.0
+        last_reap = 0.0
         poll_interval = config.get("poll_interval_sec", 3)
         errors = 0
         while not shutdown_event.is_set():
@@ -965,6 +1012,10 @@ class CloudWorker:
                 if now - last_heartbeat > 30:
                     threading.Thread(target=self.heartbeats, daemon=True).start()
                     last_heartbeat = now
+                # 유휴 컨테이너 정지 (5분마다)
+                if config.get("container", {}).get("enabled") and now - last_reap > 300:
+                    threading.Thread(target=ctr.reap_idle, daemon=True).start()
+                    last_reap = now
 
                 result = host_api("GET", "/api/cloud/poll")
                 if result is None:
@@ -1017,6 +1068,7 @@ def main():
         if not config.get(k):
             print(f"config missing: {k}", file=sys.stderr)
             sys.exit(1)
+    ctr.init(config, logger)
 
     def handle_sig(_sig, _frm):
         shutdown_event.set()
