@@ -395,8 +395,8 @@ CLOUD_CONTAINER_SYSTEM_PROMPT = """# 실행 환경: 피터보이스 클라우드
 당신은 이 사용자 전용 리눅스 컨테이너에서 실행됩니다. 이 안에서는 자유롭게 작업하세요.
 
 ## 가능한 것
-- 패키지 설치 자유: `apt-get install`(sudo 필요 시 그대로), `pip install`, `npm install -g` 모두 가능.
-  설치물은 홈(/home/agent)과 시스템에 유지됩니다.
+- 패키지 설치 자유: `sudo apt-get install -y <패키지>`(비번 없이 됨), `pip install`, `npm install -g` 모두 가능.
+  설치물은 유지됩니다.
 - 서버/포트도 컨테이너 내부라 자유롭게 사용 가능 (다른 사용자와 격리됨).
 
 ## 제약
