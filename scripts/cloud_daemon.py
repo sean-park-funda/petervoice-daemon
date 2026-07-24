@@ -338,16 +338,124 @@ def has_credentials(user_id: int) -> bool:
     return r.returncode == 0
 
 
-# ── Claude 실행 ──────────────────────────────────────────────────
+CLOUD_SYSTEM_PROMPT = """# 실행 환경: 피터보이스 클라우드 (공유 서버)
 
-def run_claude_turn(user_id: int, project: str, prompt: str) -> tuple[str, bool]:
-    """한 턴 실행. returns (응답 텍스트, 인증오류 여부)."""
+당신은 여러 사용자가 공유하는 리눅스 서버에서, 이 사용자 전용 계정으로 격리 실행됩니다.
+자원이 제한된 공유 환경이므로 아래를 지켜주세요.
+
+## 환경 제약
+- 한 번의 작업(턴)은 메모리 3GB, CPU, 30분 시간 제한이 걸려 있습니다. 초과하면 강제 종료됩니다.
+- 시스템 전역 설치(apt, sudo, npm -g)는 불가합니다. 대신:
+  - 파이썬 패키지: `pip install --user` 또는 가상환경(venv)을 홈 아래에 만들어 사용
+  - node 패키지: 프로젝트 폴더에 로컬 설치(`npm install`), node 버전 변경은 홈에 nvm 설치
+- 서버/데몬을 상시 띄우지 마세요. 확인용으로 잠깐 띄웠다면 작업 끝에 반드시 종료하세요.
+- 대용량 데이터, 파일은 작업 폴더에만. 디스크도 사용자별 한도가 있습니다.
+
+## 무거운 작업 안내 (중요)
+아래 유형은 **착수하지 말고**, 먼저 사용자에게 안내하세요:
+"이 작업은 클라우드 환경의 한도를 넘어요. 내 컴퓨터(맥/PC)에 피터를 직접 설치하면 제한 없이 할 수 있어요. 설정에서 '내 AI 비서 설치'를 신청해보세요."
+- 머신러닝/딥러닝 모델 학습·추론, GPU 필요 작업
+- 대량 크롤링/스크래핑, 대용량(수 GB) 데이터 처리
+- 영상 렌더링·인코딩 등 장시간 CPU 작업
+- 상시 실행 서버/봇 운영, 시스템 패키지 설치가 꼭 필요한 작업
+이런 요청에는 응답 어딘가에 `[HEAVY_TASK]` 를 포함하세요 (사용자에겐 보이지 않게 처리됩니다).
+
+가벼운 작업(리서치, 문서 작성, 데이터 분석, 소규모 코드/스크립트, 웹 API 호출)은 자유롭게 하세요.
+"""
+
+
+def _ensure_cloud_system_prompt(user_id: int) -> str | None:
+    """클라우드 환경 가이드 시스템 프롬프트 파일 (유저 워크스페이스에 1회 생성, ACL로 pv유저 읽기 가능)."""
+    try:
+        p = user_workspace(user_id) / ".cloud-system-prompt.md"
+        if not p.exists() or p.read_text() != CLOUD_SYSTEM_PROMPT:
+            p.write_text(CLOUD_SYSTEM_PROMPT)
+            os.chmod(p, 0o644)
+        return str(p)
+    except OSError:
+        return None
+
+
+# ── Claude 실행 (리소스 상한: systemd-run cgroup) ────────────────
+# 각 턴을 systemd 일회성 유닛으로 격리 실행 → 메모리/CPU/태스크/시간 상한을 강제한다.
+# 폭주해도 그 턴 유닛만 죽고 호스트/데몬/타 유저는 무사. PrivateTmp 로 /tmp 도 사설.
+# 시크릿은 EnvironmentFile(600, ubuntu 소유, 턴마다 삭제)로 전달 — argv 비노출.
+
+_turn_counter = [0]
+_turn_counter_lock = threading.Lock()
+
+
+def _turnenv_dir() -> Path:
+    d = _state_dir() / "turnenv"
+    d.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(d, 0o700)
+    except OSError:
+        pass
+    return d
+
+
+def _next_unit_id(user_id: int) -> str:
+    with _turn_counter_lock:
+        _turn_counter[0] += 1
+        n = _turn_counter[0]
+    return f"pvturn-{user_id}-{os.getpid()}-{n}"
+
+
+def _escape_envfile_value(v: str) -> str:
+    # systemd EnvironmentFile: 한 줄 KEY=value, 값의 개행 제거 (다중 라인 미지원)
+    return v.replace("\n", " ").replace("\r", " ")
+
+
+def build_systemd_run(user_id: int, cmd: list[str], env: dict, cwd: str, unit: str,
+                      env_file: str) -> list[str]:
+    lim = config.get("limits", {})
+    mem = lim.get("memory_max", "3G")
+    cpu = lim.get("cpu_quota", "150%")
+    tasks = str(lim.get("tasks_max", 256))
+    runtime_max = str(lim.get("turn_timeout_sec", TURN_TIMEOUT_SEC))
+    return [
+        "sudo", "-n", "systemd-run",
+        f"--uid={unix_user(user_id)}", "--gid=pvusers",
+        f"--unit={unit}", "--wait", "--pipe", "--quiet",
+        f"-p=EnvironmentFile={env_file}",
+        f"-p=WorkingDirectory={cwd}",
+        f"-p=MemoryMax={mem}", "-p=MemorySwapMax=0",
+        f"-p=CPUQuota={cpu}", f"-p=TasksMax={tasks}",
+        f"-p=RuntimeMaxSec={runtime_max}",
+        "-p=PrivateTmp=yes", "-p=NoNewPrivileges=yes",
+        *cmd,
+    ]
+
+
+def _unit_result(unit: str) -> str:
+    """systemd 유닛 종료 사유: success | oom-kill | timeout | ... """
+    try:
+        r = subprocess.run(["sudo", "-n", "systemctl", "show", unit,
+                            "-p", "Result", "--value"],
+                           capture_output=True, text=True, timeout=5)
+        return (r.stdout or "").strip()
+    except Exception:
+        return ""
+
+
+def _reset_unit(unit: str):
+    subprocess.run(["sudo", "-n", "systemctl", "reset-failed", unit],
+                   capture_output=True)
+
+
+def run_claude_turn(user_id: int, project: str, prompt: str) -> tuple[str, str]:
+    """한 턴 실행. returns (응답 텍스트, 상태).
+    상태: "ok" | "auth" (재로그인 필요) | "heavy_mem" (메모리 초과) | "heavy_time" (시간 초과)."""
     claude_cmd = config.get("claude_cmd", "claude")
     cmd = [
         claude_cmd, "-p",
         "--output-format", "json",
         "--dangerously-skip-permissions",
     ]
+    sp = _ensure_cloud_system_prompt(user_id)
+    if sp:
+        cmd.extend(["--append-system-prompt-file", sp])
     sid = load_session(user_id, project)
     if sid:
         cmd.extend(["--resume", sid])
@@ -356,46 +464,78 @@ def run_claude_turn(user_id: int, project: str, prompt: str) -> tuple[str, bool]
 
     pdir = project_dir(user_id, project)
     try:
-        (pdir / "docs").mkdir(parents=True, exist_ok=True)  # ACL 덕에 ubuntu 가 생성 가능
+        (pdir / "docs").mkdir(parents=True, exist_ok=True)
     except Exception:
         pass
     ws = str(pdir)
 
-    # 유저 본인의 시크릿/OAuth 토큰 주입 (값은 env 로만 — argv 노출 금지)
     user = roster.get(user_id)
     secrets = fetch_user_secrets(user_id, user["apiKey"]) if user else {}
+    env = {**isolated_env_overrides(user_id), **secrets}
 
-    wrapped = wrap_isolated(user_id, cmd, isolated_env_overrides(user_id), ws,
-                            preserve_env_names=sorted(secrets.keys()))
-    run_kwargs = {"capture_output": True, "text": True, "timeout": TURN_TIMEOUT_SEC}
-    if isolation_enabled():
-        # sudo 프로세스의 env 에 시크릿을 실어 --preserve-env 로 통과시킨다
-        run_kwargs["env"] = {**os.environ, **secrets}
-    else:
-        run_kwargs["cwd"] = ws
-        run_kwargs["env"] = {**claude_env(user_id), **secrets}
+    if not isolation_enabled():
+        # 로컬 개발: 상한 없이 직접 실행
+        try:
+            result = subprocess.run(cmd, cwd=ws, env={**claude_env(user_id), **secrets},
+                                    capture_output=True, text=True, timeout=TURN_TIMEOUT_SEC)
+        except subprocess.TimeoutExpired:
+            return ("작업이 너무 오래 걸려 중단됐어요.", "heavy_time")
+        return _parse_turn_result(result.returncode, result.stdout, result.stderr,
+                                  user_id, project, prompt, sid)
 
+    # 격리 모드: systemd-run cgroup 상한
+    unit = _next_unit_id(user_id)
+    env_file = _turnenv_dir() / f"{unit}.env"
     try:
-        result = subprocess.run(wrapped, **run_kwargs)
+        lines = [f"{k}={_escape_envfile_value(v)}" for k, v in env.items()]
+        env_file.write_text("\n".join(lines) + "\n")
+        os.chmod(env_file, 0o600)
+    except OSError as e:
+        logger.error(f"env file write failed: {e}")
+        return ("(일시적 오류로 실행에 실패했어요.)", "ok")
+
+    wrapped = build_systemd_run(user_id, cmd, env, ws, unit, str(env_file))
+    try:
+        result = subprocess.run(wrapped, capture_output=True, text=True,
+                                timeout=config.get("limits", {}).get("turn_timeout_sec", TURN_TIMEOUT_SEC) + 30)
+        rc, out, err = result.returncode, result.stdout, result.stderr
     except subprocess.TimeoutExpired:
-        return ("작업이 너무 오래 걸려 중단됐어요. 다시 시도해주세요.", False)
+        rc, out, err = 124, "", "timeout"
+    finally:
+        try:
+            env_file.unlink()
+        except OSError:
+            pass
 
-    out = (result.stdout or "").strip()
-    err = (result.stderr or "").strip()
+    # 비정상 종료 → cgroup 사유 판별
+    if rc != 0:
+        res = _unit_result(unit)
+        _reset_unit(unit)
+        if res == "oom-kill":
+            logger.info(f"turn OOM-killed user={user_id}")
+            return ("", "heavy_mem")
+        if res in ("timeout", "runtime-max"):
+            return ("", "heavy_time")
+    else:
+        _reset_unit(unit)
 
+    return _parse_turn_result(rc, out, err, user_id, project, prompt, sid)
+
+
+def _parse_turn_result(rc, out, err, user_id, project, prompt, sid) -> tuple[str, str]:
+    out = (out or "").strip()
+    err = (err or "").strip()
     auth_markers = ("Invalid API key", "not logged in", "Please run /login",
                     "OAuth token has expired", "authentication_error")
-    if result.returncode != 0:
+    if rc != 0:
         combined = f"{out}\n{err}"
         if any(m.lower() in combined.lower() for m in auth_markers):
-            return ("", True)
-        # --resume 대상 세션 소실 → 세션 리셋 후 1회 재시도
+            return ("", "auth")
         if sid and ("No conversation found" in combined or "session" in combined.lower()):
             save_session(user_id, project, None)
             return run_claude_turn(user_id, project, prompt)
-        logger.error(f"claude exit {result.returncode} user={user_id}: {combined[:300]}")
-        return ("(처리 중 오류가 발생했어요. 다시 시도해주세요.)", False)
-
+        logger.error(f"claude exit {rc} user={user_id}: {combined[:300]}")
+        return ("(처리 중 오류가 발생했어요. 다시 시도해주세요.)", "ok")
     try:
         payload = json.loads(out)
         text = payload.get("result", "")
@@ -403,12 +543,11 @@ def run_claude_turn(user_id: int, project: str, prompt: str) -> tuple[str, bool]
         if new_sid:
             save_session(user_id, project, new_sid)
         if payload.get("is_error"):
-            combined = text or err
-            if any(m.lower() in combined.lower() for m in auth_markers):
-                return ("", True)
-        return (text or "(응답이 비어 있어요)", False)
+            if any(m.lower() in (text or err).lower() for m in auth_markers):
+                return ("", "auth")
+        return (text or "(응답이 비어 있어요)", "ok")
     except json.JSONDecodeError:
-        return (out[:4000] or "(응답이 비어 있어요)", False)
+        return (out[:4000] or "(응답이 비어 있어요)", "ok")
 
 
 # ── 로그인 플로우 (claude setup-token, pty) ──────────────────────
@@ -658,14 +797,56 @@ class CloudWorker:
             return
 
         # ── 일반 턴 ──
-        response, auth_error = run_claude_turn(user_id, project, text)
-        if auth_error:
+        response, status = run_claude_turn(user_id, project, text)
+        if status == "auth":
             self.reply(api_key,
                        "클로드 로그인이 만료됐어요. `재로그인` 이라고 입력해 다시 연결해주세요.",
                        [msg_id], project)
             return
-        for chunk in _split_chunks(response):
-            self.reply(api_key, chunk, [msg_id], project)
+        if status in ("heavy_mem", "heavy_time"):
+            self.report_heavy(api_key, user_id, project, msg_id, status, text)
+            return
+        # L0 사전 감지: Claude 가 무거운 작업이라 판단해 [HEAVY_TASK] 태그를 남긴 경우
+        if "[HEAVY_TASK]" in response:
+            response = response.replace("[HEAVY_TASK]", "").strip()
+            subtype = "provision_suggest"
+            user_api(api_key, "POST", "/api/cloud/heavy-event", {
+                "kind": "intent", "project": project, "context": text[:200],
+            })
+        else:
+            subtype = None
+        chunks = _split_chunks(response)
+        for i, chunk in enumerate(chunks):
+            # CTA 카드는 마지막 청크에만 (설치 신청 버튼)
+            st = subtype if (subtype and i == len(chunks) - 1) else None
+            user_api(api_key, "POST", "/api/bot/reply", {
+                "text": chunk, "reply_to": [msg_id], "project": project,
+                "is_final": True, **({"subtype": st} if st else {}),
+            })
+
+    def report_heavy(self, api_key, user_id, project, msg_id, status, user_text):
+        """리소스 한도 초과 → 이유 + 전환 안내(CTA). heavy 이벤트 기록도 함께."""
+        lim = config.get("limits", {})
+        if status == "heavy_mem":
+            reason = f"메모리 한도({lim.get('memory_max', '3G')})를 넘어 작업이 중단됐어요."
+        else:
+            mins = int(lim.get("turn_timeout_sec", TURN_TIMEOUT_SEC)) // 60
+            reason = f"작업이 시간 한도({mins}분)를 넘어 중단됐어요."
+        msg = (
+            f"⚠️ {reason}\n\n"
+            "클라우드 피터보이스는 리서치·문서·가벼운 코드 작업에 맞춰져 있어요. "
+            "지금처럼 무거운 작업(대용량 처리·머신러닝·상시 서버 등)은 "
+            "**내 컴퓨터(맥/PC)에 피터를 직접 설치하면 제한 없이** 할 수 있어요.\n\n"
+            "설정 화면에서 '내 AI 비서 설치'를 신청하시면 안내해드릴게요."
+        )
+        # subtype 으로 웹이 CTA 카드(설치 신청 버튼)를 렌더 + heavy 이벤트 기록
+        user_api(api_key, "POST", "/api/bot/reply", {
+            "text": msg, "reply_to": [msg_id], "project": project, "is_final": True,
+            "subtype": "provision_suggest",
+        })
+        user_api(api_key, "POST", "/api/cloud/heavy-event", {
+            "kind": status, "project": project, "context": user_text[:200],
+        })
 
     def _process_safe(self, msg: dict):
         key = (msg.get("user_id"), msg.get("project", "general") or "general")
@@ -698,6 +879,12 @@ class CloudWorker:
 
     def run(self):
         logger.info("cloud daemon started")
+        # 재시작 시 지난 턴의 잔여 env 파일 정리 (600, 시크릿 잔존 방지)
+        try:
+            for f in _turnenv_dir().glob("*.env"):
+                f.unlink()
+        except Exception:
+            pass
         roster.sync(force=True)
         last_heartbeat = 0.0
         poll_interval = config.get("poll_interval_sec", 3)
