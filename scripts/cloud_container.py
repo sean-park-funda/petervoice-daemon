@@ -47,7 +47,9 @@ def enabled_for(user_id: int) -> bool:
 
 
 def home_root() -> Path:
-    return Path(_cfg().get("home_root", "/srv/pv/cusers"))
+    # systemd 모드와 같은 경로를 쓴다 (웹 projects.directory/포탈/프록시가 이 경로 기준).
+    # 모드 차이는 소유권뿐: systemd=pv<id>, container=agent uid(10000)
+    return Path(_cfg().get("home_root", _config.get("users_root", "/srv/pv/users")))
 
 
 def home(user_id: int) -> Path:
@@ -77,27 +79,27 @@ def _lock(user_id: int) -> threading.Lock:
 AGENT_UID = "10000"  # 컨테이너 내 agent 유저 uid (rootful: 호스트 uid 와 동일 매핑)
 
 
+_home_ready: set[int] = set()
+
+
 def ensure_home(user_id: int):
-    """컨테이너 홈 준비. rootful podman 은 컨테이너 uid=호스트 uid 이므로
-    홈을 agent uid(10000) 소유로 두고, docs 포탈(ubuntu)은 ACL 로 접근하게 한다.
-    systemd 모드 홈이 있으면 1회 이관."""
-    h = home(user_id)
-    if h.exists():
+    """컨테이너 홈 준비 (idempotent). 홈 전체를 agent uid(10000) 소유로 전환하고,
+    docs 포탈(ubuntu)은 **workspace 에만** ACL 접근 — claude 토큰 폴더는 ubuntu 도 못 읽게 유지."""
+    if user_id in _home_ready:
         return
-    subprocess.run(["sudo", "-n", "mkdir", "-p", str(h)], capture_output=True)
-    legacy = Path(_config.get("users_root", "/srv/pv/users")) / str(user_id)
-    if legacy.exists():
-        subprocess.run(["sudo", "-n", "cp", "-a", f"{legacy}/claude", str(h / "claude")],
-                       capture_output=True)
-        subprocess.run(["sudo", "-n", "cp", "-a", f"{legacy}/workspace", str(h / "workspace")],
-                       capture_output=True)
-    subprocess.run(["sudo", "-n", "mkdir", "-p", str(h / "workspace" / "general" / "docs")],
+    h = home(user_id)
+    subprocess.run(["sudo", "-n", "mkdir", "-p",
+                    str(h / "workspace" / "general" / "docs"), str(h / "claude")],
                    capture_output=True)
     subprocess.run(["sudo", "-n", "chown", "-R", f"{AGENT_UID}:{AGENT_UID}", str(h)],
                    capture_output=True)
-    # docs 포탈(ubuntu) 접근용 ACL (기존/신규 파일 모두)
+    subprocess.run(["sudo", "-n", "chmod", "700", str(h)], capture_output=True)
+    subprocess.run(["sudo", "-n", "chmod", "700", str(h / "claude")], capture_output=True)
+    # 루트에 ubuntu traverse + workspace 에만 ubuntu rwx (포탈용)
+    subprocess.run(["sudo", "-n", "setfacl", "-m", "u:ubuntu:--x", str(h)], capture_output=True)
     subprocess.run(["sudo", "-n", "setfacl", "-R", "-m", "u:ubuntu:rwx",
-                    "-m", "d:u:ubuntu:rwx", str(h)], capture_output=True)
+                    "-m", "d:u:ubuntu:rwx", str(h / "workspace")], capture_output=True)
+    _home_ready.add(user_id)
 
 
 def container_state(user_id: int) -> str:

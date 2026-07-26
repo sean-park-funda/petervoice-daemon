@@ -255,8 +255,8 @@ def over_disk_quota(user_id: int) -> bool:
         if c and now - c[0] < DISK_CHECK_TTL_SEC:
             return c[1]
     try:
-        r = subprocess.run(["sudo", "-n", "-u", unix_user(user_id), "env",
-                            "du", "-sb", str(user_workspace(user_id))],
+        # root du — 모드(systemd/container)별 소유권 차이와 무관하게 측정
+        r = subprocess.run(["sudo", "-n", "du", "-sb", str(user_workspace(user_id))],
                            capture_output=True, text=True, timeout=30)
         used = int((r.stdout or "0").split()[0]) if r.stdout.strip() else 0
         over = used > gb * 1024 ** 3
