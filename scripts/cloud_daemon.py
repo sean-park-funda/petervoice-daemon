@@ -211,6 +211,11 @@ def isolation_enabled() -> bool:
 
 def provision_unix_user(user_id: int):
     """유저별 unix 계정 + 소유권 격리 (idempotent). 첫 등장 시 1회."""
+    if ctr.enabled_for(user_id):
+        # 컨테이너 모드: 홈 준비는 ctr.ensure_home 담당(agent uid 소유 + claude 700).
+        # 여기서 chown/skills 심링크를 걸면 ubuntu 가 접근 못 하는 700 폴더를 파이썬으로
+        # 건드려 턴 전체가 실패한다. 스킬은 컨테이너에 shared_skills 로 마운트됨.
+        return
     if not isolation_enabled():
         ensure_user_dirs(user_id)
         return
@@ -292,7 +297,12 @@ def self_provision_skills(user_id: int):
         return
     name = unix_user(user_id)
     skills_dir = user_claude_dir(user_id) / "skills"
-    if skills_dir.is_symlink():  # 과거 통짜 심링크 → 실제 폴더로 전환
+    try:
+        is_link = skills_dir.is_symlink()
+    except OSError as e:  # 홈이 데몬(ubuntu)에게 닫혀 있는 경우 — 스킬만 포기, 턴은 진행
+        logger.warning(f"skills provision skipped user={user_id}: {e}")
+        return
+    if is_link:  # 과거 통짜 심링크 → 실제 폴더로 전환
         subprocess.run(["sudo", "-n", "-u", name, "env", "rm", "-f", str(skills_dir)],
                        capture_output=True)
     subprocess.run(["sudo", "-n", "-u", name, "env", "mkdir", "-p", str(skills_dir)],
