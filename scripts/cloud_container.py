@@ -205,6 +205,19 @@ def exec_claude_turn(user_id: int, project: str, prompt: str,
     return rc, out, err
 
 
+def exec_claude_cmd(user_id: int, args: list[str], timeout: int = 60) -> tuple[int, str, str]:
+    """이미 떠 있는 컨테이너에서 짧은 claude 서브명령 실행 (조회용).
+    컨테이너를 기동시키지 않는다 — 유휴 정지를 방해하지 않기 위함."""
+    if container_state(user_id) != "running":
+        return (1, "", "container not running")
+    try:
+        r = _podman("exec", "-w", "/home/agent/workspace", name(user_id),
+                    "claude", *args, timeout=timeout + 10)
+    except subprocess.TimeoutExpired:
+        return (124, "", "timeout")
+    return r.returncode, r.stdout, r.stderr
+
+
 def sysprompt_path_in_home(user_id: int, content: str) -> str | None:
     """시스템 프롬프트 파일을 컨테이너 홈에 기록 → 컨테이너 내부 경로 반환."""
     try:

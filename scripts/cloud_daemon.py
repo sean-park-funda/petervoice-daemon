@@ -35,6 +35,7 @@ import time
 import urllib.request
 import urllib.error
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from pathlib import Path
 
 import cloud_container as ctr
@@ -783,6 +784,125 @@ login_sessions: dict[int, LoginSession] = {}
 login_lock = threading.Lock()
 
 
+# ── Claude 사용 한도(/usage) 수집 ─────────────────────────────────
+# 맥미니(self) 데몬의 daemon/heartbeat.py fetch_usage_limits 와 동일한 파싱 로직을
+# 유저별 환경(HOME/CLAUDE_CONFIG_DIR 또는 컨테이너)에서 실행하는 멀티테넌트 버전.
+# 결과는 각 유저의 api_key 로 PATCH /api/bot/status → 웹 사용량 배너가 표시된다.
+
+USAGE_INTERVAL_SEC = 15 * 60
+USAGE_REFRESH_POLL_SEC = 30
+USAGE_PROBE_TIMEOUT_SEC = 60
+
+
+def _parse_usage_output(out: str) -> dict | None:
+    """`claude -p /usage` 출력에서 세션/주간 리밋 % + 리셋 시각 파싱."""
+    if not out or not out.strip():
+        return None
+
+    def _pct(pattern: str):
+        m = re.search(pattern, out)
+        if not m:
+            return None, None
+        pct = int(m.group(1))
+        reset = (m.group(2).strip() if m.lastindex and m.lastindex >= 2 else "")
+        reset = re.sub(r"\s*\(.*\)$", "", reset).strip()  # "(Asia/Seoul)" 제거
+        return pct, reset
+
+    session_pct, session_reset = _pct(r"Current session:\s*(\d+)% used(?:\s*·\s*resets\s*(.+))?")
+    week_pct, week_reset = _pct(r"Current week \(all models\):\s*(\d+)% used(?:\s*·\s*resets\s*(.+))?")
+    fable_pct, _ = _pct(r"Current week \(Fable\):\s*(\d+)% used")
+    if session_pct is None and week_pct is None:
+        return None
+    return {
+        "session_pct": session_pct,
+        "week_pct": week_pct,
+        "week_fable_pct": fable_pct,
+        "session_reset": session_reset,
+        "week_reset": week_reset,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def probe_usage(user_id: int) -> dict | None:
+    """해당 유저 환경에서 /usage 실행 → 파싱 결과. 실패/미로그인이면 None."""
+    if ctr.enabled_for(user_id):
+        # 컨테이너를 깨우지 않는다 (유휴 정지 유지). 꺼져 있으면 이번 주기는 건너뜀.
+        rc, out, err = ctr.exec_claude_cmd(user_id, ["-p", "/usage"],
+                                           timeout=USAGE_PROBE_TIMEOUT_SEC)
+        if rc != 0 and not (out or "").strip():
+            return None
+        return _parse_usage_output((out or "") + "\n" + (err or ""))
+
+    if not has_credentials(user_id):
+        return None  # 클로드 미로그인 → 배너 숨김이 정상
+
+    cmd = [config.get("claude_cmd", "claude"), "-p", "/usage"]
+    cwd = str(user_workspace(user_id))
+    try:
+        if isolation_enabled():
+            wrapped = wrap_isolated(user_id, cmd, isolated_env_overrides(user_id), cwd)
+            r = subprocess.run(wrapped, capture_output=True, text=True,
+                               timeout=USAGE_PROBE_TIMEOUT_SEC)
+        else:
+            r = subprocess.run(cmd, cwd=cwd, env=claude_env(user_id),
+                               capture_output=True, text=True,
+                               timeout=USAGE_PROBE_TIMEOUT_SEC)
+    except Exception as e:
+        logger.warning(f"[usage] probe failed user={user_id}: {e}")
+        return None
+    return _parse_usage_output((r.stdout or "") + "\n" + (r.stderr or ""))
+
+
+def collect_and_store_usage(user_id: int, api_key: str) -> bool:
+    limits = probe_usage(user_id)
+    if not limits:
+        return False
+    user_api(api_key, "PATCH", "/api/bot/status", {"usage_limits": limits})
+    logger.info(f"[usage] user={user_id} session={limits.get('session_pct')}% "
+                f"week={limits.get('week_pct')}%")
+    return True
+
+
+class UsageThread(threading.Thread):
+    """유저별 사용 한도 수집 — 15분 주기 + 배너 새로고침 버튼(usage_refresh) 대응."""
+
+    def __init__(self):
+        super().__init__(daemon=True, name="usage")
+        self._last: dict[int, float] = {}
+
+    def _users(self) -> list[dict]:
+        with roster._lock:
+            return list(roster._users.values())
+
+    def run(self):
+        logger.info("[usage] thread started")
+        shutdown_event.wait(30)  # 기동 직후 로스터 동기화 대기
+        while not shutdown_event.is_set():
+            try:
+                now = time.time()
+                for u in self._users():
+                    if shutdown_event.is_set():
+                        break
+                    uid, api_key = u.get("userId"), u.get("apiKey")
+                    if uid is None or not api_key:
+                        continue
+                    due = now - self._last.get(uid, 0) > USAGE_INTERVAL_SEC
+                    if not due:
+                        # 배너 새로고침 버튼 요청 확인
+                        st = user_api(api_key, "GET", "/api/bot/status")
+                        if not (st or {}).get("usage_refresh"):
+                            continue
+                        user_api(api_key, "PATCH", "/api/bot/status",
+                                 {"usage_refresh": False})
+                        logger.info(f"[usage] on-demand refresh user={uid}")
+                    self._last[uid] = time.time()
+                    collect_and_store_usage(uid, api_key)  # 직렬 실행 (부하 제한)
+            except Exception as e:
+                logger.error(f"[usage] loop error: {e}", exc_info=True)
+            shutdown_event.wait(USAGE_REFRESH_POLL_SEC)
+        logger.info("[usage] thread stopped")
+
+
 # ── 메시지 처리 ──────────────────────────────────────────────────
 
 class CloudWorker:
@@ -1001,6 +1121,7 @@ class CloudWorker:
         except Exception:
             pass
         roster.sync(force=True)
+        UsageThread().start()
         last_heartbeat = 0.0
         last_reap = 0.0
         poll_interval = config.get("poll_interval_sec", 3)
