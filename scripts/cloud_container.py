@@ -129,7 +129,9 @@ def ensure_running(user_id: int) -> bool:
             "run", "-d", "--name", name(user_id),
             "--user=agent",
             "--memory=" + c.get("memory", "3g"),
-            "--memory-swap=" + c.get("memory", "3g"),
+            # 기본은 스왑 금지(memory-swap=memory). 전용 호스트는 memory_swap 을 크게 줘서
+            # 상한 초과 시 즉사(OOM) 대신 스왑으로 버티게 할 수 있다.
+            "--memory-swap=" + str(c.get("memory_swap", c.get("memory", "3g"))),
             "--cpus=" + str(c.get("cpus", 1.5)),
             "--pids-limit=" + str(c.get("pids_limit", 256)),
             "--restart=no",
