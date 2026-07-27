@@ -416,20 +416,38 @@ def has_credentials(user_id: int) -> bool:
     return r.returncode == 0
 
 
-CLOUD_CONTAINER_SYSTEM_PROMPT = """# 실행 환경: 피터보이스 클라우드 (전용 컨테이너)
+def _container_system_prompt() -> str:
+    """전용 컨테이너용 환경 안내. 실제 config 값을 그대로 알려준다
+    (하드코딩하면 전용 호스트에서 사양을 과소 안내하게 된다)."""
+    c = config.get("container", {}) or {}
+    mem = str(c.get("memory", "3g")).upper().replace("G", "GB")
+    cpus = c.get("cpus", 1.5)
+    mins = int(c.get("turn_timeout_sec", config.get("limits", {}).get(
+        "turn_timeout_sec", TURN_TIMEOUT_SEC)) / 60)
+    disk = config.get("limits", {}).get("disk_quota_gb", 0)
+    disk_txt = f"디스크 {disk}GB" if disk else "디스크 한도 없음"
+    hb_min = config.get("heartbeat_min_interval_min", 30)
+    dedicated = bool(config.get("dedicated"))
+    intro = ("당신은 이 고객 **전용 서버** 위의 전용 리눅스 컨테이너에서 실행됩니다. "
+             "다른 고객과 자원을 나눠 쓰지 않습니다."
+             if dedicated else
+             "당신은 이 사용자 전용 리눅스 컨테이너에서 실행됩니다.")
+    return f"""# 실행 환경: 피터보이스 클라우드 (전용 컨테이너)
 
-당신은 이 사용자 전용 리눅스 컨테이너에서 실행됩니다. 이 안에서는 자유롭게 작업하세요.
+{intro} 이 안에서는 자유롭게 작업하세요.
 
 ## 가능한 것
 - 패키지 설치 자유: `sudo apt-get install -y <패키지>`(비번 없이 됨), `pip install`, `npm install -g` 모두 가능.
   설치물은 유지됩니다.
 - 서버/포트도 컨테이너 내부라 자유롭게 사용 가능 (다른 사용자와 격리됨).
 
+## 이 환경의 실제 사양 (추측하지 말고 이 값을 그대로 안내할 것)
+- 메모리 {mem} / CPU {cpus}코어 / 한 턴 최대 {mins}분 / {disk_txt}
+
 ## 제약
-- 메모리 3GB, CPU, 30분/턴 제한. 초과 시 강제 종료됩니다. 대규모 학습·장시간 렌더링은 피하세요.
-- 대용량 파일은 디스크 한도(사용자별)를 넘지 않게.
+- 위 한도를 넘으면 강제 종료됩니다. 대규모 학습·장시간 렌더링은 피하세요.
 - **반복/예약 작업**: crontab 대신 피터보이스 HeartBeat 를 쓰세요
-  (`docs/HEARTBEAT.md` + `POST $API_URL/api/tasks`, interval_min>=30).
+  (`docs/HEARTBEAT.md` + `POST $API_URL/api/tasks`, interval_min>={hb_min}).
 
 무거운 작업(딥러닝 학습, GPU, 대량 처리)이 필요하면 응답에 `[HEAVY_TASK]` 를 포함하고,
 사용자에게 "내 컴퓨터에 설치하면 제한 없이 가능하다"고 안내하세요.
@@ -437,13 +455,21 @@ CLOUD_CONTAINER_SYSTEM_PROMPT = """# 실행 환경: 피터보이스 클라우드
 """
 
 
-CLOUD_SYSTEM_PROMPT = """# 실행 환경: 피터보이스 클라우드 (공유 서버)
+def _shared_system_prompt() -> str:
+    lim = config.get("limits", {})
+    mem = str(lim.get("memory_max", "3G")).upper().replace("G", "GB")
+    mins = int(lim.get("turn_timeout_sec", TURN_TIMEOUT_SEC) / 60)
+    hb_min = config.get("heartbeat_min_interval_min", 30)
+    return CLOUD_SYSTEM_PROMPT_TMPL.format(mem=mem, mins=mins, hb_min=hb_min)
+
+
+CLOUD_SYSTEM_PROMPT_TMPL = """# 실행 환경: 피터보이스 클라우드 (공유 서버)
 
 당신은 여러 사용자가 공유하는 리눅스 서버에서, 이 사용자 전용 계정으로 격리 실행됩니다.
 자원이 제한된 공유 환경이므로 아래를 지켜주세요.
 
 ## 환경 제약
-- 한 번의 작업(턴)은 메모리 3GB, CPU, 30분 시간 제한이 걸려 있습니다. 초과하면 강제 종료됩니다.
+- 한 번의 작업(턴)은 메모리 {mem}, CPU, {mins}분 시간 제한이 걸려 있습니다. 초과하면 강제 종료됩니다.
 - 시스템 전역 설치(apt, sudo, npm -g)는 불가합니다. 대신:
   - 파이썬 패키지: `pip install --user` 또는 가상환경(venv)을 홈 아래에 만들어 사용
   - node 패키지: 프로젝트 폴더에 로컬 설치(`npm install`), node 버전 변경은 홈에 nvm 설치
@@ -452,7 +478,7 @@ CLOUD_SYSTEM_PROMPT = """# 실행 환경: 피터보이스 클라우드 (공유 �
 - **반복/예약 작업(cron)**: crontab은 사용할 수 없습니다. 대신 피터보이스 **HeartBeat**를 쓰세요.
   사용자가 "매일 아침 뉴스 정리해줘", "1시간마다 확인해줘" 같은 반복 작업을 원하면
   `docs/HEARTBEAT.md`에 체크리스트를 쓰고 `POST $API_URL/api/tasks`로 등록하세요
-  (interval_min 최소 30, max_runs 필수). 이렇게 하면 정해진 주기마다 저를 깨워 처리하며,
+  (interval_min 최소 {hb_min}, max_runs 필수). 이렇게 하면 정해진 주기마다 저를 깨워 처리하며,
   리소스 한도 안에서 안전하게 동작합니다.
 
 ## 무거운 작업 안내 (중요)
@@ -472,8 +498,9 @@ def _ensure_cloud_system_prompt(user_id: int) -> str | None:
     """클라우드 환경 가이드 시스템 프롬프트 파일 (유저 워크스페이스에 1회 생성, ACL로 pv유저 읽기 가능)."""
     try:
         p = user_workspace(user_id) / ".cloud-system-prompt.md"
-        if not p.exists() or p.read_text() != CLOUD_SYSTEM_PROMPT:
-            p.write_text(CLOUD_SYSTEM_PROMPT)
+        text = _shared_system_prompt()
+        if not p.exists() or p.read_text() != text:
+            p.write_text(text)
             os.chmod(p, 0o644)
         return str(p)
     except OSError:
@@ -555,7 +582,7 @@ def run_claude_turn(user_id: int, project: str, prompt: str) -> tuple[str, str]:
     if ctr.enabled_for(user_id):
         user = roster.get(user_id)
         secrets = fetch_user_secrets(user_id, user["apiKey"]) if user else {}
-        sp = ctr.sysprompt_path_in_home(user_id, CLOUD_CONTAINER_SYSTEM_PROMPT)
+        sp = ctr.sysprompt_path_in_home(user_id, _container_system_prompt())
         sid = load_session(user_id, project)
         rc, out, err = ctr.exec_claude_turn(user_id, project, prompt, sid, secrets, sp)
         if rc == 137:
