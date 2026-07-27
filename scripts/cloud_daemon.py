@@ -838,10 +838,13 @@ def _parse_usage_output(out: str) -> dict | None:
     }
 
 
-def probe_usage(user_id: int) -> dict | None:
-    """해당 유저 환경에서 /usage 실행 → 파싱 결과. 실패/미로그인이면 None."""
+def probe_usage(user_id: int, allow_wake: bool = False) -> dict | None:
+    """해당 유저 환경에서 /usage 실행 → 파싱 결과. 실패/미로그인이면 None.
+    allow_wake=False 면 꺼진 컨테이너는 건너뛴다(유휴 정지 유지)."""
     if ctr.enabled_for(user_id):
-        # 컨테이너를 깨우지 않는다 (유휴 정지 유지). 꺼져 있으면 이번 주기는 건너뜀.
+        if allow_wake and ctr.container_state(user_id) != "running":
+            # 아직 한 번도 값을 못 받은 유저 — 배너가 아예 안 뜨므로 1회는 깨워서 수집
+            ctr.ensure_running(user_id)
         rc, out, err = ctr.exec_claude_cmd(user_id, ["-p", "/usage"],
                                            timeout=USAGE_PROBE_TIMEOUT_SEC)
         if rc != 0 and not (out or "").strip():
@@ -868,10 +871,14 @@ def probe_usage(user_id: int) -> dict | None:
     return _parse_usage_output((r.stdout or "") + "\n" + (r.stderr or ""))
 
 
-def collect_and_store_usage(user_id: int, api_key: str) -> bool:
-    limits = probe_usage(user_id)
+_usage_ok: set[int] = set()  # 한 번이라도 값 수집에 성공한 유저
+
+
+def collect_and_store_usage(user_id: int, api_key: str, allow_wake: bool = False) -> bool:
+    limits = probe_usage(user_id, allow_wake=allow_wake)
     if not limits:
         return False
+    _usage_ok.add(user_id)
     user_api(api_key, "PATCH", "/api/bot/status", {"usage_limits": limits})
     logger.info(f"[usage] user={user_id} session={limits.get('session_pct')}% "
                 f"week={limits.get('week_pct')}%")
@@ -926,7 +933,8 @@ class UsageThread(threading.Thread):
                                  {"usage_refresh": False})
                         logger.info(f"[usage] on-demand refresh user={uid}")
                     self._last[uid] = time.time()
-                    collect_and_store_usage(uid, api_key)  # 직렬 실행 (부하 제한)
+                    # 직렬 실행 (부하 제한). 아직 값이 한 번도 없는 유저는 컨테이너를 깨워서라도 수집
+                    collect_and_store_usage(uid, api_key, allow_wake=(uid not in _usage_ok))
             except Exception as e:
                 logger.error(f"[usage] loop error: {e}", exc_info=True)
             shutdown_event.wait(USAGE_REFRESH_POLL_SEC)
