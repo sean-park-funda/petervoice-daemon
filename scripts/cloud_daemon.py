@@ -863,12 +863,27 @@ def collect_and_store_usage(user_id: int, api_key: str) -> bool:
     return True
 
 
+_usage_last: dict[int, float] = {}
+_usage_last_lock = threading.Lock()
+
+
+def collect_usage_after_turn(user_id: int, api_key: str):
+    """턴 직후 수집 — 컨테이너 유저는 대화 중에만 컨테이너가 떠 있으므로
+    주기 스레드만으로는 값이 안 잡힐 수 있다. 5분 쿨다운."""
+    with _usage_last_lock:
+        if time.time() - _usage_last.get(user_id, 0) < 300:
+            return
+        _usage_last[user_id] = time.time()
+    threading.Thread(target=collect_and_store_usage, args=(user_id, api_key),
+                     daemon=True, name=f"usage-{user_id}").start()
+
+
 class UsageThread(threading.Thread):
     """유저별 사용 한도 수집 — 15분 주기 + 배너 새로고침 버튼(usage_refresh) 대응."""
 
     def __init__(self):
         super().__init__(daemon=True, name="usage")
-        self._last: dict[int, float] = {}
+        self._last = _usage_last
 
     def _users(self) -> list[dict]:
         with roster._lock:
@@ -1033,6 +1048,7 @@ class CloudWorker:
 
         # ── 일반 턴 ──
         response, status = run_claude_turn(user_id, project, text)
+        collect_usage_after_turn(user_id, api_key)  # 컨테이너가 살아있는 동안 사용량 갱신
         if status == "auth":
             self.reply(api_key,
                        "클로드 로그인이 만료됐어요. `재로그인` 이라고 입력해 다시 연결해주세요.",
