@@ -581,12 +581,24 @@ def run_claude(
                         response_text = _rtxt
                 if event.get("is_error"):
                     error_text = str(event.get("error", "")) + str(event.get("result", ""))
-                    if "overloaded" in error_text.lower() or '"529"' in error_text or "529" in error_text:
+                    _err_lc = error_text.lower()
+                    # 어떤 분기로 가든 원문을 남긴다. 분기 라벨만 남으면 오분류를 못 잡는다.
+                    logger.warning(f"[{bot_name}] CLI error for {project}: {error_text[:300]}")
+                    # 529 판정은 '상태코드 모양'일 때만. 예전엔 `"529" in error_text` 라서
+                    # 숫자에 529가 우연히 섞이기만 해도 과부하로 오판했다.
+                    # (예: "prompt is too long: 195529 tokens" → 컨텍스트 초과인데 과부하로 처리되어
+                    #  세션 리셋 대신 같은 요청을 3번 재시도하고, 진짜 원인은 로그에 안 남음)
+                    _is_overloaded = (
+                        "overloaded" in _err_lc
+                        or re.search(r"(?:status|code|error|http)\D{0,10}\b529\b", _err_lc) is not None
+                        or "(529)" in error_text
+                    )
+                    if _is_overloaded:
                         MAX_OVERLOAD_RETRIES = 3
                         wait_times = [10, 30, 60]
                         if _overload_retry < MAX_OVERLOAD_RETRIES:
                             wait = wait_times[_overload_retry]
-                            logger.warning(f"[{bot_name}] Overloaded (529) for {project}, retry {_overload_retry + 1}/{MAX_OVERLOAD_RETRIES} in {wait}s")
+                            logger.warning(f"[{bot_name}] Overloaded (529) for {project}, retry {_overload_retry + 1}/{MAX_OVERLOAD_RETRIES} in {wait}s: {error_text[:300]}")
                             if stream_to_chat:
                                 api_request(api_key, "POST", "/api/bot/reply", {
                                     "text": f"(Anthropic 서버 과부하, {wait}초 후 재시도 {_overload_retry + 1}/{MAX_OVERLOAD_RETRIES}...)", "project": project, "is_final": False,
