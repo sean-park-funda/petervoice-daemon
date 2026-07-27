@@ -309,8 +309,14 @@ def login_submit(pid: int, fd: int, code: str) -> bool:
 # ── 유휴 정리 ────────────────────────────────────────────────────
 
 def reap_idle():
-    """유휴(마지막 사용 후 idle_stop_sec 경과) 컨테이너 정지."""
+    """유휴(마지막 사용 후 idle_stop_sec 경과) 컨테이너 정지.
+
+    idle_stop_sec <= 0 이면 유휴 정지를 하지 않는다(상시 유지).
+    전용 호스트에서 cron 배치·스크래핑 데몬을 상시 돌릴 때 필요.
+    """
     idle = int(_cfg().get("idle_stop_sec", 900))
+    if idle <= 0:
+        return
     now = time.time()
     r = _podman("ps", "--format", "{{.Names}}", timeout=15)
     if r.returncode != 0:

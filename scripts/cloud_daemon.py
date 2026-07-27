@@ -139,6 +139,20 @@ def fetch_user_secrets(user_id: int, api_key: str) -> dict:
 
 # ── Roster ───────────────────────────────────────────────────────
 
+def user_allowed(user_id: int) -> bool:
+    """이 호스트가 담당하는 유저인지. 호스트를 2대 이상 띄울 때 이중응답 방지용.
+
+    로스터(/api/cloud/roster)는 daemon_target=cloud 전 유저를 돌려주므로,
+    같은 host_key 로 호스트를 하나 더 띄우면 두 호스트가 같은 메시지를 처리한다.
+    전용 호스트(예: 고객 전용기)는 users_allow 로, 공용 호스트는 users_deny 로
+    담당 범위를 나눈다. 양쪽 config 를 반드시 같이 갱신할 것.
+    """
+    allow = config.get("users_allow")
+    if allow is not None and user_id not in allow:
+        return False
+    return user_id not in (config.get("users_deny") or [])
+
+
 class Roster:
     """user_id → {apiKey, username, botName} 매핑. 60초 주기 + 미스 시 즉시 갱신."""
 
@@ -154,7 +168,8 @@ class Roster:
         result = host_api("GET", "/api/cloud/roster")
         if result and "users" in result:
             with self._lock:
-                self._users = {u["userId"]: u for u in result["users"]}
+                self._users = {u["userId"]: u for u in result["users"]
+                               if user_allowed(u["userId"])}
                 self._last_sync = now
             logger.info(f"roster synced: {len(self._users)} cloud users")
 
@@ -1163,6 +1178,8 @@ class CloudWorker:
 
                 spawned_any = False
                 for msg in result.get("pending", []):
+                    if not user_allowed(msg.get("user_id")):
+                        continue  # 다른 호스트 담당 유저
                     msg_id = msg.get("id")
                     with self._spawned_guard:
                         if msg_id in self._spawned:
