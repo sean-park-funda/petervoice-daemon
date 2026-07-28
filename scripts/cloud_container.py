@@ -403,5 +403,12 @@ def reap_idle():
         last = _last_used.get(uid, 0)
         if now - last > idle:
             _podman("stop", "-t", "5", nm, timeout=30)
+            # podman 3.x 는 여기서 "stopping" 에 걸려 다음 기동을 막는 일이 있다.
+            # 그 자리에서 풀어둔다 (다음 턴이 느려지거나 실패하지 않게).
+            if container_state(uid) == "stopping":
+                _podman("container", "cleanup", nm, timeout=30)
+                _podman("stop", "-t", "0", nm, timeout=30)
+                if _logger:
+                    _logger.warning(f"idle stop wedged, unwedged: {nm} → {container_state(uid)}")
             if _logger:
                 _logger.info(f"idle container stopped: {nm}")
