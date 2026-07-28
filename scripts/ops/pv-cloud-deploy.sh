@@ -63,9 +63,13 @@ flock -n 9 || exit 0   # 이미 돌고 있으면 그냥 종료 (타이머 + 즉�
 sudo mkdir -p "$(dirname "$FAILED_SHA")"
 cd "$REPO" || { log "repo 없음: $REPO"; exit 1; }
 
-git fetch --quiet origin "$BRANCH" || { log "fetch 실패"; exit 1; }
+# 명시적 refspec — `git fetch origin <브랜치>` 만으로는 FETCH_HEAD 만 갱신되고
+# 원격추적 ref(origin/<브랜치>)가 안 생겨서 rev-parse 가 실패한다(main 외 브랜치에서 발생).
+git fetch --quiet origin "+refs/heads/$BRANCH:refs/remotes/origin/$BRANCH" \
+  || { log "❌ fetch 실패 (branch=$BRANCH)"; exit 1; }
 LOCAL=$(git rev-parse HEAD)
-REMOTE=$(git rev-parse "origin/$BRANCH")
+REMOTE=$(git rev-parse "origin/$BRANCH" 2>/dev/null) \
+  || { log "❌ origin/$BRANCH 확인 불가"; exit 1; }
 [ "$LOCAL" = "$REMOTE" ] && exit 0   # 새 커밋 없음 — 가장 흔한 경로, 조용히 종료
 
 # 같은 커밋으로 이미 실패했으면 재시도하지 않는다 (3분마다 무한 재시도·알림 스팸 방지).
@@ -134,6 +138,9 @@ fi
 # 배포 후 일정 시간 턴 오류를 세서, 연속 실패가 보이면 알린다. 자동 롤백은 하지 않는다
 # — 고객 요청 자체가 원인인 오류를 배포 탓으로 되돌리면 더 나쁘다.
 (
+  # ⚠️ 락(fd 9)을 물려받으면 관찰 창이 끝날 때까지(기본 10분) 다음 배포가 전부 막힌다.
+  # 백그라운드로 떨어지기 전에 반드시 닫는다.
+  exec 9>&-
   sleep "$WATCH_SEC"
   ERRS=$(sudo journalctl -u pv-cloud --no-pager --since "$RESTART_AT" \
     | grep -cE 'ERROR (provision failed|claude exit|process error)' || true)
