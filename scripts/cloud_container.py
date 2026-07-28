@@ -118,8 +118,25 @@ def ensure_running(user_id: int) -> bool:
         if st == "running":
             return True
         ensure_home(user_id)
-        if st == "exited":
+        if st in ("stopping", "removing"):
+            # podman 3.x 는 stop 이 중간에 걸려 "stopping" 으로 멎는 일이 있다.
+            # 그대로 두면 아래 신규 생성으로 흘러 "name already in use" 로 실패한다.
+            _podman("kill", name(user_id), timeout=20)
+            for _ in range(10):
+                time.sleep(1)
+                st = container_state(user_id)
+                if st != "stopping":
+                    break
+        if st == "paused":
+            r = _podman("unpause", name(user_id), timeout=30)
+            return r.returncode == 0
+        if st != "none":
+            # exited/created/stopping 등 — 이름이 이미 존재하면 start 만 시도한다.
+            # (여기서 신규 생성으로 넘어가면 이름 충돌로 반드시 실패한다)
             r = _podman("start", name(user_id), timeout=60)
+            if r.returncode != 0 and _logger:
+                _logger.error(f"container start failed user={user_id} state={st}: "
+                              f"{(r.stderr or '')[:200]}")
             return r.returncode == 0
         # 신규 생성
         c = _cfg()

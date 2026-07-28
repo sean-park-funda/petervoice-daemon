@@ -939,14 +939,31 @@ def probe_usage(user_id: int, allow_wake: bool = False) -> dict | None:
     return _parse_usage_output((r.stdout or "") + "\n" + (r.stderr or ""))
 
 
-_usage_ok: set[int] = set()  # 한 번이라도 값 수집에 성공한 유저
+def _usage_ok_path() -> Path:
+    return _state_dir() / "usage_ok.json"
+
+
+def _load_usage_ok() -> set[int]:
+    """한 번이라도 값 수집에 성공한 유저 — 재시작 후 컨테이너를 다시 깨우지 않도록 파일로 유지."""
+    try:
+        return set(json.loads(_usage_ok_path().read_text()))
+    except Exception:
+        return set()
+
+
+_usage_ok: set[int] = set()
 
 
 def collect_and_store_usage(user_id: int, api_key: str, allow_wake: bool = False) -> bool:
     limits = probe_usage(user_id, allow_wake=allow_wake)
     if not limits:
         return False
-    _usage_ok.add(user_id)
+    if user_id not in _usage_ok:
+        _usage_ok.add(user_id)
+        try:
+            _usage_ok_path().write_text(json.dumps(sorted(_usage_ok)))
+        except OSError:
+            pass
     user_api(api_key, "PATCH", "/api/bot/status", {"usage_limits": limits})
     logger.info(f"[usage] user={user_id} session={limits.get('session_pct')}% "
                 f"week={limits.get('week_pct')}%")
@@ -996,6 +1013,7 @@ class UsageThread(threading.Thread):
             return list(roster._users.values())
 
     def run(self):
+        _usage_ok.update(_load_usage_ok())
         logger.info("[usage] thread started")
         shutdown_event.wait(30)  # 기동 직후 로스터 동기화 대기
         while not shutdown_event.is_set():
