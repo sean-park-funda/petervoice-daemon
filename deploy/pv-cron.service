@@ -1,0 +1,23 @@
+[Unit]
+# PeterVoice cloud cron 러너 — 배치 실행기 (계약: docs/ops/cron-runner-contract.md)
+#
+# 배치마다 systemd timer 를 만들지 않는다. 타이머는 유닛끼리 독립이라
+# 전역 동시 실행 상한을 걸 수 없다. 러너 프로세스 하나가 스케줄·큐·상한·push 를 모두 쥔다.
+#
+# 설치:
+#   sudo cp /home/ubuntu/peter-voice/deploy/pv-cron.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now pv-cron
+# config.cron.enabled 가 false/누락이면 러너는 즉시 정상 종료한다(공용 호스트 기본값).
+Description=PeterVoice Cloud Cron Runner
+After=network-online.target pv-cloud.service
+
+[Service]
+Type=simple
+User=ubuntu
+ExecStart=/usr/bin/python3 /home/ubuntu/peter-voice/scripts/cloud_cron.py
+Restart=on-failure
+RestartSec=15
+Environment=PV_CLOUD_CONFIG=/etc/pv-cloud/config.json
+
+[Install]
+WantedBy=multi-user.target

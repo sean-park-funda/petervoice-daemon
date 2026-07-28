@@ -234,6 +234,35 @@ def exec_claude_cmd(user_id: int, args: list[str], timeout: int = 60) -> tuple[i
     return r.returncode, r.stdout, r.stderr
 
 
+def exec_shell(user_id: int, workdir: str, command: str, env: dict,
+               timeout_sec: int) -> tuple[int, str, str]:
+    """컨테이너 안에서 셸 명령 하나 실행 (cron 배치용). 클로드 턴이 아니다.
+
+    타임아웃은 **컨테이너 안 `timeout`** 으로 건다. podman exec 클라이언트만 죽이면
+    안쪽 프로세스가 고아로 남아 다음 회차와 겹친다. 컨테이너 재시작은 하지 않는다 —
+    같은 컨테이너에서 돌던 대화 턴까지 끊기기 때문.
+    명령은 argv 가 아니라 env 로 넘긴다(따옴표 지옥 회피 + /proc cmdline 노출 최소화).
+    """
+    if not ensure_running(user_id):
+        return (1, "", "container start failed")
+    _last_used[user_id] = time.time()
+    e = dict(env)
+    e["PV_CRON_CMD"] = command
+    e["PV_CRON_TIMEOUT"] = str(int(timeout_sec))
+    ef = _envfile(user_id, e)
+    args = ["exec", "-w", workdir, "--env-file", ef, name(user_id),
+            "bash", "-lc", 'timeout -k 10 "$PV_CRON_TIMEOUT" bash -c "$PV_CRON_CMD"']
+    try:
+        r = _podman(*args, timeout=timeout_sec + 60)
+        rc, out, err = r.returncode, r.stdout, r.stderr
+    except subprocess.TimeoutExpired:
+        # 컨테이너 안 timeout 이 안 먹은 경우(드묾). 컨테이너는 건드리지 않는다.
+        rc, out, err = 124, "", "runner-side timeout"
+    finally:
+        subprocess.run(["sudo", "-n", "rm", "-f", ef], capture_output=True)
+    return rc, out, err
+
+
 def sysprompt_path_in_home(user_id: int, content: str) -> str | None:
     """시스템 프롬프트 파일을 컨테이너 홈에 기록 → 컨테이너 내부 경로 반환."""
     try:
