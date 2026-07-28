@@ -16,7 +16,7 @@ set -uo pipefail
 
 REPO=/home/ubuntu/peter-voice
 LOG=/var/log/pv-cloud-deploy.log
-LOCK=/run/pv-cloud-deploy.lock
+LOCK=/run/lock/pv-cloud-deploy.lock   # /run 은 root 소유 — ubuntu 가 쓸 수 있는 곳이어야 한다
 FAILED_SHA=/var/lib/pv-cloud/failed-sha
 SELF_INSTALLED=/usr/local/bin/pv-cloud-deploy.sh
 
@@ -44,7 +44,11 @@ notify() {
 # 일시정지 — 락도 잡기 전에 조용히 빠진다
 [ -f "$REPO/.deploy-pause" ] && exit 0
 
-exec 9>"$LOCK" 2>/dev/null || exit 0
+# 락을 못 잡으면 조용히 넘어가지 말고 남긴다 — 중복 실행은 배포를 반쯤 겹치게 만든다
+if ! exec 9>"$LOCK"; then
+  log "❌ 락 파일 생성 실패: $LOCK"
+  exit 1
+fi
 flock -n 9 || exit 0   # 이미 돌고 있으면 그냥 종료 (타이머 + 즉시 트리거 중복 방지)
 
 sudo mkdir -p "$(dirname "$FAILED_SHA")"
