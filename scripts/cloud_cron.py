@@ -682,10 +682,42 @@ class Runner:
             rec["pushed"] = None
             write_file(path, json.dumps(rec, ensure_ascii=False, indent=2))
 
+    # ── 재시작 복구 ──
+    def reconcile_orphans(self):
+        """러너가 죽는 순간 돌던 실행은 `running` 인 채로 남는다.
+        그대로 두면 대시보드가 영원히 '실행 중'으로 보이므로 기동 시 한 번 정리한다."""
+        days = {(datetime.now(KST) - timedelta(days=d)).strftime("%Y-%m-%d")
+                for d in (0, 1)}
+        for u in roster.users():
+            uid = u.get("userId")
+            if uid is None:
+                continue
+            for pdir in project_dirs(uid):
+                for day in days:
+                    d = pdir / ".ax" / "runs" / day
+                    if not d.is_dir():
+                        continue
+                    for f in d.glob("*.json"):
+                        rec = _read_json(f)
+                        if not rec or rec.get("status") != "running":
+                            continue
+                        rec.update({
+                            "status": "failure", "exit_code": None, "pushed": False,
+                            "summary": "중단됨 · 러너가 재시작되어 결과를 확인할 수 없습니다",
+                            "finished_at": datetime.now(timezone.utc)
+                                           .isoformat().replace("+00:00", "Z"),
+                        })
+                        write_file(f, json.dumps(rec, ensure_ascii=False, indent=2))
+                        logger.warning(f"중단된 실행 정리: {f.name}")
+
     # ── 메인 루프 ──
     def loop(self):
         logger.info(f"cron 러너 시작 · 동시 실행 상한 {self.max_concurrent} · TZ Asia/Seoul")
         roster.sync(force=True)
+        try:
+            self.reconcile_orphans()
+        except Exception as e:
+            logger.error(f"중단 실행 정리 오류: {e}", exc_info=True)
         scan_interval = int(cron_cfg().get("scan_interval_sec", 30))
         last_scan = 0.0
         last_sweep = time.time()
