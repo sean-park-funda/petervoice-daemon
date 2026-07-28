@@ -956,6 +956,22 @@ def collect_and_store_usage(user_id: int, api_key: str, allow_wake: bool = False
 _usage_last: dict[int, float] = {}
 _usage_last_lock = threading.Lock()
 
+# 폴링 응답(/api/cloud/poll)이 실어다 주는 "배너 새로고침 요청" 유저 목록.
+# 메인 루프가 3초마다 갱신하고 사용량 스레드가 읽는다 — 유저별 status 조회를 없애기 위함.
+_usage_refresh: set[int] = set()
+_usage_refresh_lock = threading.Lock()
+
+
+def _set_usage_refresh(user_ids) -> None:
+    with _usage_refresh_lock:
+        _usage_refresh.clear()
+        _usage_refresh.update(int(u) for u in (user_ids or []))
+
+
+def _usage_refresh_wanted(user_id: int) -> bool:
+    with _usage_refresh_lock:
+        return user_id in _usage_refresh
+
 
 def collect_usage_after_turn(user_id: int, api_key: str):
     """턴 직후 수집 — 컨테이너 유저는 대화 중에만 컨테이너가 떠 있으므로
@@ -993,9 +1009,10 @@ class UsageThread(threading.Thread):
                         continue
                     due = now - self._last.get(uid, 0) > USAGE_INTERVAL_SEC
                     if not due:
-                        # 배너 새로고침 버튼 요청 확인
-                        st = user_api(api_key, "GET", "/api/bot/status")
-                        if not (st or {}).get("usage_refresh"):
+                        # 배너 새로고침 버튼 요청 — 폴링 응답이 실어다 준 목록으로 판단한다.
+                        # 유저마다 GET /api/bot/status 를 때리면 안 쓰는 유저까지
+                        # 하루 2,880회가 붙는다(가입자 수에 선형 비례).
+                        if not _usage_refresh_wanted(uid):
                             continue
                         user_api(api_key, "PATCH", "/api/bot/status",
                                  {"usage_refresh": False})
@@ -1211,7 +1228,13 @@ class CloudWorker:
                 self._spawned.discard(msg_id)
 
     def heartbeats(self):
-        """전 유저 온라인 표시 — 로스터의 각 유저로 heartbeat 전송."""
+        """전 유저 온라인 표시.
+
+        호스트 단위 배치 1회로 처리한다. 유저별로 보내면 안 쓰는 유저까지
+        하루 2,880회씩 붙어 가입자 수에 선형 비례한다.
+        구 웹(배치 엔드포인트 없음)에서는 예전 방식으로 되돌아간다."""
+        if host_api("POST", "/api/cloud/heartbeat", {}) is not None:
+            return
         with roster._lock:
             users = list(roster._users.values())
         for u in users:
@@ -1251,6 +1274,7 @@ class CloudWorker:
                     shutdown_event.wait(min(30, 2 ** errors))
                     continue
                 errors = 0
+                _set_usage_refresh(result.get("usage_refresh"))
 
                 spawned_any = False
                 for msg in result.get("pending", []):
