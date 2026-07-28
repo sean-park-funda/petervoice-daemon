@@ -1,0 +1,10 @@
+[Unit]
+Description=PeterVoice cloud host auto-deploy (git pull + restart + health check)
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+ExecStart=/usr/local/bin/pv-cloud-deploy.sh
+# 배포 자체가 오래 걸리면(헬스체크 90초 포함) 다음 타이머와 겹치지 않게 여유를 둔다
+TimeoutStartSec=600
