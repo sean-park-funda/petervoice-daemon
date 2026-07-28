@@ -20,7 +20,16 @@ LOCK=/run/lock/pv-cloud-deploy.lock   # /run 은 root 소유 — ubuntu 가 쓸 
 FAILED_SHA=/var/lib/pv-cloud/failed-sha
 SELF_INSTALLED=/usr/local/bin/pv-cloud-deploy.sh
 
-[ -f /etc/pv-cloud/deploy.env ] && . /etc/pv-cloud/deploy.env
+# deploy.env 는 **ubuntu 소유 600** 이어야 한다 (서비스가 User=ubuntu 로 돈다).
+# root 소유면 읽지 못하는데, 조용히 넘어가면 브랜치·알림 설정이 통째로 무시된 채 배포된다.
+if [ -f /etc/pv-cloud/deploy.env ]; then
+  if [ -r /etc/pv-cloud/deploy.env ]; then
+    . /etc/pv-cloud/deploy.env
+  else
+    log "❌ /etc/pv-cloud/deploy.env 를 읽을 수 없음 (소유권 확인: ubuntu:ubuntu 600)"
+    exit 1
+  fi
+fi
 BRANCH="${PV_DEPLOY_BRANCH:-main}"
 HEALTH_SEC="${PV_DEPLOY_HEALTH_SEC:-90}"
 WATCH_SEC="${PV_DEPLOY_WATCH_SEC:-600}"
