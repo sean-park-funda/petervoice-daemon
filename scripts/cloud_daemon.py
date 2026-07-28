@@ -444,6 +444,13 @@ def _container_system_prompt() -> str:
 ## 이 환경의 실제 사양 (추측하지 말고 이 값을 그대로 안내할 것)
 - 메모리 {mem} / CPU {cpus}코어 / 한 턴 최대 {mins}분 / {disk_txt}
 
+## 함께 쓰는 사람들
+이 프로젝트는 여러 사람이 함께 쓸 수 있습니다. 메시지가
+`[팀원 OOO 님이 보낸 메시지]` 로 시작하면 **프로젝트 소유자가 아닌 팀원**이 보낸 것입니다.
+- 그 표시가 없으면 소유자 본인입니다
+- 이전 대화의 "내가"가 지금 말하는 사람과 다를 수 있으니, 사람이 바뀌면 그 사람 기준으로 답하세요
+- 답변에는 이 표시를 따라 쓰지 마세요 (사람에게 보이는 건 대화 화면의 이름표입니다)
+
 ## 제약
 - 위 한도를 넘으면 강제 종료됩니다. 대규모 학습·장시간 렌더링은 피하세요.
 - **반복/예약 작업**: crontab 대신 피터보이스 HeartBeat 를 쓰세요
@@ -480,6 +487,11 @@ CLOUD_SYSTEM_PROMPT_TMPL = """# 실행 환경: 피터보이스 클라우드 (공
   `docs/HEARTBEAT.md`에 체크리스트를 쓰고 `POST $API_URL/api/tasks`로 등록하세요
   (interval_min 최소 {hb_min}, max_runs 필수). 이렇게 하면 정해진 주기마다 저를 깨워 처리하며,
   리소스 한도 안에서 안전하게 동작합니다.
+
+## 함께 쓰는 사람들
+이 프로젝트는 여러 사람이 함께 쓸 수 있습니다. 메시지가
+`[팀원 OOO 님이 보낸 메시지]` 로 시작하면 **프로젝트 소유자가 아닌 팀원**이 보낸 것입니다.
+표시가 없으면 소유자 본인입니다. 사람이 바뀌면 그 사람 기준으로 답하고, 답변에 이 표시를 따라 쓰지 마세요.
 
 ## 무거운 작업 안내 (중요)
 아래 유형은 **착수하지 말고**, 먼저 사용자에게 안내하세요:
@@ -573,6 +585,21 @@ def _unit_result(unit: str) -> str:
 def _reset_unit(unit: str):
     subprocess.run(["sudo", "-n", "systemctl", "reset-failed", unit],
                    capture_output=True)
+
+
+_SENDER_RE = re.compile(r"[\x00-\x1f\[\]\n]")
+
+
+def with_sender(msg: dict, text: str) -> str:
+    """팀 프로젝트에서 온 메시지에 발신자를 표시한다.
+
+    메시지는 프로젝트 **소유자**의 user_id 로 저장되므로(팀원이 보내도 마찬가지),
+    이걸 붙이지 않으면 여러 사람이 한 세션을 써도 비서가 전부 같은 사람으로 인식한다.
+    소유자 본인이 보낸 메시지에는 아무것도 붙이지 않는다(기존 동작 유지)."""
+    name = (msg.get("from_username") or "").strip()
+    if not name or msg.get("from_user_id") in (None, msg.get("user_id")):
+        return text
+    return f"[팀원 {_SENDER_RE.sub('', name)[:40]} 님이 보낸 메시지]\n{text}"
 
 
 def run_claude_turn(user_id: int, project: str, prompt: str) -> tuple[str, str]:
@@ -1111,7 +1138,7 @@ class CloudWorker:
             return
 
         # ── 일반 턴 ──
-        response, status = run_claude_turn(user_id, project, text)
+        response, status = run_claude_turn(user_id, project, with_sender(msg, text))
         collect_usage_after_turn(user_id, api_key)  # 컨테이너가 살아있는 동안 사용량 갱신
         if status == "auth":
             self.reply(api_key,
