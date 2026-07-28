@@ -1155,7 +1155,13 @@ class CloudWorker:
             return
 
         # ── 일반 턴 ──
-        response, status = run_claude_turn(user_id, project, with_sender(msg, text))
+        # 진행 표시("생각 중...") — 웹은 is_working + active_project 로 판단한다.
+        # 이걸 안 보내면 응답이 나올 때까지 화면이 조용해서 멈춘 것처럼 보인다.
+        self.set_working(api_key, True, project, text[:80], msg_id)
+        try:
+            response, status = run_claude_turn(user_id, project, with_sender(msg, text))
+        finally:
+            self.set_working(api_key, False, project)
         collect_usage_after_turn(user_id, api_key)  # 컨테이너가 살아있는 동안 사용량 갱신
         if status == "auth":
             self.reply(api_key,
@@ -1227,6 +1233,32 @@ class CloudWorker:
             with self._spawned_guard:
                 self._spawned.discard(msg_id)
 
+    def set_working(self, api_key: str, working: bool, project: str,
+                    task: str | None = None, msg_id=None):
+        """턴 진행 표시. 배치 heartbeat 는 last_heartbeat 만 갱신하므로 이 값을 덮지 않는다."""
+        body = {"is_working": working, "cloud": True, "project": project}
+        if working:
+            body["current_task"] = task
+            body["message_ids"] = [msg_id] if msg_id else None
+        try:
+            user_api(api_key, "POST", "/api/bot/heartbeat", body)
+        except Exception as e:  # 표시 실패로 턴이 죽으면 안 된다
+            logger.warning(f"set_working({working}) failed: {e}")
+
+    def clear_stale_working(self):
+        """기동 시 남아 있는 '작업 중' 표시를 정리한다.
+        턴 도중에 데몬이 죽으면 is_working=true 가 그대로 남는데, 배치 heartbeat 가
+        last_heartbeat 를 계속 갱신하므로 웹의 stale 판정(60초)에도 걸리지 않아
+        '생각 중...' 이 영원히 도는 상태가 된다."""
+        with roster._lock:
+            users = list(roster._users.values())
+        for u in users:
+            try:
+                user_api(u["apiKey"], "POST", "/api/bot/heartbeat",
+                         {"is_working": False, "cloud": True})
+            except Exception:
+                pass
+
     def heartbeats(self):
         """전 유저 온라인 표시.
 
@@ -1251,6 +1283,7 @@ class CloudWorker:
         except Exception:
             pass
         roster.sync(force=True)
+        self.clear_stale_working()
         UsageThread().start()
         last_heartbeat = 0.0
         last_reap = 0.0
