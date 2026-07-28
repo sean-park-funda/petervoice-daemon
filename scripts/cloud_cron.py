@@ -27,6 +27,7 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -363,6 +364,23 @@ def write_file(path: Path, content: str):
     _sudo("chown", f"{ctr.AGENT_UID}:{ctr.AGENT_UID}", str(path))
 
 
+def read_text(path: Path) -> str:
+    """없으면 빈 문자열. **읽기 실패는 예외로 올린다** — 조용히 '' 를 돌려주면
+    이어붙이기 대상 파일을 통째로 덮어써서 과거 기록이 날아간다."""
+    if not path.exists():
+        return ""
+    try:
+        return path.read_text()
+    except OSError:
+        tmp = Path("/tmp") / f"pvcron-{os.getpid()}-{path.name}"
+        if _sudo("cp", str(path), str(tmp)):
+            try:
+                return tmp.read_text()
+            finally:
+                tmp.unlink(missing_ok=True)
+        raise
+
+
 _provisioned: set[tuple] = set()
 
 
@@ -590,7 +608,7 @@ class Runner:
         key = roster.api_key(b.user_id)
         if not key:
             return False
-        status, _ = user_api(key, "POST", "/api/ax/runs", run_payload(rec))
+        status, _ = user_api(key, "POST", "/api/ax/runs", {"runs": [run_payload(rec)]})
         ok = 200 <= status < 300
         if ok:
             rec["pushed"] = True
@@ -673,7 +691,7 @@ class Runner:
             write_file(path, json.dumps(rec, ensure_ascii=False, indent=2))
             logger.warning(f"push 24시간 초과 — 포기(원본은 남음): {path}")
             return
-        status, _ = user_api(api_key, "POST", "/api/ax/runs", run_payload(rec))
+        status, _ = user_api(api_key, "POST", "/api/ax/runs", {"runs": [run_payload(rec)]})
         if 200 <= status < 300:
             rec["pushed"] = True
             write_file(path, json.dumps(rec, ensure_ascii=False, indent=2))
@@ -681,6 +699,48 @@ class Runner:
         elif 400 <= status < 500:
             rec["pushed"] = None
             write_file(path, json.dumps(rec, ensure_ascii=False, indent=2))
+
+    # ── 대화 기록 스냅샷 (인계 보존) ──
+    def export_chats(self):
+        """대시보드 대화는 웹 DB 가 원본이라 인계 시 사라진다 → 워크스페이스에 적재한다.
+        (`docs/ops/ax-dashboard-runner-api.md` §3, Sean 결정 2026-07-27)
+
+        워크플로우에 `branch_id` 가 없으면 서버가 404 를 준다 = 연결된 대화가 없다는 뜻이므로
+        조용히 넘어간다. 증분(`after`)은 프로젝트별 상태파일에 남겨 중복 적재를 막는다."""
+        for u in roster.users():
+            uid, key = u.get("userId"), u.get("apiKey")
+            if uid is None or not key:
+                continue
+            for pdir in project_dirs(uid):
+                if not (pdir / ".ax" / "workflow.json").is_file():
+                    continue
+                try:
+                    self.export_project_chat(pdir, key)
+                except Exception as e:
+                    logger.warning(f"대화 기록 적재 실패 {pdir.name}: {e}")
+
+    def export_project_chat(self, pdir: Path, api_key: str):
+        state_path = pdir / ".ax" / "chat-export.json"
+        state = (_read_json(state_path) if state_path.is_file() else {}) or {}
+        q = f"/api/ax/chat/export?project={urllib.parse.quote(pdir.name)}"
+        after = state.get("last_created_at")
+        if after:
+            q += f"&after={urllib.parse.quote(str(after))}"
+        status, res = user_api(api_key, "GET", q)
+        if status == 404 or not res or not res.get("count"):
+            return   # 연결된 대화 없음 / 새 메시지 없음
+        md = res.get("markdown") or ""
+        target = pdir / "docs" / "대화기록" / f"{datetime.now(KST):%Y-%m}.md"
+        prev = read_text(target)
+        if prev:
+            # 매 응답에 붙는 머리말은 첫 적재분에만 남긴다
+            head = md.find("\n### ")
+            md = md[head + 1:] if head >= 0 else md
+            md = prev.rstrip("\n") + "\n\n" + md
+        write_file(target, md)
+        state["last_created_at"] = res.get("last_created_at")
+        write_file(state_path, json.dumps(state, ensure_ascii=False, indent=2))
+        logger.info(f"대화 기록 적재 {pdir.name}: {res['count']}건 → {target.name}")
 
     # ── 재시작 복구 ──
     def reconcile_orphans(self):
@@ -719,8 +779,10 @@ class Runner:
         except Exception as e:
             logger.error(f"중단 실행 정리 오류: {e}", exc_info=True)
         scan_interval = int(cron_cfg().get("scan_interval_sec", 30))
+        export_min = int(cron_cfg().get("chat_export_min", 60))   # 0 = 끔
         last_scan = 0.0
         last_sweep = time.time()
+        last_export = 0.0
         while not shutdown.is_set():
             try:
                 now = time.time()
@@ -733,6 +795,10 @@ class Runner:
                     threading.Thread(target=self._sweep_safe, daemon=True,
                                      name="sweep").start()
                     last_sweep = now
+                if export_min > 0 and now - last_export >= export_min * 60:
+                    threading.Thread(target=self._export_safe, daemon=True,
+                                     name="chat-export").start()
+                    last_export = now
             except Exception as e:
                 logger.error(f"루프 오류: {e}", exc_info=True)
             shutdown.wait(TICK_SEC)
@@ -743,6 +809,12 @@ class Runner:
             self.sweep()
         except Exception as e:
             logger.error(f"sweep 오류: {e}", exc_info=True)
+
+    def _export_safe(self):
+        try:
+            self.export_chats()
+        except Exception as e:
+            logger.error(f"대화 기록 적재 오류: {e}", exc_info=True)
 
 
 def run_payload(rec: dict) -> dict:
