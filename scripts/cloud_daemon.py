@@ -571,6 +571,18 @@ def build_systemd_run(user_id: int, cmd: list[str], env: dict, cwd: str, unit: s
     ]
 
 
+def kill_systemd_turns(user_id: int) -> None:
+    """이 데몬 프로세스가 띄운 해당 유저의 턴 유닛을 정지한다 (systemd 격리 모드)."""
+    prefix = f"pvturn-{user_id}-{os.getpid()}-"
+    r = subprocess.run(["systemctl", "list-units", "--no-legend", "--plain",
+                        f"{prefix}*.service"], capture_output=True, text=True, timeout=10)
+    for line in (r.stdout or "").splitlines():
+        unit = line.split()[0] if line.split() else ""
+        if unit.startswith(prefix):
+            subprocess.run(["sudo", "-n", "systemctl", "stop", unit],
+                           capture_output=True, timeout=15)
+
+
 def _unit_result(unit: str) -> str:
     """systemd 유닛 종료 사유: success | oom-kill | timeout | ... """
     try:
@@ -1053,6 +1065,8 @@ class CloudWorker:
         self._locks: dict[tuple, threading.Lock] = {}
         self._locks_guard = threading.Lock()
         self._spawned: set = set()
+        # 실제로 처리에 들어간 메시지 (processed 마킹까지 끝난 것) — 종료 시 되돌리기용
+        self._inflight: dict = {}
         self._spawned_guard = threading.Lock()
         self._processed: set = set()
 
@@ -1237,7 +1251,9 @@ class CloudWorker:
         try:
             with self._key_lock(*key):
                 if shutdown_event.is_set():
-                    return
+                    return  # 아직 시작 전 — processed 마킹도 안 됐으니 그대로 재전달된다
+                with self._spawned_guard:
+                    self._inflight[msg_id] = msg
                 self.process(msg)
         except Exception as e:
             logger.error(f"process error msg #{msg_id}: {e}", exc_info=True)
@@ -1250,6 +1266,70 @@ class CloudWorker:
         finally:
             with self._spawned_guard:
                 self._spawned.discard(msg_id)
+                self._inflight.pop(msg_id, None)
+
+    # ── 종료 처리 ────────────────────────────────────────────────
+    # systemd 모드의 턴은 `systemd-run --unit=pvturn-<uid>-<pid>-<n>` 전용 유닛이라
+    # 데몬과 다른 cgroup 에 있다 → 데몬이 죽어도 계속 돈다. 되돌릴 때 같이 정리한다.
+    # 클라우드는 턴 시작 **전에** processed 를 마킹한다(2026-07-06 폴링 핫루프 사고 대응).
+    # 그래서 턴 도중에 데몬이 죽으면 그 메시지는 다시 폴링되지 않고 **영구 유실**된다.
+    # 종료 시 (1) 진행 중인 턴을 잠시 기다리고 (2) 그래도 안 끝난 것은 되돌려 재전달시킨다.
+
+    def drain(self) -> int:
+        """진행 중인 턴이 끝날 때까지 대기. 남은 개수를 반환(0이면 깨끗이 종료)."""
+        sec = int(config.get("shutdown_drain_sec", 90))
+        try:
+            self._executor.shutdown(wait=False, cancel_futures=True)
+        except TypeError:  # py<3.9
+            self._executor.shutdown(wait=False)
+        with self._spawned_guard:
+            n = len(self._inflight)
+        if n:
+            logger.info(f"draining {n} in-flight turn(s), up to {sec}s")
+        deadline = time.time() + sec
+        while time.time() < deadline:
+            with self._spawned_guard:
+                if not self._inflight:
+                    logger.info("drained cleanly")
+                    return 0
+            time.sleep(0.5)
+        return self.requeue_inflight()
+
+    def requeue_inflight(self) -> int:
+        """드레인 시한을 넘긴 턴을 되돌린다 — processed 해제 + 고아 프로세스 정리."""
+        with self._spawned_guard:
+            items = list(self._inflight.items())
+        for msg_id, msg in items:
+            uid = msg.get("user_id")
+            project = msg.get("project", "general") or "general"
+            user = roster.get(uid)
+            if not user:
+                logger.error(f"requeue skipped msg #{msg_id}: unknown user {uid}")
+                continue
+            api_key = user["apiKey"]
+            # 컨테이너 안 claude 는 exec 클라이언트를 죽여도 살아남는다(실측 확인).
+            # 정리하지 않으면 재전달된 메시지가 같은 세션에서 두 번 돌게 된다.
+            try:
+                if ctr.enabled_for(uid):
+                    ctr.kill_turns(uid)
+                else:
+                    kill_systemd_turns(uid)
+            except Exception as e:
+                logger.warning(f"kill_turns failed user={uid}: {e}")
+            ok = user_api(api_key, "PATCH", "/api/bot/message",
+                          {"id": msg_id, "updates": {"processed": False, "fetched_at": None}})
+            if ok is None:
+                logger.error(f"requeue FAILED msg #{msg_id} — 유실 위험")
+                continue
+            logger.info(f"requeued msg #{msg_id} user={uid} project={project}")
+            try:
+                self.set_working(api_key, False, project)
+                self.reply(api_key,
+                           "(서버 업데이트로 작업이 중단됐어요. 잠시 후 자동으로 다시 처리할게요.)",
+                           [msg_id], project)
+            except Exception:
+                pass
+        return len(items)
 
     def set_working(self, api_key: str, working: bool, project: str,
                     task: str | None = None, msg_id=None):
@@ -1345,6 +1425,7 @@ class CloudWorker:
                 errors += 1
                 logger.error(f"loop error: {e}", exc_info=True)
                 shutdown_event.wait(min(30, 2 ** errors))
+        self.drain()
         logger.info("cloud daemon stopped")
 
 
