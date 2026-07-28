@@ -880,7 +880,11 @@ def probe_usage(user_id: int, allow_wake: bool = False) -> dict | None:
     allow_wake=False 면 꺼진 컨테이너는 건너뛴다(유휴 정지 유지)."""
     if ctr.enabled_for(user_id):
         if allow_wake and ctr.container_state(user_id) != "running":
-            # 아직 한 번도 값을 못 받은 유저 — 배너가 아예 안 뜨므로 1회는 깨워서 수집
+            # 아직 한 번도 값을 못 받은 유저 — 배너가 아예 안 뜨므로 1회는 깨워서 수집.
+            # 단 **로그인한 유저만** 깨운다. 미로그인 유저는 /usage 가 영영 실패해
+            # _usage_ok 에 들어가지 못하고 15분마다 빈 컨테이너를 띄우는 루프가 된다.
+            if not ctr.has_credentials(user_id):
+                return None
             ctr.ensure_running(user_id)
         rc, out, err = ctr.exec_claude_cmd(user_id, ["-p", "/usage"],
                                            timeout=USAGE_PROBE_TIMEOUT_SEC)

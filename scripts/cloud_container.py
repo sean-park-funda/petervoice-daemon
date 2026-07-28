@@ -149,9 +149,23 @@ def ensure_running(user_id: int) -> bool:
         return True
 
 
+def _home_has_credentials(user_id: int) -> bool:
+    """컨테이너를 깨우지 않고 호스트에서 자격증명 유무만 판정.
+    claude/ 는 agent(10000) 소유 700 이라 ubuntu 가 직접 stat 할 수 없어 sudo 로 확인한다
+    (sudoers 에 이미 허용된 du 를 존재 확인용으로 쓴다 — 내용은 읽지 않는다)."""
+    p = home(user_id) / "claude" / ".credentials.json"
+    r = subprocess.run(["sudo", "-n", "du", "-sb", str(p)],
+                       capture_output=True, timeout=15)
+    return r.returncode == 0
+
+
 def has_credentials(user_id: int) -> bool:
-    if not ensure_running(user_id):
-        return False
+    """로그인 여부 확인. **컨테이너를 새로 띄우지 않는다.**
+    여기서 ensure_running 을 하면 로그인조차 안 한 유저까지 컨테이너가 생성돼,
+    전용 호스트(유휴 정지 없음)에서 빈 컨테이너가 상시 점유된다.
+    컨테이너는 실제 턴(exec_claude_turn)이나 로그인(login_start) 때만 뜬다."""
+    if container_state(user_id) != "running":
+        return _home_has_credentials(user_id)
     r = _podman("exec", name(user_id), "test", "-f", "/home/agent/claude/.credentials.json",
                 timeout=15)
     return r.returncode == 0
