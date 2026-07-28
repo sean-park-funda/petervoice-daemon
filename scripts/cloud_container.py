@@ -119,14 +119,16 @@ def ensure_running(user_id: int) -> bool:
             return True
         ensure_home(user_id)
         if st in ("stopping", "removing"):
-            # podman 3.x 는 stop 이 중간에 걸려 "stopping" 으로 멎는 일이 있다.
-            # 그대로 두면 아래 신규 생성으로 흘러 "name already in use" 로 실패한다.
-            _podman("kill", name(user_id), timeout=20)
-            for _ in range(10):
-                time.sleep(1)
-                st = container_state(user_id)
-                if st != "stopping":
-                    break
+            # podman 3.x 는 conmon 이 먼저 죽으면 컨테이너가 "stopping" 에서 멎는다.
+            # 그대로 두면 아래 신규 생성으로 흘러 "name already in use" 로 실패하고,
+            # start 도 "must be in Created or Stopped state" 로 거부된다.
+            # cleanup → stop -t 0 이면 stopped 로 떨어져 다시 start 할 수 있다.
+            # (컨테이너를 지우지 않는다 — 유저가 안에 설치한 것들이 날아가므로)
+            _podman("container", "cleanup", name(user_id), timeout=30)
+            _podman("stop", "-t", "0", name(user_id), timeout=30)
+            st = container_state(user_id)
+            if _logger:
+                _logger.warning(f"container unwedged user={user_id} → {st}")
         if st == "paused":
             r = _podman("unpause", name(user_id), timeout=30)
             return r.returncode == 0
@@ -186,6 +188,16 @@ def has_credentials(user_id: int) -> bool:
     r = _podman("exec", name(user_id), "test", "-f", "/home/agent/claude/.credentials.json",
                 timeout=15)
     return r.returncode == 0
+
+
+def kill_turns(user_id: int) -> None:
+    """컨테이너 안에서 도는 claude 턴을 정리한다.
+
+    `podman exec` 는 클라이언트를 죽여도 **컨테이너 안 프로세스가 살아남는다**(실측 확인).
+    데몬 종료 시 정리하지 않으면, 재전달된 메시지가 같은 세션에서 두 번 돌게 된다."""
+    if container_state(user_id) != "running":
+        return
+    _podman("exec", name(user_id), "pkill", "-f", "^claude ", timeout=15)
 
 
 def _envfile(user_id: int, env: dict) -> str:
