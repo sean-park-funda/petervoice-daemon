@@ -437,6 +437,8 @@ class Runner:
         self._fired: dict[tuple, datetime] = {}
         self._fail_streak: dict[tuple, int] = {}
         self._wf_hash: dict[tuple, str] = {}
+        self._wf_retry_at: dict[tuple, float] = {}
+        self._wf_backoff: dict[tuple, int] = {}
 
     # ── 선언 스캔 ──
     def scan(self):
@@ -462,7 +464,14 @@ class Runner:
         self.batches = found
 
     def sync_workflow(self, user_id: int, pdir: Path, batches: list[Batch]):
-        """워크플로우 정의를 대시보드로 sync (표시용 캐시). 선언이 바뀔 때만 보낸다."""
+        """워크플로우 정의를 대시보드로 sync (표시용 캐시). 선언이 바뀔 때만 보낸다.
+
+        실패를 조용히 넘기지 않는다:
+        - 4xx = 고쳐 보낼 것이 우리에겐 없다 → 같은 내용 재전송을 막고 사유를 error 로 남긴다.
+          선언 파일이 바뀌면 blob 이 달라져 차단이 자연히 풀린다
+        - 5xx·네트워크 = 일시 장애 → 해시를 갱신하지 않고 백오프 후 재시도.
+          그냥 두면 스캔 주기(30초)마다 영원히 두드린다
+        """
         if not cron_cfg().get("push", True):
             return
         meta = load_workflow_meta(pdir)
@@ -472,17 +481,42 @@ class Runner:
             {"name": b.name, "schedule": b.spec.expr, "enabled": b.enabled}
             for b in sorted(batches, key=lambda x: x.name)
         ]
+        # branch_id 는 생략 가능하다 — 웹이 대시보드 채팅용 브랜치를 자동 생성하고
+        # 재sync 때 재사용한다. 값이 있을 때만 실어 보낸다(2026-07-28 계약 완화)
+        if payload.get("branch_id") is None:
+            payload.pop("branch_id", None)
+
         blob = json.dumps(payload, sort_keys=True, ensure_ascii=False)
         tag = (user_id, pdir.name)
         if self._wf_hash.get(tag) == blob:
             return
+        if time.time() < self._wf_retry_at.get(tag, 0):
+            return   # 백오프 대기 중
         key = roster.api_key(user_id)
         if not key:
             return
-        status, _ = user_api(key, "POST", "/api/ax/workflows", payload)
+
+        status, body = user_api(key, "POST", "/api/ax/workflows", payload)
+        label = f"{user_id}/{pdir.name}"
         if 200 <= status < 300:
             self._wf_hash[tag] = blob
-            logger.info(f"워크플로우 sync: {user_id}/{pdir.name} ({meta['status']})")
+            self._wf_retry_at.pop(tag, None)
+            self._wf_backoff.pop(tag, None)
+            logger.info(f"워크플로우 sync: {label} ({meta['status']})")
+            return
+        reason = (body or {}).get("error") or "(응답 본문 없음)"
+        if 400 <= status < 500:
+            self._wf_hash[tag] = blob   # 같은 내용 재전송 차단
+            self._wf_retry_at.pop(tag, None)
+            self._wf_backoff.pop(tag, None)
+            logger.error(f"워크플로우 sync 거부됨({status}) {label}: {reason} "
+                         f"— 선언 파일을 고쳐야 다시 시도한다")
+            return
+        wait = min(900, max(60, self._wf_backoff.get(tag, 30) * 2))
+        self._wf_backoff[tag] = wait
+        self._wf_retry_at[tag] = time.time() + wait
+        logger.warning(f"워크플로우 sync 실패({status or '네트워크'}) {label}: {reason} "
+                       f"— {wait}초 뒤 재시도")
 
     # ── 스케줄 틱 ──
     def tick(self, now: datetime):
@@ -607,19 +641,25 @@ class Runner:
             return False
         key = roster.api_key(b.user_id)
         if not key:
+            logger.warning(f"push 보류 {b.key}: 로스터에 api_key 없음 — 5분 뒤 재시도")
             return False
-        status, _ = user_api(key, "POST", "/api/ax/runs", {"runs": [run_payload(rec)]})
+        status, body = user_api(key, "POST", "/api/ax/runs", {"runs": [run_payload(rec)]})
         ok = 200 <= status < 300
         if ok:
             rec["pushed"] = True
             if retry_on_fail:
                 self.write_record(b, rec)
-        elif 400 <= status < 500:
-            # 4xx 는 재시도해도 소용없다 (계약서 §6)
+            return True
+        reason = (body or {}).get("error") or "(응답 본문 없음)"
+        if 400 <= status < 500:
+            # 4xx 는 재시도해도 소용없다 — 원본은 남고 대시보드에만 안 뜬다
             rec["pushed"] = None
-            logger.warning(f"push 거부됨({status}) {b.key} — 재시도하지 않음")
+            logger.error(f"push 거부됨({status}) {b.key}: {reason} — 재시도하지 않음")
             if retry_on_fail:
                 self.write_record(b, rec)
+        else:
+            logger.warning(f"push 실패({status or '네트워크'}) {b.key}: {reason} "
+                           f"— 5분 뒤 재시도(원본은 워크스페이스에 있음)")
         return ok
 
     # ── 실패 알림 (슬랙) ──
@@ -691,7 +731,8 @@ class Runner:
             write_file(path, json.dumps(rec, ensure_ascii=False, indent=2))
             logger.warning(f"push 24시간 초과 — 포기(원본은 남음): {path}")
             return
-        status, _ = user_api(api_key, "POST", "/api/ax/runs", {"runs": [run_payload(rec)]})
+        status, body = user_api(api_key, "POST", "/api/ax/runs",
+                                {"runs": [run_payload(rec)]})
         if 200 <= status < 300:
             rec["pushed"] = True
             write_file(path, json.dumps(rec, ensure_ascii=False, indent=2))
@@ -699,6 +740,8 @@ class Runner:
         elif 400 <= status < 500:
             rec["pushed"] = None
             write_file(path, json.dumps(rec, ensure_ascii=False, indent=2))
+            logger.error(f"push 거부됨({status}) {path.name}: "
+                         f"{(body or {}).get('error') or '(응답 본문 없음)'} — 재시도 중단")
 
     # ── 대화 기록 스냅샷 (인계 보존) ──
     def export_chats(self):
@@ -727,8 +770,14 @@ class Runner:
         if after:
             q += f"&after={urllib.parse.quote(str(after))}"
         status, res = user_api(api_key, "GET", q)
-        if status == 404 or not res or not res.get("count"):
-            return   # 연결된 대화 없음 / 새 메시지 없음
+        if status == 404:
+            return   # 연결된 대화 없음 (워크플로우에 브랜치가 아직 안 붙음)
+        if not (200 <= status < 300):
+            reason = (res or {}).get("error") or "(응답 본문 없음)"
+            logger.warning(f"대화 기록 조회 실패({status or '네트워크'}) {pdir.name}: {reason}")
+            return
+        if not res or not res.get("count"):
+            return   # 새 메시지 없음
         md = res.get("markdown") or ""
         target = pdir / "docs" / "대화기록" / f"{datetime.now(KST):%Y-%m}.md"
         prev = read_text(target)
