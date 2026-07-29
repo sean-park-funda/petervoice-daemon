@@ -331,7 +331,7 @@ def load_workflow_meta(project: Path) -> dict:
     d = _read_json(project / ".ax" / "workflow.json") or {}
     if not isinstance(d, dict):
         d = {}
-    return {
+    out = {
         "title": str(d.get("title") or project.name),
         "description": d.get("description"),
         "owner_team": d.get("owner_team"),
@@ -343,6 +343,11 @@ def load_workflow_meta(project: Path) -> dict:
         "branch_id": d.get("branch_id") if isinstance(d.get("branch_id"), int) else None,
         "sort_order": d.get("sort_order") if isinstance(d.get("sort_order"), int) else 0,
     }
+    # 흐름도(2026-07-29 웹 계약 추가). 화이트리스트에 없어서 통째로 버려졌고,
+    # blob 에도 안 들어가 graph 만 바뀐 편집은 변경 감지조차 안 됐다.
+    if isinstance(d.get("graph"), dict):
+        out["graph"] = d["graph"]
+    return out
 
 
 # ── 파일 쓰기 (ubuntu → agent 소유 워크스페이스) ─────────────────
