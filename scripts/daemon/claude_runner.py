@@ -15,6 +15,7 @@ from daemon.globals import (
     MAX_CONTEXT_OVERFLOW_RETRIES,
     config, sessions_lock, shutdown_event, logger,
 )
+from daemon.limits import build_claude_env, detect_cap_hit, record_cap_hit, cap_notice
 import daemon.globals as g
 import signal
 import threading
@@ -351,12 +352,8 @@ def run_claude(
             g.claude_inflight += 1
             _spawn_concurrency = g.claude_inflight
         _counted = True
-        claude_env = {
-            **{k: v for k, v in os.environ.items() if k != "CLAUDECODE"},
-            "LANG": "en_US.UTF-8",
-        }
-        if account_config_dir:
-            claude_env["CLAUDE_CONFIG_DIR"] = os.path.expanduser(account_config_dir)
+        # 상한 주입은 반드시 build_claude_env 경유 (limits.py) — 실행 지점이 5곳이라 직접 만들면 샌다
+        claude_env = build_claude_env(config, account_config_dir)
         proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
@@ -392,6 +389,7 @@ def run_claude(
         stop_deadline = 0.0
 
         response_text = ""
+        _cap_notified = False   # 폭주 상한 알림은 턴당 1회
         result_segments: list[str] = []
         new_session_id = sid
         last_stream_time = time.time()
@@ -497,6 +495,18 @@ def run_claude(
             if not line:
                 continue
 
+            # 폭주 상한에 걸렸는지 — CLI 가 사람이 읽을 문구로 알려준다(limits.py CAP_MESSAGES).
+            # 턴당 1회만 알린다: 같은 상한 메시지가 반복돼 나오므로 채팅이 도배된다.
+            if not _cap_notified:
+                _cap_label = detect_cap_hit(line)
+                if _cap_label:
+                    _cap_notified = True
+                    logger.warning(f"[limits] {project}: {_cap_label} 상한 도달 — 작업 일부 중단됨")
+                    record_cap_hit(project, _cap_label, config)
+                    if stream_to_chat:
+                        api_request(api_key, "POST", "/api/bot/reply", {
+                            "text": cap_notice(_cap_label), "project": project, "is_final": False,
+                        })
             try:
                 event = json.loads(line)
             except json.JSONDecodeError:
@@ -790,7 +800,7 @@ def rewrite_for_voice(text: str) -> str:
         result = subprocess.run(
             cmd, capture_output=True, text=True,
             timeout=timeout, cwd=os.path.expanduser("~"),
-            env={k: v for k, v in os.environ.items() if k != "CLAUDECODE"},
+            env=build_claude_env(config),
             shell=IS_WINDOWS,
         )
 

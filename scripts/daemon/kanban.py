@@ -15,6 +15,7 @@ from daemon.globals import (
     config, shutdown_event, logger, PROMPTS_DIR, SECRETS_ENV_PATH,
     DAEMON_DIR, CLAUDE_CMD, IS_WINDOWS,
 )
+from daemon.limits import build_claude_env
 from daemon.api import api_request
 from daemon.supabase import (
     resolve_user_id, get_project_dir, fetch_prompt_from_supabase,
@@ -311,12 +312,7 @@ def run_kanban_claude(
     accounts = config.get("accounts", {})
     account_config_dir = accounts.get(account_name, {}).get("config_dir") if account_name != "default" else None
 
-    claude_env = {
-        **{k: v for k, v in os.environ.items() if k != "CLAUDECODE"},
-        "LANG": "en_US.UTF-8",
-    }
-    if account_config_dir:
-        claude_env["CLAUDE_CONFIG_DIR"] = os.path.expanduser(account_config_dir)
+    claude_env = build_claude_env(config, account_config_dir)
 
     bot_name = config.get("bot_name", "bot")
     logger.info(f"[{bot_name}] Kanban Claude: card=#{card_id}, project={project_id}, session={session_id or 'new'}")

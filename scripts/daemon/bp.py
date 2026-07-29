@@ -22,6 +22,7 @@ import subprocess
 import threading
 
 from daemon.globals import config, logger, CLAUDE_CMD
+from daemon.limits import build_claude_env
 from daemon.api import api_request
 
 # 전 유저 동일 모델 (유저별 채팅 모델 설정과 무관)
@@ -157,10 +158,7 @@ def _run(worker, msg_id: int, project: str, mode: str, bp_ids: list[str]):
         "--model", BP_MODEL,
         "--", prompt,
     ]
-    claude_env = {
-        **{k: v for k, v in os.environ.items() if k != "CLAUDECODE"},
-        "LANG": "en_US.UTF-8",
-    }
+    claude_env = build_claude_env(config)
 
     logger.info(f"[{bot}] BP runner: mode={mode}, ids={list(docs)}")
     result_text = ""

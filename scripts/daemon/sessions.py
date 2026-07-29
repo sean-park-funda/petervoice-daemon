@@ -9,6 +9,7 @@ from datetime import datetime
 from pathlib import Path
 
 import daemon.globals as g
+from daemon.limits import build_claude_env
 from daemon.globals import (
     config, sessions_lock, shutdown_event, logger,
     DAEMON_DIR, SESSIONS_PATH, PENDING_RESETS_PATH, CODEX_SESSIONS_PATH,
@@ -147,14 +148,24 @@ def save_session_context(project: str) -> bool:
 
     sid = sess["session_id"]
     project_dir = get_project_dir(project)
+
+    # 슬라이딩 윈도우 단기기억(작업 A):
+    # 최근 N턴은 다음 세션에 '원문 그대로' 붙일 것이므로, 요약에서는 그 이전만 다룬다.
+    # recent_raw를 요약 프롬프트에 '제외 대상'으로 명시해 경계를 내용 기준으로 고정 →
+    # 저장 시점에 [요약(N턴 이전) + 원문(최근 N턴)]이 확정되어 중복/누락 없음(경계 정합).
+    recent_turns = config.get("session_recent_turns", 20)
+    recent_raw = _fetch_recent_conversation(project, limit=recent_turns)
     summary_prompt = (
-        "세션이 곧 리셋됩니다. 다음 세션에서 이어갈 수 있도록, "
-        "지금까지의 핵심 맥락을 요약해주세요:\n"
+        "세션이 곧 리셋됩니다. 다음 세션에서 이어갈 수 있도록 지금까지의 핵심 맥락을 요약해주세요.\n"
+        "단, 아래 '최근 대화'는 다음 세션에 원문 그대로 다시 제공되므로 **요약에서 제외**하고, "
+        "그 이전 내용만 요약하세요 (최근 대화 내용을 다시 적지 마세요):\n"
         "1. 현재 진행 중인 작업과 상태\n"
         "2. 최근 내린 주요 결정사항\n"
         "3. 아직 완료되지 않은 과제\n"
         "4. 중요한 컨텍스트 (에러, 제약사항 등)\n"
-        "간결하게 500자 이내로 작성해주세요."
+        "간결하게 500자 이내로 작성해주세요.\n\n"
+        "--- 최근 대화 (요약 제외 대상, 이미 다음 세션에 원문 제공됨) ---\n"
+        f"{recent_raw or '(최근 대화 없음)'}"
     )
 
     proj_settings = _fetch_project_settings(project)
@@ -162,17 +173,19 @@ def save_session_context(project: str) -> bool:
     accounts = config.get("accounts", {})
     account_config_dir = accounts.get(account_name, {}).get("config_dir") if account_name != "default" else None
 
-    cmd = [CLAUDE_CMD, "-p", "--output-format", "stream-json", "--resume", sid, "--", summary_prompt]
-    claude_env = {
-        **{k: v for k, v in os.environ.items() if k != "CLAUDECODE"},
-        "LANG": "en_US.UTF-8",
-    }
-    if account_config_dir:
-        claude_env["CLAUDE_CONFIG_DIR"] = os.path.expanduser(account_config_dir)
+    # --verbose 필수: CLI가 "When using --print, --output-format=stream-json requires --verbose"로
+    # exit 1 하며 즉시 죽는다(1초). 이 인자가 없어 AI 요약이 항상 실패하고 폴백(원문)만
+    # 저장되고 있었다 — 2026-07-27 실측으로 확인·수정.
+    cmd = [CLAUDE_CMD, "-p", "--output-format", "stream-json", "--verbose",
+           "--resume", sid, "--", summary_prompt]
+    claude_env = build_claude_env(config, account_config_dir)
 
     try:
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            # stdin=DEVNULL: CLI가 stdin을 3초 기다리며 "no stdin data received" 경고를
+            # 내고 그만큼 늦어진다. 요약은 인자로 프롬프트를 주므로 stdin이 필요 없다.
+            stdin=subprocess.DEVNULL,
             cwd=project_dir, env=claude_env, shell=IS_WINDOWS,
         )
         summary_text = ""
@@ -196,11 +209,18 @@ def save_session_context(project: str) -> bool:
             elif etype == "result":
                 if event.get("result") and not summary_text.strip():
                     summary_text = event["result"]
-        proc.wait(timeout=60)
+        # 19.5MB 세션 요약에 실측 25초. 더 큰 세션(30~70MB)도 있어 60초는 빡빡하므로
+        # 기본 180초로 늘리고 config로 조정 가능하게 한다.
+        proc.wait(timeout=config.get("session_summary_timeout_sec", 180))
         summary_text = _strip_ansi(summary_text).strip()
 
         if summary_text and len(summary_text) > 20:
-            _save_session_summary(project, summary_text)
+            # 슬라이딩 윈도우: 요약(N턴 이전) + 최근 N턴 원문을 함께 저장.
+            # 경계는 위 recent_raw로 이미 고정됨(요약에서 제외하도록 지시). 저장/주입 시점 재조회 없음.
+            combined = summary_text
+            if recent_raw:
+                combined += f"\n\n## 최근 {recent_turns}턴 (원문)\n{recent_raw}"
+            _save_session_summary(project, combined)
             return True
         else:
             logger.warning(f"Summary too short for {project}, using fallback")
