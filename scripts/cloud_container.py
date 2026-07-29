@@ -190,6 +190,33 @@ def has_credentials(user_id: int) -> bool:
     return r.returncode == 0
 
 
+_skills_linked: set[int] = set()
+
+
+def ensure_skills(user_id: int) -> None:
+    """컨테이너 안 `$CLAUDE_CONFIG_DIR/skills` 에 번들 스킬을 **개별 심링크**로 건다.
+
+    마운트만으로는 안 된다 — Claude Code 는 `CLAUDE_CONFIG_DIR/skills` 만 탐색하고,
+    `/srv/pv/shared/skills` 는 그저 임의 경로다. 이게 빠져 있어서 컨테이너 유저는
+    gmail·slack 등 번들 스킬을 하나도 못 썼다 (2026-07-29 실측으로 확인).
+
+    개별 링크인 이유: 통짜로 걸면 유저가 자기 스킬을 같은 폴더에 설치할 수 없다.
+    프로세스당 1회만 수행하고, 배포로 데몬이 재시작되면 다시 걸려 새 스킬이 반영된다."""
+    if user_id in _skills_linked:
+        return
+    shared = _config.get("shared_skills_dir", "/srv/pv/shared/skills")
+    script = (
+        'd="${CLAUDE_CONFIG_DIR:-/home/agent/claude}/skills"; mkdir -p "$d"; '
+        f'for s in {shared}/*/; do n=$(basename "$s"); '
+        '[ -e "$d/$n" ] || ln -sfn "${s%/}" "$d/$n"; done'
+    )
+    r = _podman("exec", name(user_id), "sh", "-c", script, timeout=30)
+    if r.returncode == 0:
+        _skills_linked.add(user_id)
+    elif _logger:
+        _logger.warning(f"skills link failed user={user_id}: {(r.stderr or '')[:200]}")
+
+
 def kill_turns(user_id: int) -> None:
     """컨테이너 안에서 도는 claude 턴을 정리한다.
 
@@ -218,6 +245,7 @@ def exec_claude_turn(user_id: int, project: str, prompt: str,
     """컨테이너 안에서 claude 한 턴. returns (rc, stdout, stderr)."""
     if not ensure_running(user_id):
         return (1, "", "container start failed")
+    ensure_skills(user_id)  # 번들 스킬 심링크 (프로세스당 1회)
     _last_used[user_id] = time.time()
     ws = f"/home/agent/workspace/{project if re.fullmatch(r'[a-z0-9_-]{1,60}', project or '') else 'general'}"
     _podman("exec", name(user_id), "mkdir", "-p", f"{ws}/docs", timeout=15)
