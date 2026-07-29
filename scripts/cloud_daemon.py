@@ -506,11 +506,45 @@ CLOUD_SYSTEM_PROMPT_TMPL = """# 실행 환경: 피터보이스 클라우드 (공
 """
 
 
+def _dedicated_host_prompt() -> str:
+    """전용 호스트 + 컨테이너 없는 모드용 환경 안내.
+
+    공유 서버 문구를 그대로 쓰면 apt·sudo 불가, 공유 환경 등 사실과 다른 안내가 나간다
+    (2026-07-29 뉴넥스 내부 서버에서 실제 발생). 전용 서버는 하드웨어 전부가 이 고객 것이다."""
+    lim = config.get("limits", {})
+    mem = str(lim.get("memory_max", "6G")).upper().replace("G", "GB")
+    mins = int(lim.get("turn_timeout_sec", TURN_TIMEOUT_SEC) / 60)
+    disk = lim.get("disk_quota_gb", 0)
+    hb_min = config.get("heartbeat_min_interval_min", 30)
+    return f"""# 실행 환경: 피터보이스 (고객 전용 서버)
+
+당신은 이 고객사 **전용 서버**에서 실행됩니다. 다른 사용자와 자원을 나눠 쓰지 않습니다.
+
+## 가능한 것
+- 패키지 설치 자유: `sudo apt-get install -y <패키지>`, `pip install`, `npm install -g` 모두 가능. 설치물은 유지됩니다
+- 서버/포트도 내부에서 자유롭게 사용 가능
+
+## 이 서버의 실제 사양 (추측하지 말고 이 값을 그대로 안내할 것)
+- 메모리 {mem} / 한 턴 최대 {mins}분 / 디스크 {disk}GB
+
+## 제약
+- **인터넷 아웃바운드는 443·80·53 포트만 열려 있습니다.** 그 외 포트(DB 직결, SSH 등)는 차단됩니다
+- **반복/예약 작업**: crontab 대신 피터보이스 HeartBeat 를 쓰세요
+  (`docs/HEARTBEAT.md` + `POST $API_URL/api/tasks`, interval_min>={hb_min})
+
+## 함께 쓰는 사람들
+메시지가 `[팀원 OOO 님이 보낸 메시지]` 로 시작하면 프로젝트 소유자가 아닌 팀원이 보낸 것입니다.
+표시가 없으면 소유자 본인입니다. 사람이 바뀌면 그 사람 기준으로 답하고, 답변에 이 표시를 따라 쓰지 마세요.
+
+GPU 가 필요한 작업만 불가합니다. 그 외 작업은 자유롭게 하세요.
+"""
+
+
 def _ensure_cloud_system_prompt(user_id: int) -> str | None:
     """클라우드 환경 가이드 시스템 프롬프트 파일 (유저 워크스페이스에 1회 생성, ACL로 pv유저 읽기 가능)."""
     try:
         p = user_workspace(user_id) / ".cloud-system-prompt.md"
-        text = _shared_system_prompt()
+        text = _dedicated_host_prompt() if config.get("dedicated") else _shared_system_prompt()
         if not p.exists() or p.read_text() != text:
             p.write_text(text)
             os.chmod(p, 0o644)
