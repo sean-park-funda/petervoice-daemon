@@ -858,6 +858,7 @@ class Runner:
                 if now - last_scan >= scan_interval:
                     self.scan()
                     last_scan = now
+                    self._last_scan_ts = now
                 self.tick(datetime.now(KST))
                 if now - last_sweep >= 300:
                     threading.Thread(target=self._sweep_safe, daemon=True,
@@ -867,10 +868,37 @@ class Runner:
                     threading.Thread(target=self._export_safe, daemon=True,
                                      name="chat-export").start()
                     last_export = now
+                if now - self._last_hb >= 60:
+                    self._heartbeat()
+                    self._last_hb = now
             except Exception as e:
                 logger.error(f"루프 오류: {e}", exc_info=True)
             shutdown.wait(TICK_SEC)
         logger.info("cron 러너 정지")
+
+    _last_hb = 0.0
+    _hb_404 = False
+    _last_scan_ts = 0.0
+
+    def _heartbeat(self):
+        """러너 생존 신호 → 대시보드 (60초 주기, 아웃바운드).
+
+        러너가 죽거나 sync 가 막혀도 밖에서 알 길이 없어 대시보드 쪽이 오진했다
+        (2026-07-29 graph 미반영 건 — 러너 정지로 의심했으나 실제는 키 필터 문제).
+        웹이 아직 이 엔드포인트를 안 만들었으면 404 — 한 번만 로그하고 조용히 넘어간다."""
+        body = {
+            "batches": len(self.batches),
+            "last_scan_at": (datetime.fromtimestamp(self._last_scan_ts, KST).isoformat()
+                             if self._last_scan_ts else None),
+            "max_concurrent": self.max_concurrent,
+        }
+        try:
+            status, _ = host_api("POST", "/api/ax/runner-heartbeat", body)
+        except Exception:
+            return
+        if status == 404 and not self._hb_404:
+            self._hb_404 = True
+            logger.info("runner-heartbeat 엔드포인트 미구현(404) — 웹 배포 전까지 무시")
 
     def _sweep_safe(self):
         try:
