@@ -50,6 +50,30 @@ notify() {
     || true
 }
 
+# 번들 스킬을 컨테이너가 읽는 공용 폴더로 반영한다.
+# 이 단계가 없어서 레포에 스킬을 추가해도 유저 환경에 영원히 안 들어갔다
+# (2026-07-28 실측: 공용 8/9개, 전용 **0개** — 전용은 gmail·slack 조차 없었다).
+# 데몬은 이 폴더를 읽어 유저 홈에 심링크만 걸고, 비어 있으면 조용히 return 한다.
+sync_skills() {
+  local src="$REPO/skills"
+  local dst="${PV_SHARED_SKILLS:-/srv/pv/shared/skills}"
+  [ -d "$src" ] || return 0
+  sudo mkdir -p "$dst"
+  local n=0
+  for s in "$src"/*/; do
+    [ -d "$s" ] || continue
+    local name; name=$(basename "$s")
+    # 번들 스킬 **이름 단위로만** 덮어쓴다. 유저가 같은 폴더에 설치한 다른 스킬은 건드리지 않는다
+    if command -v rsync >/dev/null 2>&1; then
+      sudo rsync -a --delete "$s" "$dst/$name/" || continue
+    else
+      sudo rm -rf "$dst/$name" && sudo cp -a "${s%/}" "$dst/$name" || continue
+    fi
+    n=$((n + 1))
+  done
+  log "번들 스킬 동기화: ${n}개 → $dst"
+}
+
 # 일시정지 — 락도 잡기 전에 조용히 빠진다
 [ -f "$REPO/.deploy-pause" ] && exit 0
 
@@ -90,6 +114,8 @@ if git diff --name-only "$LOCAL" "$REMOTE" | grep -q '^requirements.txt$'; then
   log "requirements.txt 변경 → pip install"
   python3 -m pip install -q -r requirements.txt || log "⚠️ pip install 실패(계속 진행)"
 fi
+
+sync_skills
 
 # 배포 전 기준선 — 헬스체크에서 로스터 수가 줄지 않았는지 비교한다
 BASE_ROSTER=$(sudo journalctl -u pv-cloud --no-pager -n 200 \
