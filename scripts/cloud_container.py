@@ -300,6 +300,28 @@ def exec_shell(user_id: int, workdir: str, command: str, env: dict,
     같은 컨테이너에서 돌던 대화 턴까지 끊기기 때문.
     명령은 argv 가 아니라 env 로 넘긴다(따옴표 지옥 회피 + /proc cmdline 노출 최소화).
     """
+    # 컨테이너 없는 호스트(예: 뉴넥스 내부 서버, container.enabled=false)에서는
+    # 데몬 계정으로 직접 실행한다. 컨테이너 경로(/home/agent/...)는 호스트 경로로 번역.
+    if not enabled_for(user_id):
+        host_wd = workdir
+        if workdir.startswith("/home/agent/"):
+            host_wd = str(home(user_id) / workdir[len("/home/agent/"):])
+        try:
+            os.makedirs(host_wd, exist_ok=True)
+            e = dict(os.environ)
+            e.update(env)
+            e["PV_CRON_CMD"] = command
+            r = subprocess.run(
+                ["bash", "-lc",
+                 f'timeout -k 10 {int(timeout_sec)} bash -c "$PV_CRON_CMD"'],
+                cwd=host_wd, env=e, capture_output=True, text=True,
+                timeout=timeout_sec + 60)
+            return (r.returncode, r.stdout, r.stderr)
+        except subprocess.TimeoutExpired:
+            return (124, "", "host timeout")
+        except OSError as exc:
+            return (1, "", f"host exec failed: {exc}")
+
     if not ensure_running(user_id):
         return (1, "", "container start failed")
     _last_used[user_id] = time.time()

@@ -351,6 +351,13 @@ def _sudo(*args) -> bool:
     return subprocess.run(["sudo", "-n", *args], capture_output=True).returncode == 0
 
 
+def _container_host() -> bool:
+    """이 호스트가 컨테이너 모드인지. 컨테이너 없는 호스트(뉴넥스 내부 서버 등,
+    container.enabled=false)에서는 홈이 데몬 계정 소유라 agent(10000) chown/ubuntu ACL 을
+    걸면 오히려 소유권이 깨진다 — 그 경우 아래 소유권 보정들을 전부 건너뛴다."""
+    return bool((config.get("container") or {}).get("enabled"))
+
+
 def write_file(path: Path, content: str):
     """워크스페이스에 원본 기록. ACL 로 직접 쓰고, 안 되면 sudo tee 로 우회한다."""
     try:
@@ -360,8 +367,9 @@ def write_file(path: Path, content: str):
         _sudo("mkdir", "-p", str(path.parent))
         subprocess.run(["sudo", "-n", "tee", str(path)],
                        input=content, capture_output=True, text=True)
-    # 컨테이너 안 agent(10000) 도 읽을 수 있어야 한다
-    _sudo("chown", f"{ctr.AGENT_UID}:{ctr.AGENT_UID}", str(path))
+    # 컨테이너 안 agent(10000) 도 읽을 수 있어야 한다 (컨테이너 호스트에서만)
+    if _container_host():
+        _sudo("chown", f"{ctr.AGENT_UID}:{ctr.AGENT_UID}", str(path))
 
 
 def read_text(path: Path) -> str:
@@ -389,10 +397,13 @@ def ensure_ax_dir(user_id: int, project: str) -> Path:
     tag = (user_id, project)
     if tag not in _provisioned:
         if not d.is_dir():
-            _sudo("mkdir", "-p", str(d))
-            _sudo("chown", "-R", f"{ctr.AGENT_UID}:{ctr.AGENT_UID}", str(d.parent))
-            _sudo("setfacl", "-R", "-m", "u:ubuntu:rwx", "-m", "d:u:ubuntu:rwx",
-                  str(d.parent))
+            if _container_host():
+                _sudo("mkdir", "-p", str(d))
+                _sudo("chown", "-R", f"{ctr.AGENT_UID}:{ctr.AGENT_UID}", str(d.parent))
+                _sudo("setfacl", "-R", "-m", "u:ubuntu:rwx", "-m", "d:u:ubuntu:rwx",
+                      str(d.parent))
+            else:
+                d.mkdir(parents=True, exist_ok=True)
         _provisioned.add(tag)
     return d
 
@@ -402,9 +413,12 @@ def ensure_shared(user_id: int):
     p = workspace(user_id) / "_shared"
     if p.is_dir():
         return
-    _sudo("mkdir", "-p", str(p))
-    _sudo("chown", "-R", f"{ctr.AGENT_UID}:{ctr.AGENT_UID}", str(p))
-    _sudo("setfacl", "-R", "-m", "u:ubuntu:rwx", "-m", "d:u:ubuntu:rwx", str(p))
+    if _container_host():
+        _sudo("mkdir", "-p", str(p))
+        _sudo("chown", "-R", f"{ctr.AGENT_UID}:{ctr.AGENT_UID}", str(p))
+        _sudo("setfacl", "-R", "-m", "u:ubuntu:rwx", "-m", "d:u:ubuntu:rwx", str(p))
+    else:
+        p.mkdir(parents=True, exist_ok=True)
     logger.info(f"_shared 준비 완료: {p}")
 
 
