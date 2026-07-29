@@ -896,9 +896,12 @@ class Runner:
             status, _ = host_api("POST", "/api/ax/runner-heartbeat", body)
         except Exception:
             return
-        if status == 404 and not self._hb_404:
+        if 400 <= status < 500 and not self._hb_404:
             self._hb_404 = True
-            logger.info("runner-heartbeat 엔드포인트 미구현(404) — 웹 배포 전까지 무시")
+            logger.info(f"runner-heartbeat 미수신({status}) — 웹이 엔드포인트를 배포하면 자동 연결")
+        elif 200 <= status < 300 and self._hb_404:
+            self._hb_404 = False
+            logger.info("runner-heartbeat 수신 시작 — 대시보드 연결됨")
 
     def _sweep_safe(self):
         try:
