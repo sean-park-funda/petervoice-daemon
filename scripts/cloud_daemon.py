@@ -27,6 +27,7 @@ import os
 import pty
 import re
 import select
+import shutil
 import signal
 import subprocess
 import sys
@@ -635,6 +636,59 @@ def _reset_unit(unit: str):
 
 _SENDER_RE = re.compile(r"[\x00-\x1f\[\]\n]")
 
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg"}
+
+
+def fetch_attachments(user_id: int, project: str, files: list) -> list[str]:
+    """첨부 파일을 워크스페이스 `docs/uploaded/` 에 내려받아, **claude 가 보는 경로**로 돌려준다.
+
+    맥 데몬(daemon/worker.py)의 규약을 클라우드로 이식한 것 — 이게 없어서 클라우드 유저의
+    이미지 첨부가 통째로 무시됐다(2026-07-29 뉴넥스에서 발견). 파일별 실패는 건너뛴다."""
+    if not files:
+        return []
+    pdir = project_dir(user_id, project)
+    updir = pdir / "docs" / "uploaded"
+    try:
+        updir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        logger.error(f"attachment dir failed user={user_id}: {e}")
+        return []
+    out: list[str] = []
+    for f in files:
+        url = (f.get("url") or "").strip()
+        name = re.sub(r"[^\w.\-가-힣 ]", "_", f.get("name") or "file")[:80]
+        if not url.startswith(("http://", "https://")):
+            continue
+        dest = updir / f"{int(time.time() * 1000)}_{name}"
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "pv-cloud"})
+            with urllib.request.urlopen(req, timeout=60) as r, open(dest, "wb") as w:
+                shutil.copyfileobj(r, w, 1 << 16)
+            os.chmod(dest, 0o644)  # 격리 모드에서 pv<id>/agent 가 읽을 수 있게
+        except Exception as e:
+            logger.error(f"attachment download failed {name}: {e}")
+            continue
+        if ctr.enabled_for(user_id):
+            out.append(f"/home/agent/workspace/{pdir.name}/docs/uploaded/{dest.name}")
+        else:
+            out.append(str(dest))
+    return out
+
+
+def with_attachments(text: str, paths: list[str]) -> str:
+    if not paths:
+        return text
+    lines = "\n".join(f"- {p}" for p in paths)
+    exts = {os.path.splitext(p)[1].lower() for p in paths}
+    has_img, has_doc = bool(exts & IMAGE_EXTS), bool(exts - IMAGE_EXTS)
+    if has_img and has_doc:
+        hint = "이미지는 Read 도구로, 문서(xlsx/docx/pdf 등)는 Bash에서 python으로 읽으세요"
+    elif has_doc:
+        hint = "Bash에서 python으로 파일 내용을 읽으세요 (예: openpyxl, python-docx, PyPDF2 등)"
+    else:
+        hint = "Read 도구로 확인하세요"
+    return f"{text}\n\n[첨부 파일 ({hint})]\n{lines}"
+
 
 def with_sender(msg: dict, text: str) -> str:
     """팀 프로젝트에서 온 메시지에 발신자를 표시한다.
@@ -1221,11 +1275,15 @@ class CloudWorker:
             return
 
         # ── 일반 턴 ──
+        attachments = fetch_attachments(user_id, project, msg.get("files") or [])
+        if not text and not attachments:
+            return  # 빈 메시지 — 빈 프롬프트로 claude 를 부르면 exit 1 로 죽는다
+        prompt = with_attachments(with_sender(msg, text), attachments)
         # 진행 표시("생각 중...") — 웹은 is_working + active_project 로 판단한다.
         # 이걸 안 보내면 응답이 나올 때까지 화면이 조용해서 멈춘 것처럼 보인다.
-        self.set_working(api_key, True, project, text[:80], msg_id)
+        self.set_working(api_key, True, project, text[:80] or "첨부 파일 확인", msg_id)
         try:
-            response, status = run_claude_turn(user_id, project, with_sender(msg, text))
+            response, status = run_claude_turn(user_id, project, prompt)
         finally:
             self.set_working(api_key, False, project)
         collect_usage_after_turn(user_id, api_key)  # 컨테이너가 살아있는 동안 사용량 갱신
