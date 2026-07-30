@@ -16,7 +16,9 @@ CDP_PORT="${PV_CDP_PORT:-9222}"
 started=""
 
 # ── chromium ──
-if ! pgrep -f "remote-debugging-port=$CDP_PORT" >/dev/null 2>&1; then
+# "이미 떠 있음" 판정은 pgrep 이 아니라 CDP 응답으로 한다 — pgrep -f 는 SSH/부모 셸의
+# 명령줄 문자열에 패턴이 들어 있으면 자기 자신을 매칭한다 (뉴넥스에서 실측 오탐)
+if ! curl -sf -m 2 "http://127.0.0.1:$CDP_PORT/json/version" >/dev/null 2>&1; then
   BIN=""
   HEADLESS_FLAG="--headless=new"
   if [ "$(uname)" = "Darwin" ]; then
@@ -58,7 +60,7 @@ if ! pgrep -f "remote-debugging-port=$CDP_PORT" >/dev/null 2>&1; then
 fi
 
 # ── CDP 브리지 (컨테이너 전용 — 홈이 /home/agent 일 때만) ──
-if [ "$HOME" = "/home/agent" ] && ! pgrep -f "cdp-proxy.js" >/dev/null 2>&1; then
+if [ "$HOME" = "/home/agent" ] && ! pgrep -f "node .*cdp-proxy.js" >/dev/null 2>&1; then
   nohup node "$SCRIPT_DIR/cdp-proxy.js" >/dev/null 2>&1 &
   started="$started cdp-proxy"
 fi
