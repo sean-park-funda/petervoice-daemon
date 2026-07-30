@@ -27,14 +27,19 @@ try {
 let ptyModule = null;
 let WebSocketServer = null;
 let WSClient = null; // CDP 브라우저 인계용 WebSocket 클라이언트
+// node-pty(네이티브, 터미널용)와 ws(순수 JS)는 따로 로드한다 —
+// 한 블록에 묶으면 node-pty 빌드 실패가 ws(브라우저 인계)까지 죽인다 (뉴넥스에서 실측)
 try {
-  const SCRIPTS_DIR = path.dirname(__filename);
-  ptyModule = require(path.join(SCRIPTS_DIR, "node_modules/@homebridge/node-pty-prebuilt-multiarch"));
-  const wsMod = require(path.join(SCRIPTS_DIR, "node_modules/ws"));
+  ptyModule = require(path.join(path.dirname(__filename), "node_modules/@homebridge/node-pty-prebuilt-multiarch"));
+} catch (e) {
+  console.warn("[terminal] node-pty not available:", e.message);
+}
+try {
+  const wsMod = require(path.join(path.dirname(__filename), "node_modules/ws"));
   WebSocketServer = wsMod.WebSocketServer;
   WSClient = wsMod.WebSocket;
 } catch (e) {
-  console.warn("[terminal] node-pty or ws not available:", e.message);
+  console.warn("[terminal] ws not available:", e.message);
 }
 
 // ─── Config ──────────────────────────────────────────
