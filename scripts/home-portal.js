@@ -1343,18 +1343,43 @@ function cdpHttpJson(port, pathName) {
   });
 }
 
-async function cdpConnect(port) {
+function cdpHostOf(u) {
+  try { return new URL(u).host; } catch { return ""; }
+}
+
+async function cdpConnect(port, matchUrl) {
+  // matchUrl(인계의 대상 URL)이 있으면 같은 호스트의 탭을 우선 선택 — 여러 탭 중
+  // 엉뚱한 탭을 스트리밍하던 문제의 수정 (2026-07-30 포트원 가입 인계에서 실측)
+  const wantHost = matchUrl ? cdpHostOf(matchUrl) : "";
   const existing = cdpSessions.get(port);
-  if (existing && existing.ws.readyState === 1) { existing.lastUsed = Date.now(); return existing; }
-  if (existing) cdpSessions.delete(port);
+  if (existing && existing.ws.readyState === 1 && !wantHost) {
+    existing.lastUsed = Date.now();
+    return existing;
+  }
   if (!WSClient) throw new Error("ws module not available");
   const targets = await cdpHttpJson(port, "/json/list");
   const pages = (targets || []).filter(t => t.type === "page" && !/^(devtools|chrome-extension):/.test(t.url || ""));
   if (!pages.length) throw new Error("no page target");
-  const target = pages[0];
+  let target = wantHost ? pages.find(t => cdpHostOf(t.url) === wantHost) : null;
+  if (!target && existing && existing.ws.readyState === 1) {
+    // 매칭 탭이 없으면(예: 작업 중 다른 호스트로 리다이렉트) 붙어 있던 탭을 유지 — 탭 점프 방지
+    existing.lastUsed = Date.now();
+    return existing;
+  }
+  if (!target) target = pages[0];
+  if (existing && existing.ws.readyState === 1) {
+    if (existing.targetId === target.id) {
+      existing.lastUsed = Date.now();
+      return existing;
+    }
+    try { existing.ws.close(); } catch {}
+    cdpSessions.delete(port);
+  } else if (existing) {
+    cdpSessions.delete(port);
+  }
   const session = await new Promise((resolve, reject) => {
     const ws = new WSClient(target.webSocketDebuggerUrl, { perMessageDeflate: false });
-    const s = { ws, port, nextId: 1, pending: new Map(), lastUsed: Date.now() };
+    const s = { ws, port, targetId: target.id, nextId: 1, pending: new Map(), lastUsed: Date.now() };
     const to = setTimeout(() => { ws.terminate(); reject(new Error("cdp ws timeout")); }, 5000);
     ws.on("open", () => { clearTimeout(to); resolve(s); });
     ws.on("error", (e) => { clearTimeout(to); reject(e); });
@@ -2371,7 +2396,7 @@ document.addEventListener('click', e => {
     (async () => {
       const port = cdpPortForDir(url.searchParams.get("dir"));
       if (!port) return json({ error: "잘못된 dir" }, 403);
-      const s = await cdpConnect(port);
+      const s = await cdpConnect(port, url.searchParams.get("url") || "");
       const [shot, metrics] = await Promise.all([
         cdpSend(s, "Page.captureScreenshot", { format: "jpeg", quality: 60 }),
         cdpSend(s, "Page.getLayoutMetrics", {}),
@@ -2379,7 +2404,8 @@ document.addEventListener('click', e => {
       let pageInfo = {};
       try {
         const t = await cdpHttpJson(port, "/json/list");
-        const p = (t || []).find(x => x.type === "page" && !/^devtools:/.test(x.url || ""));
+        const p = (t || []).find(x => x.id === s.targetId) ||
+          (t || []).find(x => x.type === "page" && !/^devtools:/.test(x.url || ""));
         pageInfo = { url: p && p.url, title: p && p.title };
       } catch {}
       const vp = metrics.cssLayoutViewport || metrics.layoutViewport || {};
@@ -2397,7 +2423,7 @@ document.addEventListener('click', e => {
     readBody().then(async (body) => {
       const port = cdpPortForDir(body && body.dir);
       if (!port) return json({ error: "잘못된 dir" }, 403);
-      const s = await cdpConnect(port);
+      const s = await cdpConnect(port, (body && body.url) || "");
       const events = Array.isArray(body.events) ? body.events.slice(0, 20) : [];
       for (const ev of events) await cdpDispatchEvent(s, ev);
       json({ ok: true });
