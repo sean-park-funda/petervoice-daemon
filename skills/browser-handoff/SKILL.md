@@ -11,11 +11,16 @@ description: 브라우저 자동화 중 로그인/인증 벽에 막혔을 때 �
 ## 0. 브라우저 준비 (최초 1회 + 세션마다)
 
 ```bash
-# chromium 이 없으면 설치 (최초 1회, 유저 홈에 저장되어 유지됨)
-npx -y playwright install --with-deps chromium
-
 # CDP(9222) 포함 헤드리스 브라우저 기동 (이미 떠 있으면 no-op)
-bash /srv/pv/shared/skills/browser-handoff/scripts/start-browser.sh
+# 이 스킬 폴더의 scripts/start-browser.sh 를 실행한다:
+#  - 클라우드: bash /srv/pv/shared/skills/browser-handoff/scripts/start-browser.sh
+#  - 맥(설치형): bash ~/.claude/skills/browser-handoff/scripts/start-browser.sh
+bash "$(dirname "$SKILL_PATH" 2>/dev/null || echo .)/scripts/start-browser.sh" \
+  || bash ~/.claude/skills/browser-handoff/scripts/start-browser.sh \
+  || bash /srv/pv/shared/skills/browser-handoff/scripts/start-browser.sh
+
+# chromium 이 없다고 나오면 설치 (최초 1회, 유저 홈에 저장되어 유지됨. 맥은 Chrome 있으면 불필요)
+npx -y playwright install --with-deps chromium
 ```
 
 **중요**: 브라우저 자동화는 반드시 이 브라우저에 **CDP로 붙어서** 해야 한다.
@@ -34,6 +39,10 @@ npx -y agent-browser --cdp 9222 click @e1
 로그인 폼, "로그인이 필요합니다", 2FA 입력, CAPTCHA 등을 만나면 **직접 뚫으려 하지 말고**:
 
 ```bash
+# API_URL/API_KEY — 클라우드: env 로 주입됨 / 맥(설치형): config 에서 읽기
+API_URL=${API_URL:-$(python3 -c "import json; c=json.load(open('$HOME/.claude-daemon/config.json')); print(c.get('api_url','https://www.peter-voice.site'))")}
+API_KEY=${API_KEY:-$(python3 -c "import json; print(json.load(open('$HOME/.claude-daemon/config.json'))['api_key'])")}
+
 RESP=$(curl -s -X POST "$API_URL/api/browser-handoff" \
   -H "X-Api-Key: $API_KEY" \
   -H "Content-Type: application/json" \
