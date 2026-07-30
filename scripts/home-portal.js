@@ -1375,6 +1375,9 @@ async function cdpConnect(port) {
       if (cdpSessions.get(port) === s) cdpSessions.delete(port);
     });
   });
+  // 헤드리스 크롬은 스스로를 "포커스 없는 창"으로 여겨 일부 사이트가 입력을 무시한다
+  // (네이버 로그인에서 실측) — 포커스 에뮬레이션을 켠다. 실패해도 치명적이지 않음.
+  try { await cdpSend(session, "Emulation.setFocusEmulationEnabled", { enabled: true }); } catch {}
   cdpSessions.set(port, session);
   return session;
 }
@@ -1409,6 +1412,11 @@ const CDP_KEY_MAP = {
   Tab: { windowsVirtualKeyCode: 9, code: "Tab", key: "Tab" },
   Backspace: { windowsVirtualKeyCode: 8, code: "Backspace", key: "Backspace" },
   Escape: { windowsVirtualKeyCode: 27, code: "Escape", key: "Escape" },
+  Delete: { windowsVirtualKeyCode: 46, code: "Delete", key: "Delete" },
+  ArrowLeft: { windowsVirtualKeyCode: 37, code: "ArrowLeft", key: "ArrowLeft" },
+  ArrowUp: { windowsVirtualKeyCode: 38, code: "ArrowUp", key: "ArrowUp" },
+  ArrowRight: { windowsVirtualKeyCode: 39, code: "ArrowRight", key: "ArrowRight" },
+  ArrowDown: { windowsVirtualKeyCode: 40, code: "ArrowDown", key: "ArrowDown" },
 };
 
 async function cdpDispatchEvent(session, ev) {
