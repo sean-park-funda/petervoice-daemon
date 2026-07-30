@@ -10,7 +10,8 @@ if pgrep -f "remote-debugging-port=9222" >/dev/null 2>&1; then
 fi
 
 # playwright 가 받아둔 chromium 우선, 없으면 시스템 chromium
-BIN="$(ls -d "$HOME"/.cache/ms-playwright/chromium-*/chrome-linux/chrome 2>/dev/null | sort | tail -1)"
+# (playwright 버전에 따라 chrome-linux/ 또는 chrome-linux64/ 레이아웃)
+BIN="$(ls -d "$HOME"/.cache/ms-playwright/chromium-*/chrome-linux*/chrome 2>/dev/null | sort | tail -1)"
 if [ -z "$BIN" ] && command -v chromium >/dev/null 2>&1; then BIN=chromium; fi
 if [ -z "$BIN" ] && command -v chromium-browser >/dev/null 2>&1; then BIN=chromium-browser; fi
 if [ -z "$BIN" ]; then
