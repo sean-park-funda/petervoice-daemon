@@ -27,9 +27,10 @@ npx -y playwright install --with-deps chromium
 그래야 사용자가 로그인해준 세션을 그대로 이어받는다.
 
 ```bash
-npx -y agent-browser --cdp 9222 open https://example.com
-npx -y agent-browser --cdp 9222 snapshot -i
-npx -y agent-browser --cdp 9222 click @e1
+CDP=${PV_CDP_PORT:-9222}
+npx -y agent-browser --cdp $CDP open https://example.com
+npx -y agent-browser --cdp $CDP snapshot -i
+npx -y agent-browser --cdp $CDP click @e1
 ```
 
 (자체적으로 새 브라우저를 띄우는 `agent-browser open`(--cdp 없이)을 쓰면 인계와 세션이 분리된다 — 금지)
@@ -74,7 +75,7 @@ MARKER=$(echo "$RESP" | python3 -c "import sys,json; print(json.load(sys.stdin)[
 ## 3. 완료 후 이어받기
 
 사용자가 로그인을 마치면 `[relay from:browser-handoff]` 로 시작하는 완료 메시지가 도착한다.
-그때 **같은 CDP 브라우저(--cdp 9222)** 로 이어서 작업하면 로그인 세션이 살아 있다.
+그때 **같은 CDP 브라우저(--cdp $CDP)** 로 이어서 작업하면 로그인 세션이 살아 있다.
 
 - 만료 메시지(⏱️)가 와도 로그인이 이미 되어 있을 수 있다 — 먼저 페이지를 열어 확인할 것
 - 로그인 세션은 `$HOME/.pv-browser` 프로필에 저장되어 다음 턴·컨테이너 재시작에도 유지된다

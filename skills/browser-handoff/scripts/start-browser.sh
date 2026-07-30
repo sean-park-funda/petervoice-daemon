@@ -9,10 +9,14 @@
 set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# CDP 포트: 데몬이 주입한 PV_CDP_PORT 우선 (컨테이너=9222 고정, 비컨테이너 클라우드=19000+uid,
+# 맥 설치형=9222 기본). 포탈이 유저별로 유도하는 포트와 일치해야 한다.
+CDP_PORT="${PV_CDP_PORT:-9222}"
+
 started=""
 
 # ── chromium ──
-if ! pgrep -f "remote-debugging-port=9222" >/dev/null 2>&1; then
+if ! pgrep -f "remote-debugging-port=$CDP_PORT" >/dev/null 2>&1; then
   BIN=""
   HEADLESS_FLAG="--headless=new"
   if [ "$(uname)" = "Darwin" ]; then
@@ -43,7 +47,7 @@ if ! pgrep -f "remote-debugging-port=9222" >/dev/null 2>&1; then
   mkdir -p "$HOME/.pv-browser"
   # shellcheck disable=SC2086
   nohup "$BIN" $HEADLESS_FLAG \
-    --remote-debugging-port=9222 \
+    --remote-debugging-port="$CDP_PORT" \
     --no-sandbox \
     --disable-dev-shm-usage \
     --disable-gpu \
@@ -65,7 +69,7 @@ if [ -z "$started" ]; then
 fi
 
 for _ in $(seq 1 20); do
-  if curl -sf http://127.0.0.1:9222/json/version >/dev/null 2>&1; then
+  if curl -sf "http://127.0.0.1:$CDP_PORT/json/version" >/dev/null 2>&1; then
     echo "started:$started"
     exit 0
   fi

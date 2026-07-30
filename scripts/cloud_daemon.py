@@ -718,6 +718,8 @@ def run_claude_turn(user_id: int, project: str, prompt: str) -> tuple[str, str]:
             secrets.setdefault("API_KEY", user["apiKey"])
         # 이 턴의 대화 라우팅 값 (브랜치면 branch:N) — 스킬이 API 회신 project 로 사용
         secrets["PV_PROJECT"] = project
+        # 컨테이너 안 CDP 는 항상 9222 (호스트로는 19000+uid 로 퍼블리시됨)
+        secrets["PV_CDP_PORT"] = "9222"
         sp = ctr.sysprompt_path_in_home(user_id, _container_system_prompt())
         sid = load_session(user_id, project)
         rc, out, err = ctr.exec_claude_turn(user_id, project, prompt, sid, secrets, sp)
@@ -757,6 +759,8 @@ def run_claude_turn(user_id: int, project: str, prompt: str) -> tuple[str, str]:
         secrets.setdefault("API_KEY", user["apiKey"])
     # 이 턴의 대화 라우팅 값 (브랜치면 branch:N) — 스킬이 API 회신 project 로 사용
     secrets["PV_PROJECT"] = project
+    # 비컨테이너 실행: chromium 이 호스트에서 직접 돌므로 포탈이 유도하는 유저별 포트를 써야 한다
+    secrets["PV_CDP_PORT"] = str(ctr.CDP_PORT_BASE + user_id)
     env = {**isolated_env_overrides(user_id), **secrets}
 
     if not isolation_enabled():
