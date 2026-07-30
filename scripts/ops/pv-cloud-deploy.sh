@@ -124,6 +124,13 @@ RESTART_AT=$(date '+%Y-%m-%d %H:%M:%S')
 
 sudo systemctl restart pv-cloud || { log "❌ restart 실패"; }
 
+# 포탈(home-portal.js) 변경 시 pv-portal 도 재시작 — 2026-07-30 브라우저 인계 배포 때
+# pv-cloud 만 재시작해 포탈이 구코드로 남는 갭이 실제로 발생했다
+if git diff --name-only "$LOCAL" "$REMOTE" | grep -q '^scripts/home-portal.js$'; then
+  log "home-portal.js 변경 → pv-portal 재시작"
+  sudo systemctl restart pv-portal || log "⚠️ pv-portal 재시작 실패"
+fi
+
 # ── 헬스체크 ──
 # 데몬은 HTTP 를 제공하지 않으므로 "살아있다"만으로는 부족하다.
 # 2026-07-27 사고 때 데몬은 active 였고 로스터도 정상이었는데 모든 턴이 죽었다.

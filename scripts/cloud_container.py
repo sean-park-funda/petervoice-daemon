@@ -251,9 +251,7 @@ def ensure_browser(user_id: int) -> bool:
     if not ensure_cdp(user_id):
         return False
     _last_used[user_id] = time.time()
-    r = _podman("exec", name(user_id), "pgrep", "-f", "remote-debugging-port=9222", timeout=15)
-    if r.returncode == 0:
-        return True
+    # 스크립트가 chromium/브리지 각각 idempotent 하게 처리 (둘 다 떠 있으면 즉시 no-op)
     shared_skills = _config.get("shared_skills_dir", "/srv/pv/shared/skills")
     script = f"{shared_skills}/{BROWSER_START_SCRIPT}"
     r = _podman("exec", "--user=agent", name(user_id), "bash", script, timeout=60)
