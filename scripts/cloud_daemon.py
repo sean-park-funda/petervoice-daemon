@@ -716,6 +716,8 @@ def run_claude_turn(user_id: int, project: str, prompt: str) -> tuple[str, str]:
         secrets.setdefault("API_URL", config["api_url"])
         if user:
             secrets.setdefault("API_KEY", user["apiKey"])
+        # 이 턴의 대화 라우팅 값 (브랜치면 branch:N) — 스킬이 API 회신 project 로 사용
+        secrets["PV_PROJECT"] = project
         sp = ctr.sysprompt_path_in_home(user_id, _container_system_prompt())
         sid = load_session(user_id, project)
         rc, out, err = ctr.exec_claude_turn(user_id, project, prompt, sid, secrets, sp)
@@ -749,6 +751,12 @@ def run_claude_turn(user_id: int, project: str, prompt: str) -> tuple[str, str]:
 
     user = roster.get(user_id)
     secrets = fetch_user_secrets(user_id, user["apiKey"]) if user else {}
+    secrets = dict(secrets)
+    secrets.setdefault("API_URL", config["api_url"])
+    if user:
+        secrets.setdefault("API_KEY", user["apiKey"])
+    # 이 턴의 대화 라우팅 값 (브랜치면 branch:N) — 스킬이 API 회신 project 로 사용
+    secrets["PV_PROJECT"] = project
     env = {**isolated_env_overrides(user_id), **secrets}
 
     if not isolation_enabled():

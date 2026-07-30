@@ -47,7 +47,7 @@ RESP=$(curl -s -X POST "$API_URL/api/browser-handoff" \
   -H "X-Api-Key: $API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "project": "'"$(basename "$PWD")"'",
+    "project": "'"${PV_PROJECT:-$(basename "$PWD")}"'",
     "url": "현재 로그인이 필요한 페이지 URL",
     "reason": "쿠팡윙 로그인 (주문 데이터 조회용)"
   }')
@@ -55,7 +55,9 @@ MARKER=$(echo "$RESP" | python3 -c "import sys,json; print(json.load(sys.stdin)[
 ```
 
 - `reason`: 사용자에게 보이는 한 줄 설명 — **어느 사이트, 무슨 작업 때문인지** 명확히
-- `project`: 현재 프로젝트 ID (작업 디렉토리 이름)
+- `project`: **반드시 `$PV_PROJECT` 환경변수를 사용** — 이 값이 완료/만료 통지가 도착할
+  대화를 결정한다. 브랜치 세션은 `branch:N` 형태라 디렉토리 이름으로 추측하면
+  통지가 엉뚱한 대화로 간다 (실제 사고 사례 있음)
 
 ## 2. 턴 종료 (기다리지 말 것)
 

@@ -354,6 +354,10 @@ def run_claude(
         _counted = True
         # 상한 주입은 반드시 build_claude_env 경유 (limits.py) — 실행 지점이 5곳이라 직접 만들면 샌다
         claude_env = build_claude_env(config, account_config_dir)
+        # 이 턴의 대화 라우팅 값 (브랜치면 branch:N, 칸반이면 kanban:N) —
+        # browser-handoff 등 스킬이 API 회신을 정확한 대화로 받기 위해 사용.
+        # basename $PWD 방식은 브랜치·공유 디렉토리에서 틀린다 (2026-07-30 실측)
+        claude_env["PV_PROJECT"] = project
         proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
