@@ -26,10 +26,13 @@ try {
 // ─── Terminal (WebSocket + node-pty) ─────────────────
 let ptyModule = null;
 let WebSocketServer = null;
+let WSClient = null; // CDP 브라우저 인계용 WebSocket 클라이언트
 try {
   const SCRIPTS_DIR = path.dirname(__filename);
   ptyModule = require(path.join(SCRIPTS_DIR, "node_modules/@homebridge/node-pty-prebuilt-multiarch"));
-  WebSocketServer = require(path.join(SCRIPTS_DIR, "node_modules/ws")).WebSocketServer;
+  const wsMod = require(path.join(SCRIPTS_DIR, "node_modules/ws"));
+  WebSocketServer = wsMod.WebSocketServer;
+  WSClient = wsMod.WebSocket;
 } catch (e) {
   console.warn("[terminal] node-pty or ws not available:", e.message);
 }
@@ -1310,6 +1313,147 @@ const CLOUD_MODE = process.env.PV_CLOUD_MODE === "1";
 const CLOUD_HOST_KEY = process.env.PV_CLOUD_HOST_KEY || "";
 const CLOUD_USERS_ROOT = process.env.PV_USERS_ROOT || "/srv/pv/users";
 
+// ── 브라우저 세션 인계 (CDP 브리지) ──
+// 유저 브라우저(chromium)의 CDP 에 붙어 화면 프레임과 입력을 중계한다.
+// 클라우드: 컨테이너 CDP 가 호스트 127.0.0.1:(19000+uid) 로 퍼블리시됨. 셀프호스팅: 9222.
+// 자격증명 위생: 입력 이벤트 내용과 프레임은 절대 로깅하지 않는다.
+const CDP_PORT_BASE = 19000;
+const cdpSessions = new Map(); // port -> session
+
+function cdpPortForDir(dir) {
+  if (!CLOUD_MODE) return 9222;
+  if (!dir) return null;
+  const root = path.resolve(CLOUD_USERS_ROOT);
+  const resolved = path.resolve(dir);
+  if (!resolved.startsWith(root + path.sep)) return null;
+  const uid = parseInt(resolved.slice(root.length + 1).split(path.sep)[0], 10);
+  if (!Number.isInteger(uid) || uid <= 0 || uid > 100000) return null;
+  return CDP_PORT_BASE + uid;
+}
+
+function cdpHttpJson(port, pathName) {
+  return new Promise((resolve, reject) => {
+    const r = http.get({ host: "127.0.0.1", port, path: pathName, timeout: 3000 }, (resp) => {
+      let b = "";
+      resp.on("data", c => b += c);
+      resp.on("end", () => { try { resolve(JSON.parse(b)); } catch (e) { reject(e); } });
+    });
+    r.on("timeout", () => r.destroy(new Error("cdp timeout")));
+    r.on("error", reject);
+  });
+}
+
+async function cdpConnect(port) {
+  const existing = cdpSessions.get(port);
+  if (existing && existing.ws.readyState === 1) { existing.lastUsed = Date.now(); return existing; }
+  if (existing) cdpSessions.delete(port);
+  if (!WSClient) throw new Error("ws module not available");
+  const targets = await cdpHttpJson(port, "/json/list");
+  const pages = (targets || []).filter(t => t.type === "page" && !/^(devtools|chrome-extension):/.test(t.url || ""));
+  if (!pages.length) throw new Error("no page target");
+  const target = pages[0];
+  const session = await new Promise((resolve, reject) => {
+    const ws = new WSClient(target.webSocketDebuggerUrl, { perMessageDeflate: false });
+    const s = { ws, port, nextId: 1, pending: new Map(), lastUsed: Date.now() };
+    const to = setTimeout(() => { ws.terminate(); reject(new Error("cdp ws timeout")); }, 5000);
+    ws.on("open", () => { clearTimeout(to); resolve(s); });
+    ws.on("error", (e) => { clearTimeout(to); reject(e); });
+    ws.on("message", (raw) => {
+      let msg;
+      try { msg = JSON.parse(raw); } catch { return; }
+      if (msg.id && s.pending.has(msg.id)) {
+        const p = s.pending.get(msg.id);
+        s.pending.delete(msg.id);
+        clearTimeout(p.timer);
+        if (msg.error) p.rej(new Error(msg.error.message || "cdp error"));
+        else p.res(msg.result);
+      }
+    });
+    ws.on("close", () => {
+      for (const p of s.pending.values()) { clearTimeout(p.timer); p.rej(new Error("cdp closed")); }
+      s.pending.clear();
+      if (cdpSessions.get(port) === s) cdpSessions.delete(port);
+    });
+  });
+  cdpSessions.set(port, session);
+  return session;
+}
+
+function cdpSend(session, method, params = {}) {
+  return new Promise((resolve, reject) => {
+    const id = session.nextId++;
+    const timer = setTimeout(() => {
+      session.pending.delete(id);
+      reject(new Error("cdp call timeout: " + method));
+    }, 8000);
+    session.pending.set(id, { res: resolve, rej: reject, timer });
+    session.lastUsed = Date.now();
+    try { session.ws.send(JSON.stringify({ id, method, params })); }
+    catch (e) { clearTimeout(timer); session.pending.delete(id); reject(e); }
+  });
+}
+
+// 유휴 CDP 연결 정리 (5분 미사용 시 닫음)
+setInterval(() => {
+  const now = Date.now();
+  for (const [port, s] of cdpSessions) {
+    if (now - s.lastUsed > 5 * 60 * 1000) {
+      try { s.ws.close(); } catch {}
+      cdpSessions.delete(port);
+    }
+  }
+}, 60 * 1000);
+
+const CDP_KEY_MAP = {
+  Enter: { windowsVirtualKeyCode: 13, code: "Enter", key: "Enter", text: "\r" },
+  Tab: { windowsVirtualKeyCode: 9, code: "Tab", key: "Tab" },
+  Backspace: { windowsVirtualKeyCode: 8, code: "Backspace", key: "Backspace" },
+  Escape: { windowsVirtualKeyCode: 27, code: "Escape", key: "Escape" },
+};
+
+async function cdpDispatchEvent(session, ev) {
+  if (!ev || typeof ev !== "object") return;
+  const x = Math.round(Number(ev.x) || 0);
+  const y = Math.round(Number(ev.y) || 0);
+  switch (ev.t) {
+    case "click": {
+      const count = Math.min(3, Math.max(1, parseInt(ev.count) || 1));
+      const base = { x, y, button: "left", clickCount: count, pointerType: "mouse" };
+      await cdpSend(session, "Input.dispatchMouseEvent", { type: "mousePressed", ...base });
+      await cdpSend(session, "Input.dispatchMouseEvent", { type: "mouseReleased", ...base });
+      break;
+    }
+    case "move":
+      await cdpSend(session, "Input.dispatchMouseEvent", { type: "mouseMoved", x, y });
+      break;
+    case "wheel":
+      await cdpSend(session, "Input.dispatchMouseEvent", {
+        type: "mouseWheel", x, y,
+        deltaX: Math.round(Number(ev.dx2) || 0), deltaY: Math.round(Number(ev.dy) || 0),
+      });
+      break;
+    case "text":
+      if (typeof ev.text === "string" && ev.text.length > 0 && ev.text.length <= 500) {
+        await cdpSend(session, "Input.insertText", { text: ev.text });
+      }
+      break;
+    case "key": {
+      const k = CDP_KEY_MAP[ev.key];
+      if (!k) break;
+      await cdpSend(session, "Input.dispatchKeyEvent", { type: "keyDown", ...k });
+      await cdpSend(session, "Input.dispatchKeyEvent", {
+        type: "keyUp", windowsVirtualKeyCode: k.windowsVirtualKeyCode, code: k.code, key: k.key,
+      });
+      break;
+    }
+    case "nav":
+      if (typeof ev.url === "string" && /^https?:\/\//.test(ev.url)) {
+        await cdpSend(session, "Page.navigate", { url: ev.url.slice(0, 2000) });
+      }
+      break;
+  }
+}
+
 function verifyAuth(req) {
   if (CLOUD_MODE) {
     // 클라우드: host_key 헤더만 인정 (웹 프록시 전용).
@@ -1541,8 +1685,8 @@ const server = http.createServer((req, res) => {
     return json({ error: "인증 필요" }, 401);
   }
 
-  // 클라우드 모드: docs API만 노출 (공유/사이트/기타 로컬 기능 차단)
-  if (CLOUD_MODE && !pathname.startsWith("/api/docs") && pathname !== "/api/graph") {
+  // 클라우드 모드: docs API + 브라우저 인계만 노출 (공유/사이트/기타 로컬 기능 차단)
+  if (CLOUD_MODE && !pathname.startsWith("/api/docs") && !pathname.startsWith("/api/browser") && pathname !== "/api/graph") {
     return json({ error: "cloud mode: not available" }, 404);
   }
   // 클라우드 모드: 쿼리 dir 중앙 검증 (일부 핸들러가 개별 검증을 생략하므로 초크포인트 필수)
@@ -2213,6 +2357,43 @@ document.addEventListener('click', e => {
   }
   else if (pathname === "/api/unpublish" && req.method === "POST") {
     readBody().then(body => json(execUnpublish(body)));
+  }
+  else if (pathname === "/api/browser/frame" && req.method === "GET") {
+    // 브라우저 인계: 현재 화면 프레임 (JPEG base64) + 뷰포트/URL
+    (async () => {
+      const port = cdpPortForDir(url.searchParams.get("dir"));
+      if (!port) return json({ error: "잘못된 dir" }, 403);
+      const s = await cdpConnect(port);
+      const [shot, metrics] = await Promise.all([
+        cdpSend(s, "Page.captureScreenshot", { format: "jpeg", quality: 60 }),
+        cdpSend(s, "Page.getLayoutMetrics", {}),
+      ]);
+      let pageInfo = {};
+      try {
+        const t = await cdpHttpJson(port, "/json/list");
+        const p = (t || []).find(x => x.type === "page" && !/^devtools:/.test(x.url || ""));
+        pageInfo = { url: p && p.url, title: p && p.title };
+      } catch {}
+      const vp = metrics.cssLayoutViewport || metrics.layoutViewport || {};
+      json({
+        ok: true,
+        image: shot.data,
+        viewport: { w: vp.clientWidth || 0, h: vp.clientHeight || 0 },
+        url: pageInfo.url || "",
+        title: pageInfo.title || "",
+      });
+    })().catch((e) => json({ error: "browser_unavailable", detail: String((e && e.message) || e) }, 502));
+  }
+  else if (pathname === "/api/browser/input" && req.method === "POST") {
+    // 브라우저 인계: 입력 전달. 이벤트 내용은 절대 로깅하지 않는다 (자격증명 위생).
+    readBody().then(async (body) => {
+      const port = cdpPortForDir(body && body.dir);
+      if (!port) return json({ error: "잘못된 dir" }, 403);
+      const s = await cdpConnect(port);
+      const events = Array.isArray(body.events) ? body.events.slice(0, 20) : [];
+      for (const ev of events) await cdpDispatchEvent(s, ev);
+      json({ ok: true });
+    }).catch((e) => json({ error: "browser_unavailable", detail: String((e && e.message) || e) }, 502));
   }
   else {
     json({ error: "Not found" }, 404);

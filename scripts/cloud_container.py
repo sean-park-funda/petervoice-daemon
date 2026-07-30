@@ -78,6 +78,41 @@ def _lock(user_id: int) -> threading.Lock:
 
 AGENT_UID = "10000"  # 컨테이너 내 agent 유저 uid (rootful: 호스트 uid 와 동일 매핑)
 
+# ── 브라우저 세션 인계 (CDP) ──
+# 컨테이너 안 chromium CDP(9222)를 호스트 127.0.0.1:(BASE+uid) 로 퍼블리시한다.
+# pv-portal 이 이 포트로 붙어 화면/입력을 중계 (docs/plans/2026-07-30-browser-session-handoff.md)
+CDP_PORT_BASE = 19000
+# 컨테이너 간 통신 차단 네트워크 (netavark isolate). CDP 가 컨테이너 안에서 0.0.0.0 바인딩이라
+# 기본 브리지에선 다른 유저 컨테이너가 교차 접근할 수 있다 — isolate 네트워크로 차단.
+ISOLATED_NETWORK = "pv-isolated"
+_network_ready = False
+_keepalive: dict[int, float] = {}  # user_id -> 이 시각까지 유휴정지 금지 (epoch)
+
+
+def cdp_port(user_id: int) -> int:
+    return CDP_PORT_BASE + int(user_id)
+
+
+def keep_alive(user_id: int, until_ts: float):
+    """활성 브라우저 인계 동안 reap_idle 이 컨테이너를 정지하지 않게 한다."""
+    _keepalive[user_id] = max(_keepalive.get(user_id, 0), until_ts)
+
+
+def _ensure_network() -> str | None:
+    """isolate 네트워크 보장. 생성 실패(구버전 podman 등) 시 None → 기본 네트워크 사용."""
+    global _network_ready
+    if _network_ready:
+        return ISOLATED_NETWORK
+    r = _podman("network", "exists", ISOLATED_NETWORK, timeout=15)
+    if r.returncode != 0:
+        r = _podman("network", "create", "--opt", "isolate=true", ISOLATED_NETWORK, timeout=30)
+        if r.returncode != 0:
+            if _logger:
+                _logger.warning(f"isolate network create failed, using default: {(r.stderr or '')[:200]}")
+            return None
+    _network_ready = True
+    return ISOLATED_NETWORK
+
 
 _home_ready: set[int] = set()
 
@@ -154,18 +189,77 @@ def ensure_running(user_id: int) -> bool:
             "--cpus=" + str(c.get("cpus", 1.5)),
             "--pids-limit=" + str(c.get("pids_limit", 256)),
             "--restart=no",
+            # 브라우저 인계: 컨테이너 CDP → 호스트 localhost 전용 퍼블리시
+            "-p", f"127.0.0.1:{cdp_port(user_id)}:9222",
             "-v", f"{h}:/home/agent:rw",
             "-v", f"{shared_skills}:{shared_skills}:ro",
             "-e", "HOME=/home/agent",
             "-e", "CLAUDE_CONFIG_DIR=/home/agent/claude",
-            image(), "sleep", "infinity",
         ]
+        net = _ensure_network()
+        if net:
+            args += ["--network", net]
+        args += [image(), "sleep", "infinity"]
         r = _podman(*args, timeout=120)
         if r.returncode != 0:
             if _logger:
                 _logger.error(f"container run failed user={user_id}: {r.stderr[:200]}")
             return False
         return True
+
+
+def _has_cdp_publish(user_id: int) -> bool:
+    r = _podman("inspect", name(user_id), "--format",
+                "{{json .HostConfig.PortBindings}}", timeout=15)
+    if r.returncode != 0:
+        return False
+    return "9222" in (r.stdout or "")
+
+
+def ensure_cdp(user_id: int) -> bool:
+    """브라우저 인계용: CDP 포트 매핑이 있는 컨테이너 보장.
+
+    포트 퍼블리시는 생성 시에만 가능하므로, 매핑 없는 기존 컨테이너는 재생성한다
+    (홈은 마운트라 무손실 — 단 컨테이너 레이어의 apt 설치물은 날아간다).
+    턴(claude) 실행 중이면 보류하고 다음 폴에서 재시도."""
+    if not enabled_for(user_id):
+        return False
+    if not ensure_running(user_id):
+        return False
+    if _has_cdp_publish(user_id):
+        return True
+    with _lock(user_id):
+        r = _podman("exec", name(user_id), "pgrep", "-x", "claude", timeout=15)
+        if r.returncode == 0:
+            if _logger:
+                _logger.info(f"cdp recreate deferred (turn running) user={user_id}")
+            return False
+        if _logger:
+            _logger.info(f"recreating container with cdp port user={user_id}")
+        _podman("stop", "-t", "5", name(user_id), timeout=45)
+        _podman("rm", "-f", name(user_id), timeout=45)
+    return ensure_running(user_id)
+
+
+BROWSER_START_SCRIPT = "browser-handoff/scripts/start-browser.sh"
+
+
+def ensure_browser(user_id: int) -> bool:
+    """헤드리스 chromium 이 컨테이너 안에서 CDP(9222)와 함께 떠 있게 보장.
+
+    시작 스크립트는 공유 스킬(ro 마운트)에 있어 에이전트와 데몬이 같은 것을 쓴다."""
+    if not ensure_cdp(user_id):
+        return False
+    _last_used[user_id] = time.time()
+    r = _podman("exec", name(user_id), "pgrep", "-f", "remote-debugging-port=9222", timeout=15)
+    if r.returncode == 0:
+        return True
+    shared_skills = _config.get("shared_skills_dir", "/srv/pv/shared/skills")
+    script = f"{shared_skills}/{BROWSER_START_SCRIPT}"
+    r = _podman("exec", "--user=agent", name(user_id), "bash", script, timeout=60)
+    if r.returncode != 0 and _logger:
+        _logger.warning(f"browser start failed user={user_id}: {(r.stderr or r.stdout or '')[:200]}")
+    return r.returncode == 0
 
 
 def _home_has_credentials(user_id: int) -> bool:
@@ -450,6 +544,8 @@ def reap_idle():
         if not m:
             continue
         uid = int(m.group(1))
+        if now < _keepalive.get(uid, 0):
+            continue  # 활성 브라우저 인계 — 유저가 원격 로그인 중일 수 있어 정지 금지
         last = _last_used.get(uid, 0)
         if now - last > idle:
             _podman("stop", "-t", "5", nm, timeout=30)

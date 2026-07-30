@@ -709,6 +709,13 @@ def run_claude_turn(user_id: int, project: str, prompt: str) -> tuple[str, str]:
     if ctr.enabled_for(user_id):
         user = roster.get(user_id)
         secrets = fetch_user_secrets(user_id, user["apiKey"]) if user else {}
+        # 에이전트가 피터보이스 API(HeartBeat 등록, 브라우저 인계 등)를 부를 수 있게
+        # API_URL/API_KEY 를 env 로 제공 (시스템 프롬프트가 $API_URL 을 참조한다).
+        # 유저가 SecretsPanel 에 같은 키를 직접 넣었으면 그 값을 존중.
+        secrets = dict(secrets)
+        secrets.setdefault("API_URL", config["api_url"])
+        if user:
+            secrets.setdefault("API_KEY", user["apiKey"])
         sp = ctr.sysprompt_path_in_home(user_id, _container_system_prompt())
         sid = load_session(user_id, project)
         rc, out, err = ctr.exec_claude_turn(user_id, project, prompt, sid, secrets, sp)
@@ -1144,6 +1151,56 @@ class UsageThread(threading.Thread):
         logger.info("[usage] thread stopped")
 
 
+class HandoffThread(threading.Thread):
+    """브라우저 세션 인계 폴러 (10초 주기).
+
+    활성 인계 동안 ① 컨테이너 유휴정지 억제(keep_alive) ② CDP 포트 매핑 보장(재생성 포함)
+    ③ 헤드리스 chromium 기동을 책임진다. 유저가 인계 페이지를 열었을 때 브라우저가
+    죽어 있으면 안 되므로 데몬이 생존을 보장한다.
+    설계: peter-voice docs/plans/2026-07-30-browser-session-handoff.md"""
+
+    KEEPALIVE_GRACE_SEC = 120
+
+    def __init__(self):
+        super().__init__(daemon=True, name="handoff")
+
+    @staticmethod
+    def _parse_iso(ts: str | None) -> float | None:
+        if not ts:
+            return None
+        try:
+            from datetime import datetime
+            return datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+        except Exception:
+            return None
+
+    def run(self):
+        logger.info("[handoff] thread started")
+        shutdown_event.wait(15)
+        while not shutdown_event.is_set():
+            try:
+                self.tick()
+            except Exception as e:
+                logger.error(f"[handoff] loop error: {e}")
+            shutdown_event.wait(10)
+        logger.info("[handoff] thread stopped")
+
+    def tick(self):
+        if not config.get("container", {}).get("enabled"):
+            return
+        res = host_api("GET", "/api/cloud/handoffs")
+        if not res:
+            return
+        for h in res.get("handoffs", []):
+            uid = h.get("user_id")
+            if uid is None or not user_allowed(uid):
+                continue
+            uid = int(uid)
+            until = self._parse_iso(h.get("expires_at")) or (time.time() + 900)
+            ctr.keep_alive(uid, until + self.KEEPALIVE_GRACE_SEC)
+            ctr.ensure_browser(uid)
+
+
 # ── 메시지 처리 ──────────────────────────────────────────────────
 
 class CloudWorker:
@@ -1475,6 +1532,7 @@ class CloudWorker:
         roster.sync(force=True)
         self.clear_stale_working()
         UsageThread().start()
+        HandoffThread().start()
         last_heartbeat = 0.0
         last_reap = 0.0
         poll_interval = config.get("poll_interval_sec", 3)
