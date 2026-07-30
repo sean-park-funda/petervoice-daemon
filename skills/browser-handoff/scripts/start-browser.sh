@@ -13,18 +13,30 @@ started=""
 
 # ── chromium ──
 if ! pgrep -f "remote-debugging-port=9222" >/dev/null 2>&1; then
-  # playwright 가 받아둔 바이너리 우선 (chrome-linux/ 또는 chrome-linux64/ 레이아웃),
-  # 다음 headless-shell, 마지막으로 시스템 chromium
-  BIN="$(ls -d "$HOME"/.cache/ms-playwright/chromium-*/chrome-linux*/chrome 2>/dev/null | sort | tail -1)"
+  BIN=""
   HEADLESS_FLAG="--headless=new"
-  if [ -z "$BIN" ]; then
-    BIN="$(ls -d "$HOME"/.cache/ms-playwright/chromium_headless_shell-*/chrome-headless-shell-linux*/chrome-headless-shell 2>/dev/null | sort | tail -1)"
-    HEADLESS_FLAG=""  # headless-shell 은 항상 헤드리스
+  if [ "$(uname)" = "Darwin" ]; then
+    # macOS (설치형/맥미니): 설치된 Chrome/Chromium 우선, 없으면 playwright 캐시
+    for c in "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+             "/Applications/Chromium.app/Contents/MacOS/Chromium"; do
+      [ -x "$c" ] && BIN="$c" && break
+    done
+    if [ -z "$BIN" ]; then
+      BIN="$(ls -d "$HOME"/Library/Caches/ms-playwright/chromium-*/chrome-mac*/Chromium.app/Contents/MacOS/Chromium 2>/dev/null | sort | tail -1)"
+    fi
+  else
+    # Linux: playwright 가 받아둔 바이너리 우선 (chrome-linux/ 또는 chrome-linux64/ 레이아웃),
+    # 다음 headless-shell, 마지막으로 시스템 chromium
+    BIN="$(ls -d "$HOME"/.cache/ms-playwright/chromium-*/chrome-linux*/chrome 2>/dev/null | sort | tail -1)"
+    if [ -z "$BIN" ]; then
+      BIN="$(ls -d "$HOME"/.cache/ms-playwright/chromium_headless_shell-*/chrome-headless-shell-linux*/chrome-headless-shell 2>/dev/null | sort | tail -1)"
+      HEADLESS_FLAG=""  # headless-shell 은 항상 헤드리스
+    fi
+    if [ -z "$BIN" ] && command -v chromium >/dev/null 2>&1; then BIN=chromium; fi
+    if [ -z "$BIN" ] && command -v chromium-browser >/dev/null 2>&1; then BIN=chromium-browser; fi
   fi
-  if [ -z "$BIN" ] && command -v chromium >/dev/null 2>&1; then BIN=chromium; fi
-  if [ -z "$BIN" ] && command -v chromium-browser >/dev/null 2>&1; then BIN=chromium-browser; fi
   if [ -z "$BIN" ]; then
-    echo "chromium not found — run: npx -y playwright install --with-deps chromium" >&2
+    echo "chromium not found — run: npx -y playwright install --with-deps chromium (or install Chrome)" >&2
     exit 1
   fi
 
