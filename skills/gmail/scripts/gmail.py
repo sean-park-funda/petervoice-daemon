@@ -282,16 +282,34 @@ def _env_google_credentials(service: str, scopes: list[str]) -> "Credentials | N
     if not (refresh_token and client_id and client_secret):
         return None
     try:
+        # scopes 를 넘기면 google-auth 가 refresh 요청에 scope 파라미터를 실어 보내고,
+        # 구글은 **그만큼만 담은 축소 토큰**을 내준다. 기본값이 readonly 라 check 가
+        # "발송 권한 없음"으로 오보하고, 유저에게 불필요한 재승인을 요구하게 된다
+        # (2026-07-31 실측). scopes=None 으로 두면 유저가 실제로 승인한 전체 권한이 온다.
         creds = Credentials(
             token=None,
             refresh_token=refresh_token,
             token_uri="https://oauth2.googleapis.com/token",
             client_id=client_id,
             client_secret=client_secret,
-            scopes=scopes,
+            scopes=None,
         )
         creds.refresh(Request())
-        return creds if creds.valid else None
+        if not creds.valid:
+            return None
+        # 부여된 실제 권한을 토큰인포로 확인해 반영 (google-auth 는 refresh 응답의
+        # scope 를 creds 에 채우지 않는다). 실패해도 무시.
+        try:
+            import urllib.request as _u
+            with _u.urlopen(
+                "https://oauth2.googleapis.com/tokeninfo?access_token=" + creds.token, timeout=10
+            ) as r:
+                granted = (json.load(r).get("scope") or "").split()
+            if granted:
+                creds._scopes = granted
+        except Exception:
+            pass
+        return creds
     except Exception as e:
         print(f"env-based Google auth failed: {e}", file=sys.stderr)
         return None
