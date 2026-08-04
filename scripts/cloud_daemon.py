@@ -183,8 +183,67 @@ class Roster:
                 user = self._users.get(user_id)
         return user
 
+    def peek(self, user_id: int) -> dict | None:
+        """미스여도 동기화하지 않는 조회 — 핫패스(정렬 키·리퍼)용.
+        get() 을 핫패스에 쓰면 타 호스트 유저 메시지마다 강제 sync HTTP 가 나간다."""
+        with self._lock:
+            return self._users.get(user_id)
+
 
 roster = Roster()
+
+
+# ── 티어 한도 (로스터 전달값) ────────────────────────────────────
+# 수치의 단일 원천은 웹 lib/tiers.ts — 데몬은 로스터가 내려준 limits 를 그대로 쓴다.
+# 전용 호스트 유저(dedicated)와 구 웹(limits 미제공)은 None → 기존 호스트 config 일괄값.
+
+def user_limits(user_id: int, peek: bool = False) -> dict | None:
+    u = roster.peek(user_id) if peek else roster.get(user_id)
+    if not u or u.get("dedicated"):
+        return None
+    return u.get("limits") or None
+
+
+# ── 월 턴 카운팅 ─────────────────────────────────────────────────
+# 카운트의 단일 진실은 웹 DB(turn_usage) — 데몬은 턴 종료마다 POST 하고,
+# 응답/로스터(turnsUsed)로 로컬 캐시를 갱신해 사전 차단에 쓴다.
+
+_turn_usage: dict[int, tuple[str, int]] = {}   # uid -> (month "YYYY-MM" UTC, turns)
+_turn_usage_lock = threading.Lock()
+_quota_warned: set[tuple[int, str]] = set()     # (uid, month) — 90% 경고 1회
+
+
+def _usage_month() -> str:
+    return time.strftime("%Y-%m", time.gmtime())  # 웹 to_char(now(),'YYYY-MM')와 동일(UTC)
+
+
+def turns_used(user_id: int) -> int:
+    """이번 달 사용 턴. 로스터(60초 주기)와 로컬 카운트 중 큰 값 — 폴링 지연으로 과소평가 방지."""
+    u = roster.get(user_id) or {}
+    from_roster = int(u.get("turnsUsed") or 0)
+    month = _usage_month()
+    with _turn_usage_lock:
+        cached = _turn_usage.get(user_id)
+    local = cached[1] if cached and cached[0] == month else 0
+    return max(from_roster, local)
+
+
+def record_turn(user_id: int):
+    """턴 1개 소비를 웹에 기록 (백그라운드, 실패해도 턴을 막지 않는다)."""
+    def _post():
+        result = host_api("POST", "/api/cloud/turns", {"user_id": user_id})
+        if result and "turns" in result:
+            with _turn_usage_lock:
+                _turn_usage[user_id] = (result.get("month") or _usage_month(),
+                                        int(result["turns"]))
+        else:  # 웹 미배포/일시 실패 — 로컬만이라도 증가시켜 사전 차단이 뚫리지 않게
+            month = _usage_month()
+            base = turns_used(user_id)  # 락 밖에서 (turns_used 도 같은 락을 잡는다)
+            with _turn_usage_lock:
+                cur = _turn_usage.get(user_id)
+                n = cur[1] + 1 if cur and cur[0] == month else base + 1
+                _turn_usage[user_id] = (month, n)
+    threading.Thread(target=_post, daemon=True).start()
 
 
 # ── Per-user dirs / sessions ─────────────────────────────────────
@@ -266,9 +325,20 @@ _disk_lock = threading.Lock()
 DISK_CHECK_TTL_SEC = 600
 
 
+def disk_quota_gb(user_id: int) -> int:
+    """이 유저의 디스크 한도(GB). 티어 한도 우선, 없으면 호스트 config."""
+    lim = user_limits(user_id)
+    if lim and lim.get("diskGb"):
+        return int(lim["diskGb"])
+    return config.get("limits", {}).get("disk_quota_gb", 0)
+
+
 def over_disk_quota(user_id: int) -> bool:
-    """유저 워크스페이스 사용량이 한도 초과인지 (10분 캐시). du 는 무거우니 드물게."""
-    gb = config.get("limits", {}).get("disk_quota_gb", 0)
+    """유저 사용량이 한도 초과인지 (10분 캐시). du 는 무거우니 드물게.
+
+    apt 설치물은 홈이 아니라 컨테이너 레이어에 쌓이므로 레이어 크기를 합산한다
+    (프로젝트 프롬프트의 '알려진 함정' — du 만으로는 안 잡힌다)."""
+    gb = disk_quota_gb(user_id)
     if not gb:
         return False
     now = time.time()
@@ -281,6 +351,8 @@ def over_disk_quota(user_id: int) -> bool:
         r = subprocess.run(["sudo", "-n", "du", "-sb", str(user_workspace(user_id))],
                            capture_output=True, text=True, timeout=30)
         used = int((r.stdout or "0").split()[0]) if r.stdout.strip() else 0
+        if ctr.enabled_for(user_id):
+            used += ctr.layer_size_bytes(user_id)
         over = used > gb * 1024 ** 3
     except Exception:
         over = False
@@ -417,17 +489,27 @@ def has_credentials(user_id: int) -> bool:
     return r.returncode == 0
 
 
-def _container_system_prompt() -> str:
-    """전용 컨테이너용 환경 안내. 실제 config 값을 그대로 알려준다
-    (하드코딩하면 전용 호스트에서 사양을 과소 안내하게 된다)."""
+def _container_system_prompt(user_id: int | None = None) -> str:
+    """전용 컨테이너용 환경 안내. 실제 적용값을 그대로 알려준다
+    (하드코딩하면 호스트·티어별로 사양을 잘못 안내하게 된다).
+    user_id 가 있고 티어 한도가 오면 그 유저의 티어값으로 안내한다."""
     c = config.get("container", {}) or {}
-    mem = str(c.get("memory", "3g")).upper().replace("G", "GB")
-    cpus = c.get("cpus", 1.5)
-    mins = int(c.get("turn_timeout_sec", config.get("limits", {}).get(
-        "turn_timeout_sec", TURN_TIMEOUT_SEC)) / 60)
-    disk = config.get("limits", {}).get("disk_quota_gb", 0)
+    lim = user_limits(user_id) if user_id is not None else None
+    if lim:
+        mem_mb = min(int(lim.get("turnMemoryMb") or 3072), int(c.get("max_memory_mb", 6144)))
+        mem = f"{mem_mb / 1024:g}GB"
+        mins = int(lim.get("turnTimeoutMin") or 30)
+        disk = int(lim.get("diskGb") or 0)
+        hb_min = int(lim.get("automationMinIntervalMin")
+                     or config.get("heartbeat_min_interval_min", 30))
+    else:
+        mem = str(c.get("memory", "3g")).upper().replace("G", "GB")
+        mins = int(c.get("turn_timeout_sec", config.get("limits", {}).get(
+            "turn_timeout_sec", TURN_TIMEOUT_SEC)) / 60)
+        disk = config.get("limits", {}).get("disk_quota_gb", 0)
+        hb_min = config.get("heartbeat_min_interval_min", 30)
     disk_txt = f"디스크 {disk}GB" if disk else "디스크 한도 없음"
-    hb_min = config.get("heartbeat_min_interval_min", 30)
+    cpus = c.get("cpus", 1.5)
     dedicated = bool(config.get("dedicated"))
     intro = ("당신은 이 고객 **전용 서버** 위의 전용 리눅스 컨테이너에서 실행됩니다. "
              "다른 고객과 자원을 나눠 쓰지 않습니다."
@@ -463,11 +545,18 @@ def _container_system_prompt() -> str:
 """
 
 
-def _shared_system_prompt() -> str:
+def _shared_system_prompt(user_id: int | None = None) -> str:
     lim = config.get("limits", {})
-    mem = str(lim.get("memory_max", "3G")).upper().replace("G", "GB")
-    mins = int(lim.get("turn_timeout_sec", TURN_TIMEOUT_SEC) / 60)
-    hb_min = config.get("heartbeat_min_interval_min", 30)
+    tl = user_limits(user_id) if user_id is not None else None
+    if tl:
+        mem = f"{int(tl.get('turnMemoryMb') or 3072) / 1024:g}GB"
+        mins = int(tl.get("turnTimeoutMin") or 30)
+        hb_min = int(tl.get("automationMinIntervalMin")
+                     or config.get("heartbeat_min_interval_min", 30))
+    else:
+        mem = str(lim.get("memory_max", "3G")).upper().replace("G", "GB")
+        mins = int(lim.get("turn_timeout_sec", TURN_TIMEOUT_SEC) / 60)
+        hb_min = config.get("heartbeat_min_interval_min", 30)
     return CLOUD_SYSTEM_PROMPT_TMPL.format(mem=mem, mins=mins, hb_min=hb_min)
 
 
@@ -545,7 +634,7 @@ def _ensure_cloud_system_prompt(user_id: int) -> str | None:
     """클라우드 환경 가이드 시스템 프롬프트 파일 (유저 워크스페이스에 1회 생성, ACL로 pv유저 읽기 가능)."""
     try:
         p = user_workspace(user_id) / ".cloud-system-prompt.md"
-        text = _dedicated_host_prompt() if config.get("dedicated") else _shared_system_prompt()
+        text = _dedicated_host_prompt() if config.get("dedicated") else _shared_system_prompt(user_id)
         if not p.exists() or p.read_text() != text:
             p.write_text(text)
             os.chmod(p, 0o644)
@@ -585,13 +674,23 @@ def _escape_envfile_value(v: str) -> str:
     return v.replace("\n", " ").replace("\r", " ")
 
 
+def turn_timeout_sec(user_id: int) -> int:
+    """이 유저의 턴 시간 한도(초). 티어 한도 우선, 없으면 호스트 config."""
+    tl = user_limits(user_id)
+    if tl and tl.get("turnTimeoutMin"):
+        return int(tl["turnTimeoutMin"]) * 60
+    return int(config.get("limits", {}).get("turn_timeout_sec", TURN_TIMEOUT_SEC))
+
+
 def build_systemd_run(user_id: int, cmd: list[str], env: dict, cwd: str, unit: str,
                       env_file: str) -> list[str]:
     lim = config.get("limits", {})
-    mem = lim.get("memory_max", "3G")
+    tl = user_limits(user_id)
+    mem = (f"{int(tl['turnMemoryMb'])}M" if tl and tl.get("turnMemoryMb")
+           else lim.get("memory_max", "3G"))
     cpu = lim.get("cpu_quota", "150%")
     tasks = str(lim.get("tasks_max", 256))
-    runtime_max = str(lim.get("turn_timeout_sec", TURN_TIMEOUT_SEC))
+    runtime_max = str(turn_timeout_sec(user_id))
     return [
         "sudo", "-n", "systemd-run",
         f"--uid={unix_user(user_id)}", "--gid=pvusers",
@@ -720,9 +819,10 @@ def run_claude_turn(user_id: int, project: str, prompt: str) -> tuple[str, str]:
         secrets["PV_PROJECT"] = project
         # 컨테이너 안 CDP 는 항상 9222 (호스트로는 19000+uid 로 퍼블리시됨)
         secrets["PV_CDP_PORT"] = "9222"
-        sp = ctr.sysprompt_path_in_home(user_id, _container_system_prompt())
+        sp = ctr.sysprompt_path_in_home(user_id, _container_system_prompt(user_id))
         sid = load_session(user_id, project)
-        rc, out, err = ctr.exec_claude_turn(user_id, project, prompt, sid, secrets, sp)
+        rc, out, err = ctr.exec_claude_turn(user_id, project, prompt, sid, secrets, sp,
+                                            limits=user_limits(user_id))
         if rc == 137:
             return ("", "heavy_mem")
         if rc == 124:
@@ -787,7 +887,7 @@ def run_claude_turn(user_id: int, project: str, prompt: str) -> tuple[str, str]:
     wrapped = build_systemd_run(user_id, cmd, env, ws, unit, str(env_file))
     try:
         result = subprocess.run(wrapped, capture_output=True, text=True,
-                                timeout=config.get("limits", {}).get("turn_timeout_sec", TURN_TIMEOUT_SEC) + 30)
+                                timeout=turn_timeout_sec(user_id) + 30)
         rc, out, err = result.returncode, result.stdout, result.stderr
     except subprocess.TimeoutExpired:
         rc, out, err = 124, "", "timeout"
@@ -1327,9 +1427,21 @@ class CloudWorker:
             self.reply(api_key, NEED_LOGIN_MESSAGE, [msg_id], project)
             return
 
+        # ── 티어 월 턴 한도 초과 → 차단 안내 (턴 미소비) ──
+        tl = user_limits(user_id)
+        if tl and tl.get("turnsPerMonth"):
+            used = turns_used(user_id)
+            if used >= int(tl["turnsPerMonth"]):
+                self.reply(api_key,
+                           (f"⚠️ 이번 달 턴 한도({tl['turnsPerMonth']}턴)를 모두 사용했어요.\n\n"
+                            "다음 달 1일에 초기화돼요. 더 많은 턴이 필요하면 "
+                            "**요금제 업그레이드**를 문의해주세요 (설정 > 문의하기)."),
+                           [msg_id], project)
+                return
+
         # ── 디스크 쿼터 초과 → 전환 안내 ──
         if over_disk_quota(user_id):
-            gb = config.get("limits", {}).get("disk_quota_gb", 10)
+            gb = disk_quota_gb(user_id) or 10
             user_api(api_key, "POST", "/api/bot/reply", {
                 "text": (f"⚠️ 저장 공간 한도({gb}GB)를 초과했어요.\n\n"
                          "클라우드는 저장 공간이 제한돼 있어요. 큰 파일을 다루거나 더 많은 공간이 "
@@ -1356,6 +1468,10 @@ class CloudWorker:
         finally:
             self.set_working(api_key, False, project)
         collect_usage_after_turn(user_id, api_key)  # 컨테이너가 살아있는 동안 사용량 갱신
+        # 턴 소비 기록 — 실제로 실행된 경우만 (auth 실패는 미소비)
+        if status in ("ok", "heavy_mem", "heavy_time"):
+            record_turn(user_id)
+            self.maybe_warn_quota(api_key, user_id, project, msg_id)
         if status == "auth":
             self.reply(api_key,
                        "클로드 로그인이 만료됐어요. `재로그인` 이라고 입력해 다시 연결해주세요.",
@@ -1382,13 +1498,40 @@ class CloudWorker:
                 "is_final": True, **({"subtype": st} if st else {}),
             })
 
+    def maybe_warn_quota(self, api_key, user_id, project, msg_id):
+        """턴 한도 90% 도달 시 월 1회 경고 (한도 초과 전에 미리 알린다)."""
+        tl = user_limits(user_id)
+        if not tl or not tl.get("turnsPerMonth"):
+            return
+        limit = int(tl["turnsPerMonth"])
+        used = turns_used(user_id)
+        if used < limit * 0.9:
+            return
+        key = (user_id, _usage_month())
+        if key in _quota_warned:
+            return
+        _quota_warned.add(key)
+        self.reply(api_key,
+                   (f"ℹ️ 이번 달 턴을 {used}/{limit} 사용했어요 (90% 이상). "
+                    "한도를 넘으면 다음 달 1일까지 새 작업을 시작할 수 없어요. "
+                    "더 필요하면 요금제 업그레이드를 문의해주세요."),
+                   [msg_id], project)
+
     def report_heavy(self, api_key, user_id, project, msg_id, status, user_text):
         """리소스 한도 초과 → 이유 + 전환 안내(CTA). heavy 이벤트 기록도 함께."""
         lim = config.get("limits", {})
+        tl = user_limits(user_id)
         if status == "heavy_mem":
-            reason = f"메모리 한도({lim.get('memory_max', '3G')})를 넘어 작업이 중단됐어요."
+            if tl and tl.get("turnMemoryMb"):
+                mb = int(tl["turnMemoryMb"])
+                if ctr.enabled_for(user_id):  # 공용 호스트 물리 캡 반영 (MAX 임시 6GB)
+                    mb = min(mb, int(config.get("container", {}).get("max_memory_mb", 6144)))
+                mem_txt = f"{mb / 1024:g}GB"
+            else:
+                mem_txt = lim.get("memory_max", "3G")
+            reason = f"메모리 한도({mem_txt})를 넘어 작업이 중단됐어요."
         else:
-            mins = int(lim.get("turn_timeout_sec", TURN_TIMEOUT_SEC)) // 60
+            mins = turn_timeout_sec(user_id) // 60
             reason = f"작업이 시간 한도({mins}분)를 넘어 중단됐어요."
         msg = (
             f"⚠️ {reason}\n\n"
@@ -1556,9 +1699,13 @@ class CloudWorker:
                 if now - last_heartbeat > 30:
                     threading.Thread(target=self.heartbeats, daemon=True).start()
                     last_heartbeat = now
-                # 유휴 컨테이너 정지 (5분마다)
+                # 유휴 컨테이너 정지 (5분마다) — MAX(상시 유지) 유저는 건너뜀
                 if config.get("container", {}).get("enabled") and now - last_reap > 300:
-                    threading.Thread(target=ctr.reap_idle, daemon=True).start()
+                    threading.Thread(
+                        target=ctr.reap_idle, daemon=True,
+                        kwargs={"skip": lambda uid: bool(
+                            (user_limits(uid, peek=True) or {}).get("containerAlwaysOn"))},
+                    ).start()
                     last_reap = now
 
                 result = host_api("GET", "/api/cloud/poll")
@@ -1570,7 +1717,11 @@ class CloudWorker:
                 _set_usage_refresh(result.get("usage_refresh"))
 
                 spawned_any = False
-                for msg in result.get("pending", []):
+                # 우선 큐: MAX 티어 메시지를 먼저 워커에 배정 (정렬은 안정적 — 같은 티어끼리는 도착순)
+                pending = sorted(
+                    result.get("pending", []),
+                    key=lambda m: 0 if (user_limits(m.get("user_id"), peek=True) or {}).get("priorityQueue") else 1)
+                for msg in pending:
                     if not user_allowed(msg.get("user_id")):
                         continue  # 다른 호스트 담당 유저
                     msg_id = msg.get("id")

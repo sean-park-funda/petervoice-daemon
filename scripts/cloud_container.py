@@ -145,10 +145,44 @@ def container_state(user_id: int) -> str:
     return (r.stdout or "").strip() or "none"
 
 
-def ensure_running(user_id: int) -> bool:
-    """컨테이너가 없으면 run, 멈춰있으면 start. idempotent."""
+def _mem_to_bytes(spec: str) -> int:
+    """"3g" / "2048m" → bytes. 파싱 실패 시 0."""
+    m = re.fullmatch(r"(\d+)([kmg]?)", str(spec).strip().lower())
+    if not m:
+        return 0
+    mult = {"": 1, "k": 1024, "m": 1024 ** 2, "g": 1024 ** 3}[m.group(2)]
+    return int(m.group(1)) * mult
+
+
+def _current_mem_bytes(user_id: int) -> int:
+    r = _podman("inspect", name(user_id), "--format", "{{.HostConfig.Memory}}", timeout=15)
+    try:
+        return int((r.stdout or "").strip()) if r.returncode == 0 else 0
+    except ValueError:
+        return 0
+
+
+def _target_mem(limits: dict | None) -> str:
+    """티어 한도 → 이 컨테이너의 메모리 스펙. limits 없음(전용 호스트·구 웹) = 호스트 config.
+
+    max_memory_mb: 호스트 물리 한계 보호 캡 (공용 large 7GB → 기본 6144).
+    MAX(8GB) 유저도 첫 전용 풀 증설 전까지는 이 캡으로 태운다 (2026-08-04 Sean 승인)."""
+    c = _cfg()
+    if not limits or not limits.get("turnMemoryMb"):
+        return str(c.get("memory", "3g"))
+    cap = int(c.get("max_memory_mb", 6144))
+    return f"{min(int(limits['turnMemoryMb']), cap)}m"
+
+
+def ensure_running(user_id: int, limits: dict | None = None) -> bool:
+    """컨테이너가 없으면 run, 멈춰있으면 start. idempotent.
+
+    limits(로스터 티어 한도)가 오면 메모리를 티어값으로 적용한다. 이미 다른 상한으로
+    떠 있으면: 정지 상태면 재생성(레이어 apt 설치물은 날아감 — 티어 변경 때 1회 비용),
+    실행 중이면 다음 정지 후 기동 때 반영한다 (podman 3.x 에는 update 가 없다)."""
     with _lock(user_id):
         _last_used[user_id] = time.time()
+        target_mem = _target_mem(limits)
         st = container_state(user_id)
         if st == "running":
             return True
@@ -168,6 +202,17 @@ def ensure_running(user_id: int) -> bool:
             r = _podman("unpause", name(user_id), timeout=30)
             return r.returncode == 0
         if st != "none":
+            # 티어 변경으로 메모리 상한이 달라졌으면, 정지 상태인 지금이 재생성 적기.
+            # (홈은 마운트라 무손실 — 컨테이너 레이어의 apt 설치물만 날아간다)
+            cur = _current_mem_bytes(user_id)
+            want = _mem_to_bytes(target_mem)
+            if want and cur and cur != want:
+                if _logger:
+                    _logger.info(f"container mem {cur >> 20}M → {want >> 20}M, "
+                                 f"recreating user={user_id}")
+                _podman("rm", "-f", name(user_id), timeout=45)
+                st = "none"
+        if st != "none":
             # exited/created/stopping 등 — 이름이 이미 존재하면 start 만 시도한다.
             # (여기서 신규 생성으로 넘어가면 이름 충돌로 반드시 실패한다)
             r = _podman("start", name(user_id), timeout=60)
@@ -182,10 +227,10 @@ def ensure_running(user_id: int) -> bool:
         args = [
             "run", "-d", "--name", name(user_id),
             "--user=agent",
-            "--memory=" + c.get("memory", "3g"),
+            "--memory=" + target_mem,
             # 기본은 스왑 금지(memory-swap=memory). 전용 호스트는 memory_swap 을 크게 줘서
             # 상한 초과 시 즉사(OOM) 대신 스왑으로 버티게 할 수 있다.
-            "--memory-swap=" + str(c.get("memory_swap", c.get("memory", "3g"))),
+            "--memory-swap=" + str(c.get("memory_swap", target_mem)),
             "--cpus=" + str(c.get("cpus", 1.5)),
             "--pids-limit=" + str(c.get("pids_limit", 256)),
             "--restart=no",
@@ -333,9 +378,11 @@ def _envfile(user_id: int, env: dict) -> str:
 
 def exec_claude_turn(user_id: int, project: str, prompt: str,
                      session_id: str | None, secrets: dict,
-                     system_prompt_path: str | None) -> tuple[int, str, str]:
-    """컨테이너 안에서 claude 한 턴. returns (rc, stdout, stderr)."""
-    if not ensure_running(user_id):
+                     system_prompt_path: str | None,
+                     limits: dict | None = None) -> tuple[int, str, str]:
+    """컨테이너 안에서 claude 한 턴. returns (rc, stdout, stderr).
+    limits: 로스터 티어 한도 (메모리·턴 시간). None = 호스트 config 일괄값."""
+    if not ensure_running(user_id, limits):
         return (1, "", "container start failed")
     ensure_skills(user_id)  # 번들 스킬 심링크 (프로세스당 1회)
     _last_used[user_id] = time.time()
@@ -356,7 +403,10 @@ def exec_claude_turn(user_id: int, project: str, prompt: str,
         exec_args += ["--env-file", ef]
     exec_args += [name(user_id), *cmd]
 
-    timeout = int(_cfg().get("turn_timeout_sec", 1800))
+    if limits and limits.get("turnTimeoutMin"):
+        timeout = int(limits["turnTimeoutMin"]) * 60
+    else:
+        timeout = int(_cfg().get("turn_timeout_sec", 1800))
     try:
         r = _podman(*exec_args, timeout=timeout + 30)
         rc, out, err = r.returncode, r.stdout, r.stderr
@@ -524,11 +574,21 @@ def login_submit(pid: int, fd: int, code: str) -> bool:
 
 # ── 유휴 정리 ────────────────────────────────────────────────────
 
-def reap_idle():
+def layer_size_bytes(user_id: int) -> int:
+    """컨테이너 rw 레이어 크기(apt 설치물 등). 홈 du 에 안 잡히는 사용량 — 디스크 쿼터에 합산."""
+    r = _podman("inspect", "--size", name(user_id), "--format", "{{.SizeRw}}", timeout=30)
+    try:
+        return int((r.stdout or "").strip()) if r.returncode == 0 else 0
+    except ValueError:
+        return 0
+
+
+def reap_idle(skip=None):
     """유휴(마지막 사용 후 idle_stop_sec 경과) 컨테이너 정지.
 
     idle_stop_sec <= 0 이면 유휴 정지를 하지 않는다(상시 유지).
     전용 호스트에서 cron 배치·스크래핑 데몬을 상시 돌릴 때 필요.
+    skip(uid) -> bool: True 인 유저는 정지하지 않는다 (MAX 티어 상시 유지).
     """
     idle = int(_cfg().get("idle_stop_sec", 900))
     if idle <= 0:
@@ -542,6 +602,8 @@ def reap_idle():
         if not m:
             continue
         uid = int(m.group(1))
+        if skip and skip(uid):
+            continue  # 티어 상시 유지 (MAX)
         if now < _keepalive.get(uid, 0):
             continue  # 활성 브라우저 인계 — 유저가 원격 로그인 중일 수 있어 정지 금지
         last = _last_used.get(uid, 0)
