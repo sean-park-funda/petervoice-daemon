@@ -21,6 +21,7 @@ from daemon.queue import load_queue
 from daemon.supabase import resolve_user_id, check_force_restart, clear_force_restart, check_bot_response_exists
 from daemon.worker import Worker
 from daemon.health import SessionHealthChecker
+from daemon.autoreset import SessionAutoResetThread
 from daemon.syncers.secrets import SecretsSyncer
 from daemon.syncers.skills import SkillsSyncer
 
@@ -865,6 +866,15 @@ def main():
                 health_checker.HEALTH_CHECK_INTERVAL = session_health_config["interval_hours"] * 3600
             health_checker.start()
             logger.info(f"Session health checker started (interval={health_checker.HEALTH_CHECK_INTERVAL // 3600}h)")
+
+        # Session auto-reset (deterministic, no LLM report) — independent of session_health
+        # so it can run while the LLM-reporting health checker stays disabled.
+        auto_reset_config = config.get("session_auto_reset", {})
+        if auto_reset_config.get("enabled", True):
+            SessionAutoResetThread(
+                interval_hours=auto_reset_config.get("interval_hours", 2),
+                initial_delay_sec=auto_reset_config.get("initial_delay_sec", 300),
+            ).start()
 
         # Heartbeat thread
         HeartbeatThread().start()
