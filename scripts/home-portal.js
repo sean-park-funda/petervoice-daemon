@@ -1759,9 +1759,14 @@ const server = http.createServer((req, res) => {
   else if (pathname === "/api/terminal/capture" && req.method === "GET") {
     // 터미널 화면(+스크롤백) 텍스트를 평문으로 반환 — 웹에서 선택/복사용
     // (claude TUI는 화면을 계속 다시 그려 xterm 선택이 지워지므로, 캡처 방식이 안정적)
-    const key = url.searchParams.get("key") || req.headers["x-api-key"];
+    // 인증: X-Api-Key 헤더(서버 간) 또는 단기 JWT(?token=, 브라우저용).
+    // raw 키를 URL 쿼리(?key=)로 받는 방식은 로그 잔존 위험으로 제거 (2026-08-06 보안 점검).
     const capCfg = loadConfig();
-    if (key !== capCfg.api_key) { res.writeHead(401); res.end("Unauthorized"); return; }
+    const capHeaderKey = req.headers["x-api-key"];
+    const capToken = url.searchParams.get("token");
+    const capAuthed = (capHeaderKey && capHeaderKey === capCfg.api_key) ||
+      (capToken && verifyJwt(capToken, capCfg.api_key));
+    if (!capAuthed) { res.writeHead(401); res.end("Unauthorized"); return; }
     const project = url.searchParams.get("project") || "general";
     const branch = url.searchParams.get("branch") || null;
     const mode = url.searchParams.get("mode") === "shell" ? "shell" : "claude";
@@ -2534,11 +2539,15 @@ if (ptyModule && WebSocketServer) {
     const project = url.searchParams.get("project") || "general";
     const branch = url.searchParams.get("branch") || null;
     const mode = url.searchParams.get("mode") === "shell" ? "shell" : "claude";
-    const apiKey = url.searchParams.get("key") || req.headers["x-api-key"];
-
-    // API 키 인증
+    // 인증: X-Api-Key 헤더(서버 간) 또는 단기 JWT(?token=).
+    // 브라우저 WebSocket 은 헤더를 못 붙이므로 5분 TTL 서명 토큰을 쿼리로 받는다.
+    // raw 키를 URL 쿼리(?key=)로 받는 방식은 로그 잔존 위험으로 제거 (2026-08-06 보안 점검).
     const config = loadConfig();
-    if (apiKey !== config.api_key) {
+    const headerKey = req.headers["x-api-key"];
+    const wsToken = url.searchParams.get("token");
+    const wsAuthed = (headerKey && headerKey === config.api_key) ||
+      (wsToken && verifyJwt(wsToken, config.api_key));
+    if (!wsAuthed) {
       ws.send(JSON.stringify({ type: "error", message: "Unauthorized" }));
       ws.close();
       return;
