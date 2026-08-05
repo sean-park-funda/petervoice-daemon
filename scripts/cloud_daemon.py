@@ -489,6 +489,34 @@ def has_credentials(user_id: int) -> bool:
     return r.returncode == 0
 
 
+PV_FEATURES_PROMPT = """
+# 피터보이스 기능 (프로젝트 관리·이동)
+
+유저는 피터보이스 웹 채팅 UI로 대화합니다. 왼쪽 사이드바에 **프로젝트** 목록이 있고,
+프로젝트마다 독립된 대화 세션과 작업 폴더를 가집니다. 유저가 프로젝트 생성/전환을 요청하면
+"직접 하셔야 한다"고 하지 말고 아래 방법으로 처리하세요 (인증: `X-Api-Key: $API_KEY` 헤더).
+
+- 프로젝트 목록: `GET $API_URL/api/projects`
+- 프로젝트 생성: `POST $API_URL/api/projects` — body `{"id": "영문소문자-숫자-하이픈", "name": "표시 이름"}`
+  생성하면 사이드바에 바로 나타납니다. **워크스페이스에 폴더만 만드는 것은 프로젝트 생성이 아닙니다.**
+- 프로젝트 역할(프롬프트) 설정: `PUT $API_URL/api/prompts` — body `{"project": "프로젝트ID", "content": "역할/지시 전문"}`
+  특정 역할(예: 부사장, 마케터)로 동작할 프로젝트는 생성 직후 이걸로 역할을 부여하세요.
+
+## 프로젝트 이동/전환
+- 응답에 `[표시이름](/?project=프로젝트ID)` 마크다운 링크를 넣으면 유저가 클릭해 그 프로젝트 대화로 이동합니다.
+- 유저가 "그 프로젝트로 바꿔줘/넘겨줘"라고 하면: 짧은 확인 멘트와 함께 응답 **마지막 줄**에
+  `[[voice/handoff:프로젝트ID:한줄맥락]]` 마커를 붙이세요. 마커는 유저 화면·음성에서 숨겨지고,
+  음성 모드에선 자동으로 대화가 전환되며 채팅 모드에선 이동 버튼으로 표시됩니다.
+  - 한줄맥락: 유저가 실제 말한 용건만 한 줄로 (콜론 없이). 용건을 모르면 "유저 요청으로 전환"이라고만.
+  - 전환 의도가 명확할 때만 마커 사용. 단순 언급·보고에는 위의 링크 형식을 쓰세요.
+- 존재하지 않는 프로젝트 ID를 링크/마커에 쓰지 마세요 (목록 조회로 확인).
+
+## 응답 규칙 (중요)
+도구 실행 결과(명령 출력, 파일 내용)는 유저에게 보이지 않습니다. 전달할 내용은 반드시
+응답 텍스트에 직접 포함하세요.
+"""
+
+
 def _container_system_prompt(user_id: int | None = None) -> str:
     """전용 컨테이너용 환경 안내. 실제 적용값을 그대로 알려준다
     (하드코딩하면 호스트·티어별로 사양을 잘못 안내하게 된다).
@@ -542,7 +570,7 @@ def _container_system_prompt(user_id: int | None = None) -> str:
 무거운 작업(딥러닝 학습, GPU, 대량 처리)이 필요하면 응답에 `[HEAVY_TASK]` 를 포함하고,
 사용자에게 "내 컴퓨터에 설치하면 제한 없이 가능하다"고 안내하세요.
 가벼운·중간 작업은 자유롭게 하세요.
-"""
+""" + PV_FEATURES_PROMPT
 
 
 def _shared_system_prompt(user_id: int | None = None) -> str:
@@ -557,7 +585,7 @@ def _shared_system_prompt(user_id: int | None = None) -> str:
         mem = str(lim.get("memory_max", "3G")).upper().replace("G", "GB")
         mins = int(lim.get("turn_timeout_sec", TURN_TIMEOUT_SEC) / 60)
         hb_min = config.get("heartbeat_min_interval_min", 30)
-    return CLOUD_SYSTEM_PROMPT_TMPL.format(mem=mem, mins=mins, hb_min=hb_min)
+    return CLOUD_SYSTEM_PROMPT_TMPL.format(mem=mem, mins=mins, hb_min=hb_min) + PV_FEATURES_PROMPT
 
 
 CLOUD_SYSTEM_PROMPT_TMPL = """# 실행 환경: 피터보이스 클라우드 (공유 서버)
@@ -627,7 +655,7 @@ def _dedicated_host_prompt() -> str:
 표시가 없으면 소유자 본인입니다. 사람이 바뀌면 그 사람 기준으로 답하고, 답변에 이 표시를 따라 쓰지 마세요.
 
 GPU 가 필요한 작업만 불가합니다. 그 외 작업은 자유롭게 하세요.
-"""
+""" + PV_FEATURES_PROMPT
 
 
 def _ensure_cloud_system_prompt(user_id: int) -> str | None:
