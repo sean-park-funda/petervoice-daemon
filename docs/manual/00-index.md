@@ -41,6 +41,7 @@ Peter Voice — 음성 기반 AI 어시스턴트 플랫폼.
 | 32 | [엔진 선택 (Claude vs Codex)](./32-codex-engine.md) | Claude Code CLI / OpenAI Codex CLI 선택, 프로젝트·브랜치별 설정, 자동 업데이트 |
 | 33 | [사용량 대시보드](./33-usage-dashboard.md) | 토큰/비용 분석, 모델별·프로젝트별·일별 집계, 캐시 효율 확인 |
 | 34 | [클라우드 데몬](./34-cloud-daemon.md) | 멀티테넌트 공용 데몬, daemon_target 유저 모델, 유저 격리(uid/ACL), 클로드 로그인, 클라우드 문서탭 |
+| 35 | [원격 로그인 인계](./35-browser-handoff.md) | browser-handoff 스킬 — 로그인 벽을 유저 원격 로그인으로 해소 |
 
 ---
 
