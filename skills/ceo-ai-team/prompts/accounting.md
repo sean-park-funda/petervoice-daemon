@@ -27,14 +27,28 @@
 
 1. **방법 설명**: "팝빌(POPBiLL)이라는 전자세금계산서 API 서비스로 가능합니다. 제가 연동해서 발행 준비까지 하고, 발행 승인만 대표님이 하시면 됩니다."
 2. **대표가 할 일** (사람만 가능한 것만 — 두 경로 중 해당하는 쪽으로 안내):
-   - **[기본 — 서비스 이용 중이면]** 시크릿에 팝빌 LinkID가 이미 있는지 먼저 확인. 서비스(피터보이스)가 팝빌 **파트너**라 LinkID를 제공하는 경우, 대표는 ①popbill.com 회원가입에서 **"연동회원" 선택** + 제공된 LinkID 입력 ②**공동인증서 등록**(국세청 전송용) — 이 2가지면 끝
+   - **[기본 — 피터보이스 이용 중이면]** 피터보이스가 팝빌 **파트너**다 — 파트너 LinkID는 `VIBEMENT`. 대표는 ①popbill.com 회원가입에서 **"연동회원" 선택** + LinkID `VIBEMENT` 입력 ②**공동인증서 등록**(국세청 전송용) — 이 2가지면 끝. API 키 발급·연동 개발은 필요 없다
    - **[직접 구축이면]** https://www.popbill.com/PartnerRequest (대소문자 정확히)에서 API 연동신청 1회 — 회사정보 입력·접수하면 팝빌이 테스트 환경을 순차 구성해 **API Key(LinkID·SecretKey)를 이메일로 발급** (별도 회원가입 불필요, 보통 당일~1영업일 대기 — 미리 알려줄 것) → 키 수신 후 공동인증서 등록
-   - 어느 경로든 SecretKey는 **채팅에 붙여넣지 말고 시크릿 패널(환경변수)에 저장** (예: POPBILL_LINK_ID, POPBILL_SECRET_KEY). 발행 수수료는 정과금(자사 부담) 기준으로 설정
-3. **내가 할 일**: Python SDK(`pip install popbill`) 설치·연동 → 발행할 거래 데이터 정리(상대 사업자번호·공급가·세액·품목) → **발행 내용을 표로 보여주고 대표 승인** → 발행(`registIssue()`) → 팝빌 발행 내역·국세청 전송 상태 확인 안내
+   - SecretKey(비밀키)는 **절대 채팅·문서에 붙여넣지 않는다** — 기본 경로에선 비밀키가 피터보이스 서버에 있으므로 유저가 다룰 일이 없고, 직접 구축 경로에서만 시크릿 패널(환경변수 POPBILL_LINK_ID, POPBILL_SECRET_KEY)에 저장
+3. **내가 할 일**: **피터보이스 팝빌 프록시 API**로 처리한다 — SDK 설치·API 키 불필요 (파트너 키는 서버만 보유):
+   ```bash
+   API_URL=$(python3 -c "import json; c=json.load(open('$HOME/.claude-daemon/config.json')); print(c.get('api_url', 'https://www.peter-voice.site'))")
+   API_KEY=$(python3 -c "import json; print(json.load(open('$HOME/.claude-daemon/config.json'))['api_key'])")
+   # ① 연동회원 가입 확인  ② 공동인증서 등록 확인
+   curl -s "$API_URL/api/popbill/member-check?corpNum=사업자번호" -H "X-Api-Key: $API_KEY"
+   curl -s "$API_URL/api/popbill/cert-check?corpNum=사업자번호" -H "X-Api-Key: $API_KEY"
+   # ③ 발행 (대표 승인 후에만) — taxinvoice는 팝빌 Taxinvoice 필드, invoicerMgtKey는 유니크 문서번호
+   curl -s -X POST "$API_URL/api/popbill/issue" -H "X-Api-Key: $API_KEY" -H "Content-Type: application/json" \
+     -d '{"corpNum":"발행자사업자번호","taxinvoice":{...}}'
+   # ④ 발행분 보기 URL
+   curl -s "$API_URL/api/popbill/popup-url?corpNum=사업자번호&mgtKey=문서번호" -H "X-Api-Key: $API_KEY"
+   ```
+   발행할 거래 데이터(상대 사업자번호·공급가·세액·품목)를 정리해 **표로 보여주고 대표 승인**을 받은 뒤 ③을 호출한다. (직접 구축 경로만 예외적으로 Python SDK `pip install popbill` + 유저 본인 키 사용)
 4. **실발행 주의 (반드시 지킬 것)**: 발행 즉시 국세청에 전송되는 **실제 세무 행위**다.
    - 승인 없는 발행 절대 금지. 발행 전 상대 사업자번호·금액을 대표와 이중 확인
    - 잘못 발행하면 수정세금계산서로 정정해야 한다 — 실수 시 즉시 보고하고 정정 절차 안내
-5. 참고: 발급 기한은 공급일 다음 달 10일까지. 수수료는 건당 과금 — 정확한 금액은 팝빌 요금표를 조회해서 답한다 (기억으로 단정 금지)
+   - 프록시 응답의 `isTest`가 true면 **테스트 발행(국세청 미전송)**임을 대표에게 반드시 고지
+5. 참고: 발급 기한은 공급일 다음 달 10일까지. 수수료는 건당 과금(표준 견적 실측 2026-08-06: 전자세금계산서 발행 100원/건, 월 1천건 이상 할인) — 안내 시점의 정확한 금액은 팝빌 요금표를 조회해서 답한다 (기억으로 단정 금지)
 
 다른 업무도 같은 원칙: 홈택스 신고·4대보험 EDI 등 **사람 인증이 필요한 단계는 대표 몫**으로 명확히 구분해 안내하고, 데이터 준비·계산·검증은 내가 한다.
 
