@@ -1,6 +1,7 @@
 ---
 name: local-publish
 description: 현재 프로젝트를 맥미니에서 로컬 빌드 후 인터넷에 퍼블리싱. "퍼블리싱해줘", "사이트 올려줘", "publish this", "사이트 내려줘", "재빌드" 등에 반응. Cloudflare Tunnel + launchd 기반.
+pv_version: "1.1.0"
 ---
 
 # Local Publish — 맥미니 로컬 퍼블리싱
@@ -49,7 +50,7 @@ if c.get("cloudflare_tunnel_id"):
 else:
     api_url = c.get("api_url", "https://peter-voice.vercel.app")
     api_key = c["api_key"]
-    username = (c.get("username") or c.get("customer") or "user").lower().replace(" ", "-")
+    username = c.get("username") or c.get("customer") or "user"
 
     data = json.dumps({"username": username}).encode()
     req = urllib.request.Request(
@@ -146,11 +147,11 @@ python3 "$PUBLISH_SCRIPT" publish <project_id> <project_dir> --username <usernam
 
 - `project_id`: 프로젝트명 (URL에 사용됨)
 - `project_dir`: 프로젝트 절대 경로
-- `--username`: config의 username에서 추출 (유저 고유 ID)
+- `--username`: config의 username에서 추출
 
 username 추출:
 ```bash
-python3 -c "import json; c=json.load(open('$HOME/.claude-daemon/config.json')); print((c.get('username') or c.get('customer') or 'user').lower().replace(' ','-'))"
+python3 -c "import json; c=json.load(open('$HOME/.claude-daemon/config.json')); print(c.get('username') or c.get('customer') or 'user')"
 ```
 
 ## 재빌드 (코드 수정 후)
@@ -203,126 +204,6 @@ python3 "$PUBLISH_SCRIPT" status
 
 ### DNS 전파 지연
 최초 퍼블리시 후 1~2분간 접속 불가할 수 있음. 기다리면 해결.
-
-## 로컬 DB (PGlite)
-
-퍼블리싱된 앱에서 데이터베이스가 필요하면 PGlite를 사용합니다.
-PGlite는 Node.js 안에서 실행되는 경량 PostgreSQL(WASM)입니다.
-PostgreSQL 100% 호환이라 나중에 Supabase로 이전할 때 SQL을 그대로 사용할 수 있습니다.
-
-### DB 설정 (프로젝트에 PGlite 추가)
-
-#### Step 1: @electric-sql/pglite 설치 확인 + 설치
-```bash
-cd <project_dir>
-node -e "require('@electric-sql/pglite')" 2>/dev/null && echo "INSTALLED" || echo "NOT_INSTALLED"
-```
-
-**NOT_INSTALLED이면**:
-```bash
-npm install @electric-sql/pglite
-```
-
-#### Step 2: DB 헬퍼 파일 생성
-
-프로젝트에 `lib/db.ts` (또는 `lib/db.js`)를 생성:
-
-```typescript
-// lib/db.ts — PGlite 로컬 DB 헬퍼
-import { PGlite } from "@electric-sql/pglite";
-import path from "path";
-import os from "os";
-
-const PROJECT_ID = process.env.PROJECT_ID || path.basename(process.cwd());
-const DATA_DIR = process.env.DATABASE_URL
-  ? undefined
-  : path.join(os.homedir(), ".petervoice-sites", PROJECT_ID, "data");
-
-let _db: PGlite | null = null;
-
-export async function getDB(): Promise<PGlite> {
-  if (!_db) {
-    _db = new PGlite(DATA_DIR);
-    await _db.waitReady;
-  }
-  return _db;
-}
-
-export async function query<T = Record<string, unknown>>(
-  sql: string, params?: unknown[]
-): Promise<T[]> {
-  const db = await getDB();
-  const result = await db.query<T>(sql, params);
-  return result.rows;
-}
-
-export async function exec(sql: string): Promise<void> {
-  const db = await getDB();
-  await db.exec(sql);
-}
-```
-
-#### Step 3: 마이그레이션 (테이블 생성)
-
-```typescript
-// lib/migrate.ts
-import { exec } from "./db";
-
-export async function migrate() {
-  await exec(`
-    CREATE TABLE IF NOT EXISTS example (
-      id SERIAL PRIMARY KEY,
-      name TEXT NOT NULL,
-      created_at TIMESTAMPTZ DEFAULT NOW()
-    );
-  `);
-}
-```
-
-Next.js의 경우 `instrumentation.ts`에서 호출:
-```typescript
-export async function register() {
-  if (process.env.NEXT_RUNTIME === "nodejs") {
-    const { migrate } = await import("./lib/migrate");
-    await migrate();
-  }
-}
-```
-
-#### Step 4: 앱에서 사용
-
-```typescript
-// app/api/items/route.ts (Next.js 예시)
-import { query } from "@/lib/db";
-
-export async function GET() {
-  const items = await query("SELECT * FROM example ORDER BY created_at DESC");
-  return Response.json({ items });
-}
-
-export async function POST(req: Request) {
-  const { name } = await req.json();
-  const rows = await query("INSERT INTO example (name) VALUES ($1) RETURNING *", [name]);
-  return Response.json({ item: rows[0] });
-}
-```
-
-### 에이전트 행동 가이드 (DB)
-
-- 유저가 "DB 필요해", "데이터 저장" → PGlite 설정 (Step 1~4)
-- 이미 PGlite 설치됨 → 바로 테이블 생성 + 코드 작성
-- **PostgreSQL 문법 사용** — `SERIAL`, `TIMESTAMPTZ`, `JSONB`, `$1` 파라미터 등
-- SQLite 문법 사용 금지 (`AUTOINCREMENT`, `?` 파라미터 등)
-- 테이블 생성은 반드시 `CREATE TABLE IF NOT EXISTS` 사용
-- DB 파일 위치: `~/.petervoice-sites/{project}/data/` — 프로젝트 코드 안에 넣지 말 것
-- PGlite는 단일 프로세스 전용 — 같은 data 디렉토리를 여러 프로세스에서 동시 접근하지 말 것
-
-### 클라우드 이전 (나중에)
-
-서비스 확장 시 Supabase로 이전:
-1. 환경변수 `DATABASE_URL=postgresql://...` 설정
-2. `lib/db.ts`에서 PGlite 대신 `pg` 라이브러리로 교체
-3. 기존 SQL은 PostgreSQL이므로 그대로 사용 가능
 
 ## 주의사항
 

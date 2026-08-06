@@ -1,6 +1,7 @@
 ---
 name: ax-publish
 description: 이 프로젝트에서 만든 자동화를 AX 자동화 대시보드(/ax)에 발행한다. "대시보드에 올려줘", "자동화 발행", "실무자한테 보이게 해줘", "publish automation", "대시보드에서 내려줘" 등에 반응. 실행 스케줄(cron/*.json)과 표시 정보(.ax/workflow.json)를 만든다.
+pv_version: "1.1.0"
 ---
 
 # AX Publish — 만든 자동화를 대시보드에 발행
