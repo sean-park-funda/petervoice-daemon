@@ -15,6 +15,16 @@ from daemon.supabase import get_project_dir
 
 
 # ─── Claude 사용 한도(/usage) 수집 — 주기(heartbeat) + 온디맨드(main loop) 공용 ───
+def _claude_account_email() -> str | None:
+    """데몬이 쓰는 Claude Code 계정 이메일 (~/.claude.json oauthAccount)."""
+    try:
+        with open(os.path.expanduser("~/.claude.json"), encoding="utf-8") as f:
+            data = json.load(f)
+        return (data.get("oauthAccount") or {}).get("emailAddress") or None
+    except Exception:
+        return None
+
+
 def fetch_usage_limits() -> dict | None:
     """claude -p '/usage' 실행 후 세션/주간 리밋 % + 리셋 시각 파싱."""
     try:
@@ -49,6 +59,7 @@ def fetch_usage_limits() -> dict | None:
         "week_fable_pct": fable_pct,
         "session_reset": session_reset,
         "week_reset": week_reset,
+        "account": _claude_account_email(),
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
 
