@@ -714,8 +714,13 @@ def build_systemd_run(user_id: int, cmd: list[str], env: dict, cwd: str, unit: s
                       env_file: str) -> list[str]:
     lim = config.get("limits", {})
     tl = user_limits(user_id)
-    mem = (f"{int(tl['turnMemoryMb'])}M" if tl and tl.get("turnMemoryMb")
-           else lim.get("memory_max", "3G"))
+    if tl and tl.get("turnMemoryMb"):
+        # 티어 값에도 호스트 물리 보호 캡 적용 (컨테이너 경로와 동일).
+        # 캡 없이는 MAX 8192M 이 7.6GB 공용 호스트에서 그대로 허용돼 프리즈 원인이 됐다 (2026-08-06).
+        host_cap = int(config.get("container", {}).get("max_memory_mb", 6144))
+        mem = f"{min(int(tl['turnMemoryMb']), host_cap)}M"
+    else:
+        mem = lim.get("memory_max", "3G")
     cpu = lim.get("cpu_quota", "150%")
     tasks = str(lim.get("tasks_max", 256))
     runtime_max = str(turn_timeout_sec(user_id))
