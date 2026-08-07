@@ -133,11 +133,11 @@ class Worker(threading.Thread):
                     self.reply("재로그인 세션이 만료됐어요. '재로그인' 이라고 입력해 다시 시작해 주세요.", reply_to=[msg_id], project=project)
             dequeue_message(msg_id)
             return
-        # (b) 명시적 트리거: "재로그인" / "/relogin" (401 발생 전 선제 갱신용)
-        if text in ("재로그인", "/relogin", "리로그인"):
+        # (b) 명시적 트리거: "재로그인"/"로그인"/"클로드 로그인" 등 (401 발생 전 선제 갱신용)
+        if relogin.is_login_trigger(text):
             from daemon.claude_runner import resolve_account_config_dir
             relogin.start(project, config_dir=resolve_account_config_dir(project))
-            self.reply("재로그인을 시작합니다. 잠시 후 안내 링크를 보내드릴게요...", reply_to=[msg_id], project=project)
+            self.reply("클로드 로그인을 시작합니다. 잠시 후 안내 링크를 보내드릴게요...", reply_to=[msg_id], project=project)
             dequeue_message(msg_id)
             return
 

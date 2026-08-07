@@ -59,10 +59,28 @@ LOGIN_CODE_TTL_SEC = 600
 CODE_RE = re.compile(r"[A-Za-z0-9_\-]{20,}#[A-Za-z0-9_\-]{8,}")
 _URL_RE = re.compile(r"https?://[^\s\x00-\x1f\"']+")
 
+# 로그인 트리거 — 공백·대소문자·문장부호를 무시하고 매칭 (daemon/relogin.py 와 동일 세트).
+# cloud_daemon 은 독립 실행이라 daemon 패키지를 import 하지 않으므로 여기에 사본을 둔다.
+_LOGIN_TRIGGERS = {
+    "재로그인", "리로그인", "로그인", "relogin", "login", "/relogin", "/login",
+    "클로드로그인", "클로드재로그인", "클로드연결", "클로드계정연결", "계정연결", "연결",
+    "클로드로그인해줘", "로그인해줘", "재로그인해줘", "로그인하기", "클로드인증", "인증",
+    "claude로그인", "claudelogin",
+}
+
+
+def is_login_trigger(text: str) -> bool:
+    """유저 입력이 클로드 로그인 시작 요청인지. 공백/대소문자/끝문장부호 무시."""
+    if not text:
+        return False
+    s = re.sub(r"[\s​]+", "", text).strip().lower().rstrip(".!?~,")
+    return s in _LOGIN_TRIGGERS
+
+
 NEED_LOGIN_MESSAGE = (
     "아직 클로드(Claude) 계정이 연결되지 않아 AI 비서가 잠들어 있어요. 🌙\n\n"
     "**연결 방법** (2분이면 돼요)\n"
-    "1. 여기에 `재로그인` 이라고 입력해주세요.\n"
+    "1. 여기에 `클로드 로그인` 이라고 입력해주세요.\n"
     "2. 제가 보내드리는 링크를 열어 클로드 계정으로 로그인해주세요.\n"
     "3. 화면에 나오는 코드를 복사해서 이 채팅에 붙여넣어 주세요.\n\n"
     "클로드 구독 계정이 없다면, 다른 사용자의 프로젝트에 초대받아 대화하는 것은 지금도 가능해요."
@@ -1510,11 +1528,11 @@ class CloudWorker:
                            [msg_id], project)
             else:
                 self.reply(api_key,
-                           "연결에 실패했어요. `재로그인` 이라고 입력해 다시 시도해주세요.",
+                           "연결에 실패했어요. `클로드 로그인` 이라고 입력해 다시 시도해주세요.",
                            [msg_id], project)
             return
 
-        if text in ("재로그인", "/relogin", "리로그인", "로그인", "클로드 연결", "연결"):
+        if is_login_trigger(text):
             self.reply(api_key, "클로드 로그인을 시작할게요. 잠시만요...", [msg_id], project)
             new_session = LoginSession(user_id)
             with login_lock:
@@ -1531,7 +1549,7 @@ class CloudWorker:
                 with login_lock:
                     login_sessions.pop(user_id, None)
                 self.reply(api_key,
-                           "로그인 준비에 실패했어요. 잠시 후 `재로그인` 으로 다시 시도해주세요.",
+                           "로그인 준비에 실패했어요. 잠시 후 `클로드 로그인` 이라고 입력해 다시 시도해주세요.",
                            [msg_id], project)
             return
 
@@ -1587,7 +1605,7 @@ class CloudWorker:
             self.maybe_warn_quota(api_key, user_id, project, msg_id)
         if status == "auth":
             self.reply(api_key,
-                       "클로드 로그인이 만료됐어요. `재로그인` 이라고 입력해 다시 연결해주세요.",
+                       "클로드 로그인이 만료됐어요. `클로드 로그인` 이라고 입력해 다시 연결해주세요.",
                        [msg_id], project)
             return
         if status in ("heavy_mem", "heavy_time"):
