@@ -149,7 +149,8 @@ NULL이면 24시간 활성.
 4. 완료 시 `[x]`로 마킹
 5. 전부 완료 시:
    - HEARTBEAT.md 정리 또는 비우기
-   - `PATCH /api/tasks/{id} {"status": "done"}`
+   - `PATCH /api/tasks` body `{"id": "<task_id>", "status": "done"}`
+     (⚠️ `/api/tasks/{id}` 경로는 404 — id는 body에 넣는다, 2026-08-01 실측)
 
 ## 사용 시나리오
 
