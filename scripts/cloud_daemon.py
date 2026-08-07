@@ -35,6 +35,7 @@ import threading
 import time
 import urllib.request
 import urllib.error
+import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
@@ -570,7 +571,7 @@ def _container_system_prompt(user_id: int | None = None) -> str:
 무거운 작업(딥러닝 학습, GPU, 대량 처리)이 필요하면 응답에 `[HEAVY_TASK]` 를 포함하고,
 사용자에게 "내 컴퓨터에 설치하면 제한 없이 가능하다"고 안내하세요.
 가벼운·중간 작업은 자유롭게 하세요.
-""" + PV_FEATURES_PROMPT
+"""
 
 
 def _shared_system_prompt(user_id: int | None = None) -> str:
@@ -585,7 +586,7 @@ def _shared_system_prompt(user_id: int | None = None) -> str:
         mem = str(lim.get("memory_max", "3G")).upper().replace("G", "GB")
         mins = int(lim.get("turn_timeout_sec", TURN_TIMEOUT_SEC) / 60)
         hb_min = config.get("heartbeat_min_interval_min", 30)
-    return CLOUD_SYSTEM_PROMPT_TMPL.format(mem=mem, mins=mins, hb_min=hb_min) + PV_FEATURES_PROMPT
+    return CLOUD_SYSTEM_PROMPT_TMPL.format(mem=mem, mins=mins, hb_min=hb_min)
 
 
 CLOUD_SYSTEM_PROMPT_TMPL = """# 실행 환경: 피터보이스 클라우드 (공유 서버)
@@ -655,7 +656,7 @@ def _dedicated_host_prompt() -> str:
 표시가 없으면 소유자 본인입니다. 사람이 바뀌면 그 사람 기준으로 답하고, 답변에 이 표시를 따라 쓰지 마세요.
 
 GPU 가 필요한 작업만 불가합니다. 그 외 작업은 자유롭게 하세요.
-""" + PV_FEATURES_PROMPT
+"""
 
 
 def _ensure_cloud_system_prompt(user_id: int) -> str | None:
@@ -663,6 +664,84 @@ def _ensure_cloud_system_prompt(user_id: int) -> str | None:
     try:
         p = user_workspace(user_id) / ".cloud-system-prompt.md"
         text = _dedicated_host_prompt() if config.get("dedicated") else _shared_system_prompt(user_id)
+        if not p.exists() or p.read_text() != text:
+            p.write_text(text)
+            os.chmod(p, 0o644)
+        return str(p)
+    except OSError:
+        return None
+
+
+# ── 프롬프트 주입 (셀프호스팅 데몬과 동일한 두뇌 세팅) ────────────
+# 시스템 가이드(_petervoice_system) + 실행환경 + 공통(_common) + 프로젝트/브랜치 프롬프트를
+# 웹 API 에서 가져와 턴마다 합성 주입한다. 웹 장애 시엔 환경 프롬프트만으로 동작 (턴을 막지 않는다).
+
+_PROMPT_TTL_SEC = 60
+_prompt_cache: dict[tuple[int, str], tuple[float, str]] = {}
+_prompt_cache_lock = threading.Lock()
+
+
+def _fetch_web_prompt(user_id: int, api_key: str, project: str,
+                      context: str | None = None) -> str:
+    key = (user_id, project)
+    now = time.time()
+    with _prompt_cache_lock:
+        hit = _prompt_cache.get(key)
+    if hit and now - hit[0] < _PROMPT_TTL_SEC:
+        return hit[1]
+    path = f"/api/prompts?project={urllib.parse.quote(project, safe='')}"
+    if context:
+        path += f"&context={urllib.parse.quote(context, safe='')}"
+    result = user_api(api_key, "GET", path)
+    if result is None:
+        # 조회 실패 — 이전 캐시가 있으면 유지 (일시 장애로 두뇌가 빠지지 않게)
+        return hit[1] if hit else ""
+    content = (result.get("content") or "").strip()
+    with _prompt_cache_lock:
+        _prompt_cache[key] = (now, content)
+    return content
+
+
+def _env_system_prompt(user_id: int) -> str:
+    if ctr.enabled_for(user_id):
+        return _container_system_prompt(user_id)
+    if config.get("dedicated"):
+        return _dedicated_host_prompt()
+    return _shared_system_prompt(user_id)
+
+
+def compose_system_prompt(user_id: int, project: str) -> str:
+    """턴 주입용 시스템 프롬프트 합성. 순서: 시스템 가이드 → 실행환경 → 공통 → 프로젝트/브랜치."""
+    user = roster.get(user_id)
+    api_key = (user or {}).get("apiKey") or ""
+    sys_p = common = proj_p = ""
+    if api_key:
+        sys_p = _fetch_web_prompt(user_id, api_key, "_petervoice_system")
+        ctx = None if project.startswith("branch:") else project
+        common = _fetch_web_prompt(user_id, api_key, "_common", context=ctx)
+        proj_p = _fetch_web_prompt(user_id, api_key, project)
+    parts = []
+    if sys_p:
+        parts.append(sys_p)
+    # 시스템 가이드를 못 가져왔을 때만 응급 기능 안내(PV_FEATURES_PROMPT)로 보강 (중복 방지)
+    parts.append(_env_system_prompt(user_id) + ("" if sys_p else PV_FEATURES_PROMPT))
+    if common:
+        parts.append(f"# 공통 지침 (유저 설정)\n\n{common}")
+    if proj_p:
+        label = "브랜치 프롬프트" if project.startswith("branch:") else "프로젝트 프롬프트"
+        parts.append(f"# {label}\n\n{proj_p}")
+    return "\n\n".join(parts)
+
+
+def _sysprompt_filename(project: str) -> str:
+    return f".pv-sysprompt-{re.sub(r'[^A-Za-z0-9_-]', '-', project)}.md"
+
+
+def _write_turn_sysprompt(user_id: int, project: str) -> str | None:
+    """비컨테이너 턴용: 합성 프롬프트를 프로젝트별 파일로 기록 (동시 턴 간 파일 경합 방지)."""
+    try:
+        p = user_workspace(user_id) / _sysprompt_filename(project)
+        text = compose_system_prompt(user_id, project)
         if not p.exists() or p.read_text() != text:
             p.write_text(text)
             os.chmod(p, 0o644)
@@ -852,7 +931,8 @@ def run_claude_turn(user_id: int, project: str, prompt: str) -> tuple[str, str]:
         secrets["PV_PROJECT"] = project
         # 컨테이너 안 CDP 는 항상 9222 (호스트로는 19000+uid 로 퍼블리시됨)
         secrets["PV_CDP_PORT"] = "9222"
-        sp = ctr.sysprompt_path_in_home(user_id, _container_system_prompt(user_id))
+        sp = ctr.sysprompt_path_in_home(user_id, compose_system_prompt(user_id, project),
+                                        name=_sysprompt_filename(project))
         sid = load_session(user_id, project)
         rc, out, err = ctr.exec_claude_turn(user_id, project, prompt, sid, secrets, sp,
                                             limits=user_limits(user_id))
@@ -868,7 +948,7 @@ def run_claude_turn(user_id: int, project: str, prompt: str) -> tuple[str, str]:
         "--output-format", "json",
         "--dangerously-skip-permissions",
     ]
-    sp = _ensure_cloud_system_prompt(user_id)
+    sp = _write_turn_sysprompt(user_id, project) or _ensure_cloud_system_prompt(user_id)
     if sp:
         cmd.extend(["--append-system-prompt-file", sp])
     sid = load_session(user_id, project)

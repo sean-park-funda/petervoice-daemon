@@ -484,16 +484,18 @@ def exec_shell(user_id: int, workdir: str, command: str, env: dict,
     return rc, out, err
 
 
-def sysprompt_path_in_home(user_id: int, content: str) -> str | None:
-    """시스템 프롬프트 파일을 컨테이너 홈에 기록 → 컨테이너 내부 경로 반환."""
+def sysprompt_path_in_home(user_id: int, content: str,
+                           name: str = ".cloud-system-prompt.md") -> str | None:
+    """시스템 프롬프트 파일을 컨테이너 홈에 기록 → 컨테이너 내부 경로 반환.
+    name 을 프로젝트별로 다르게 주면 동시 턴 간 파일 경합을 피한다."""
     try:
-        host_p = home(user_id) / "workspace" / ".cloud-system-prompt.md"
+        host_p = home(user_id) / "workspace" / name
         subprocess.run(["sudo", "-n", "tee", str(host_p)], input=content,
                        capture_output=True, text=True)
         # 컨테이너 내 claude(agent 10000)가 읽어야 함
         subprocess.run(["sudo", "-n", "chown", f"{AGENT_UID}:{AGENT_UID}", str(host_p)],
                        capture_output=True)
-        return "/home/agent/workspace/.cloud-system-prompt.md"
+        return f"/home/agent/workspace/{name}"
     except Exception:
         return None
 
