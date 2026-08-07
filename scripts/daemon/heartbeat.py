@@ -128,20 +128,29 @@ class HeartbeatThread(threading.Thread):
             return result["tasks"]
         return []
 
+    @staticmethod
+    def _heartbeat_filename(project: str) -> str:
+        """브랜치 세션은 부모와 작업 디렉토리를 공유하므로 파일을 분리한다.
+        branch:656 → docs/HEARTBEAT-branch-656.md, 그 외 → docs/HEARTBEAT.md"""
+        if project.startswith("branch:"):
+            return f"HEARTBEAT-branch-{project.split(':')[1]}.md"
+        return "HEARTBEAT.md"
+
     def _check_heartbeat_md(self, project: str) -> str | None:
-        """Check if docs/HEARTBEAT.md exists. Returns warning message or None."""
+        """Check if the task's HEARTBEAT file exists. Returns warning message or None."""
         try:
             project_dir = get_project_dir(project)
             if not project_dir:
                 return "프로젝트 디렉토리를 찾을 수 없음"
-            heartbeat_path = os.path.join(project_dir, "docs", "HEARTBEAT.md")
+            filename = self._heartbeat_filename(project)
+            heartbeat_path = os.path.join(project_dir, "docs", filename)
             if not os.path.exists(heartbeat_path):
-                return "HEARTBEAT.md 파일 없음 — 태스크가 실행되어도 할 일이 정의되지 않음"
+                return f"{filename} 파일 없음 — 태스크가 실행되어도 할 일이 정의되지 않음"
             content = open(heartbeat_path).read().strip()
             if not content:
-                return "HEARTBEAT.md가 비어 있음"
+                return f"{filename}가 비어 있음"
             if "[ ]" not in content:
-                return "HEARTBEAT.md에 미완료 항목 없음"
+                return f"{filename}에 미완료 항목 없음"
             return None
         except Exception:
             return None
@@ -185,7 +194,8 @@ class HeartbeatThread(threading.Thread):
             logger.info(f"[heartbeat] {project} skipped (no HEARTBEAT.md)")
             return
 
-        msg_id, ts = inject_system_message(project, self.HEARTBEAT_MSG, prefix="[heartbeat]")
+        msg = self.HEARTBEAT_MSG.replace("HEARTBEAT.md", self._heartbeat_filename(project))
+        msg_id, ts = inject_system_message(project, msg, prefix="[heartbeat]")
         if not msg_id:
             logger.warning(f"[heartbeat] {project} inject failed")
             return

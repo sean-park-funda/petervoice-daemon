@@ -24,6 +24,20 @@ Claude Code CLI 실행
   ↓ 전부 완료 → 태스크 status='done'으로 변경
 ```
 
+## 브랜치 타겟팅 (2026-08-07~)
+
+브랜치 세션도 **자기 앞으로** 하트비트를 등록할 수 있다. 별도 컬럼 없이 `project` 문자열에
+`branch:{내부ID}`를 넣는 기존 브랜치 주소 관례를 그대로 쓴다.
+
+- 등록: `POST /api/tasks {"project": "branch:656", "interval_min": 30, "max_runs": 20}`
+  - 웹이 **본인 소유·활성 브랜치인지 검증** (아니면 404/400) — 죽은 브랜치로 주입되는 것 방지
+  - UNIQUE(user_id, project) 기준으로 `branch:656`은 메인과 별개 값 → **메인+브랜치 동시 등록 가능**
+- 체크리스트 파일: 브랜치는 부모와 작업 디렉토리를 공유하므로 파일을 분리한다 →
+  `docs/HEARTBEAT-branch-{내부ID}.md` (메인은 기존 `docs/HEARTBEAT.md`)
+- 주입 메시지도 해당 파일명을 지시하며, 워커가 `branch:` 프리픽스를 브랜치 세션으로 라우팅한다
+- 데몬 `get_project_dir`가 `branch:`/`kanban:`을 부모 프로젝트 디렉토리로 해석한다
+  (이전에는 `~/.claude-daemon/projects/branch:N` 빈 디렉토리를 만들어 하트비트가 영구 skip됐다)
+
 ## DB 스키마 (tasks 테이블)
 
 | 컬럼 | 타입 | 설명 |
