@@ -1609,6 +1609,24 @@ async function cdpDispatchEvent(session, ev) {
   }
 }
 
+// JWT scope 권한 검사. scope="share"(공유 링크, 7일)는 공유 뷰어 경로 +
+// (토큰에 dir 있으면) 그 docs 디렉토리만 허용 — 공유 링크 수신자가 토큰을 뽑아
+// 포탈 API 전체(회의 목록·라벨·문서 삭제 등)를 호출하던 구멍 차단.
+// scope="portal"(5분) 또는 scope 없음(구버전 토큰)은 전체 허용.
+// TODO(2026-08-19 이후): 구버전 공유 링크(7일 TTL)가 전부 만료되면 쿼리 토큰의
+// scope 부재를 거부로 전환 (docs/plans/meeting-weakness-fix-plan.md 2-A 3단계).
+const SHARE_SCOPE_PATHS = new Set(["/share", "/api/docs/file"]);
+function jwtScopeAllows(payload, req) {
+  if (!payload || payload.scope !== "share") return true;
+  const urlObj = new URL(req.url, "http://localhost");
+  if (!SHARE_SCOPE_PATHS.has(urlObj.pathname)) return false;
+  if (payload.dir) {
+    const qDir = urlObj.searchParams.get("dir");
+    if (!qDir || path.resolve(qDir) !== path.resolve(payload.dir)) return false;
+  }
+  return true;
+}
+
 function verifyAuth(req) {
   if (CLOUD_MODE) {
     // 클라우드: host_key 헤더만 인정 (웹 프록시 전용).
@@ -1645,14 +1663,16 @@ function verifyAuth(req) {
     const jwt = authHeader.slice(7);
     // raw api_key 일치도 허용 (하위 호환)
     if (jwt === apiKey) return true;
-    // JWT 검증
-    if (verifyJwt(jwt, apiKey)) return true;
+    // JWT 검증 + scope 권한 (share 토큰은 공유 뷰어 경로만)
+    const bearerPayload = verifyJwt(jwt, apiKey);
+    if (bearerPayload && jwtScopeAllows(bearerPayload, req)) return true;
   }
 
   // 4. Query parameter token (공유 링크용)
   const urlObj = new URL(req.url, `http://localhost`);
   const queryToken = urlObj.searchParams.get("token");
-  if (queryToken && verifyJwt(queryToken, apiKey)) return true;
+  const queryPayload = queryToken ? verifyJwt(queryToken, apiKey) : null;
+  if (queryPayload && jwtScopeAllows(queryPayload, req)) return true;
 
   return false;
 }
