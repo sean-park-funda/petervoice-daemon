@@ -14,11 +14,12 @@ const os = require("os");
 const { execSync, spawnSync, spawn } = require("child_process");
 
 // ─── Meeting mode (modular) ──────────────────────────
-let meetingStore = null, processMeeting = null, meetingLabel = null, meetingSweep = null;
+let meetingStore = null, processMeeting = null, meetingLabel = null, meetingSweep = null, meetingAutoMinutes = null;
 try {
   const MDIR = path.join(path.dirname(__filename), "meeting");
   meetingStore = require(path.join(MDIR, "meeting-store"));
-  ({ processMeeting, labelMeeting: meetingLabel, sweepStuckMeetings: meetingSweep } = require(path.join(MDIR, "processor")));
+  ({ processMeeting, labelMeeting: meetingLabel, sweepStuckMeetings: meetingSweep,
+    autoTriggerPendingMinutes: meetingAutoMinutes } = require(path.join(MDIR, "processor")));
 } catch (e) {
   console.warn("[meeting] module not available:", e.message);
 }
@@ -114,13 +115,38 @@ function loadConfig() {
 // A restart of this process (AutoUpdater does it whenever meeting code changes)
 // kills in-flight transcriptions, leaving meetings stuck in "processing".
 // Sweep shortly after boot and periodically to retry or fall back.
+// 중단된 업로드가 남긴 임시 청크(.part/.state) 청소 — 24h 지난 것만
+function cleanStaleMeetingParts() {
+  try {
+    const dir = path.join(os.tmpdir(), "pv-meeting-chunks");
+    if (!fs.existsSync(dir)) return;
+    const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+    for (const f of fs.readdirSync(dir)) {
+      const p = path.join(dir, f);
+      try { if (fs.statSync(p).mtimeMs < cutoff) fs.unlinkSync(p); } catch { /* ignore */ }
+    }
+  } catch { /* ignore */ }
+}
+
 if (meetingSweep) {
   const runSweep = () => {
+    cleanStaleMeetingParts();
     Promise.resolve(meetingSweep({ configDir: CONFIG_DIR, config: loadConfig(), log: (m) => console.log(m) }))
       .catch((e) => console.warn("[meeting] sweep failed:", e.message));
   };
   setTimeout(runSweep, 60 * 1000);
   setInterval(runSweep, 6 * 60 * 60 * 1000);
+}
+
+// 라벨 미입력 회의 자동 회의록: 전사 후 10분 내 이름 입력이 없으면 화자N으로라도
+// 회의록을 트리거한다 — 탭을 닫아버린 회의가 회의록 없이 방치되는 구멍 방지.
+if (meetingAutoMinutes) {
+  const runAutoMinutes = () => {
+    Promise.resolve(meetingAutoMinutes({ configDir: CONFIG_DIR, config: loadConfig(), log: (m) => console.log(m) }))
+      .catch((e) => console.warn("[meeting] auto-minutes failed:", e.message));
+  };
+  setTimeout(runAutoMinutes, 2 * 60 * 1000);
+  setInterval(runAutoMinutes, 5 * 60 * 1000);
 }
 
 function loadSites() {
@@ -1899,26 +1925,64 @@ const server = http.createServer((req, res) => {
     parseMultipartStreaming(req, MAX).then(({ fields, file }) => {
       const meetingId = (fields.meetingId || "").replace(/[^a-zA-Z0-9_-]/g, "");
       if (!meetingId || !file) { if (file && file.tempPath) try { fs.unlinkSync(file.tempPath); } catch {} return json({ error: "meetingId, file 필요" }, 400); }
-      const docsDir = fields.dir ? validateDocsDir(fields.dir) : null;
 
+      // 멱등성: 이미 조립 완료(메타 존재)된 회의면 어떤 청크가 재전송돼도 기존
+      // 메타를 돌려준다 — 마지막 청크의 응답 유실 → 재전송이 완성된 오디오를
+      // 마지막 조각 하나로 덮어쓰고 처리를 이중 시작하던 경로 차단.
+      const existingMeta = meetingStore.readMeta(CONFIG_DIR, meetingId);
+      if (existingMeta) {
+        try { fs.unlinkSync(file.tempPath); } catch {}
+        return json({ ok: true, meeting: existingMeta, already: true });
+      }
+
+      const docsDir = fields.dir ? validateDocsDir(fields.dir) : null;
       const chunkIdx = parseInt(fields.chunkIndex || "0");
       const totalChunks = parseInt(fields.totalChunks || "1");
       const chunkDir = path.join(os.tmpdir(), "pv-meeting-chunks");
       fs.mkdirSync(chunkDir, { recursive: true });
       const chunkFile = path.join(chunkDir, `${meetingId}.part`);
+      const stateFile = path.join(chunkDir, `${meetingId}.part.state`);
+      const readChunkState = () => { try { return JSON.parse(fs.readFileSync(stateFile, "utf-8")); } catch { return null; } };
+      const clearParts = () => { try { fs.unlinkSync(chunkFile); } catch {} try { fs.unlinkSync(stateFile); } catch {} };
       try {
-        if (chunkIdx === 0) fs.copyFileSync(file.tempPath, chunkFile);
-        else fs.appendFileSync(chunkFile, fs.readFileSync(file.tempPath));
+        // 순서 강제 + 중복 무시(멱등): 응답만 유실된 청크가 재전송되어 두 번
+        // append 되면 오디오가 손상된다 — 이미 반영된 인덱스는 조용히 성공 처리.
+        const next = (readChunkState() || { next: 0 }).next;
+        let early = null;
+        if (chunkIdx === 0) {
+          fs.copyFileSync(file.tempPath, chunkFile); // 0번 = 항상 새 시작(재시작 포함)
+          fs.writeFileSync(stateFile, JSON.stringify({ next: 1 }));
+        } else if (chunkIdx < next) {
+          early = () => json({ ok: true, chunk: chunkIdx, duplicate: true });
+        } else if (chunkIdx === next && fs.existsSync(chunkFile)) {
+          fs.appendFileSync(chunkFile, fs.readFileSync(file.tempPath));
+          fs.writeFileSync(stateFile, JSON.stringify({ next: chunkIdx + 1 }));
+        } else {
+          // 순서 건너뜀 또는 조립 파일 유실(재시작 등) → 재개/재시작 지점 안내
+          const resumeFrom = fs.existsSync(chunkFile) ? next : 0;
+          if (resumeFrom === 0) clearParts();
+          early = () => json({ error: "청크 순서 불일치", resume_from: resumeFrom }, 409);
+        }
         fs.unlinkSync(file.tempPath);
+        if (early) return early();
       } catch (e) {
         try { fs.unlinkSync(file.tempPath); } catch {}
         return json({ error: "청크 저장 실패: " + e.message }, 500);
       }
       if (chunkIdx < totalChunks - 1) return json({ ok: true, chunk: chunkIdx });
 
-      // 마지막 청크 → 영구 저장 + 메타 생성 + 백그라운드 처리
+      // 마지막 청크 → 조립 크기 검증 → 영구 저장 + 메타 생성 + 백그라운드 처리
+      const expectedSize = parseInt(fields.totalSize || "0") || 0;
+      let assembledSize = 0;
+      try { assembledSize = fs.statSync(chunkFile).size; } catch { /* 검증에서 걸림 */ }
+      if (expectedSize > 0 && assembledSize !== expectedSize) {
+        clearParts();
+        return json({ error: `조립 크기 불일치 (${assembledSize} != ${expectedSize})`, restart: true }, 409);
+      }
+
       const now = new Date().toISOString();
       meetingStore.storeAudio(CONFIG_DIR, meetingId, chunkFile);
+      try { fs.unlinkSync(stateFile); } catch {}
       const meta = meetingStore.writeMeta(CONFIG_DIR, meetingId, {
         id: meetingId,
         project: fields.project || null,

@@ -11,7 +11,7 @@
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
-const { spawnSync } = require("child_process");
+const { spawn } = require("child_process");
 
 const API_BASE = "https://api.soniox.com";
 // Async diarization model. If Soniox changes the id, update here only.
@@ -47,6 +47,23 @@ function findFfmpeg() {
   return "ffmpeg"; // rely on PATH
 }
 
+/** Run a command detached from the event loop; resolves the exit code (-1 on
+ *  spawn error or timeout kill). spawnSync would freeze the WHOLE home portal
+ *  (every request, every tenant on a shared host) for the remux duration. */
+function run(cmd, cmdArgs, timeoutMs) {
+  return new Promise((resolve) => {
+    let child;
+    try {
+      child = spawn(cmd, cmdArgs, { stdio: "ignore" });
+    } catch {
+      return resolve(-1);
+    }
+    const timer = setTimeout(() => { try { child.kill("SIGKILL"); } catch { /* ignore */ } }, timeoutMs);
+    child.on("error", () => { clearTimeout(timer); resolve(-1); });
+    child.on("exit", (code) => { clearTimeout(timer); resolve(code == null ? -1 : code); });
+  });
+}
+
 /**
  * Browser MediaRecorder WebM has no duration in its header (live-stream format),
  * so Soniox async rejects it with "Error determining audio duration". A fast
@@ -55,14 +72,12 @@ function findFfmpeg() {
  * footprint stay small even for multi-hour meetings.
  * Returns the path/mime to upload (remuxed on success, original on failure).
  */
-function remuxForSoniox(filePath) {
+async function remuxForSoniox(filePath) {
   const ffmpeg = findFfmpeg();
   const outPath = path.join(os.tmpdir(), `pv-meeting-${path.basename(filePath, path.extname(filePath))}.remux.webm`);
   try {
-    const r = spawnSync(ffmpeg, ["-y", "-i", filePath, "-c", "copy", outPath], {
-      stdio: "ignore", timeout: 5 * 60 * 1000,
-    });
-    if (r.status === 0 && fs.existsSync(outPath) && fs.statSync(outPath).size > 0) {
+    const code = await run(ffmpeg, ["-y", "-i", filePath, "-c", "copy", outPath], 5 * 60 * 1000);
+    if (code === 0 && fs.existsSync(outPath) && fs.statSync(outPath).size > 0) {
       return { path: outPath, mime: "audio/webm", cleanup: true };
     }
   } catch { /* fall through */ }
@@ -110,7 +125,7 @@ async function transcribeFile(apiKey, filePath, opts = {}) {
   let remuxed = null;
   try {
     onProgress("remuxing");
-    remuxed = remuxForSoniox(filePath);
+    remuxed = await remuxForSoniox(filePath);
 
     onProgress("uploading");
     fileId = await uploadFile(apiKey, remuxed.path, remuxed.mime);
@@ -126,11 +141,13 @@ async function transcribeFile(apiKey, filePath, opts = {}) {
 
     onProgress("processing");
     const deadline = Date.now() + maxWaitMs;
-    // Long meetings poll for many minutes; a single transient "fetch failed"
-    // network blip must NOT kill a transcription Soniox is still processing.
-    // Tolerate a few consecutive poll errors before giving up.
-    let pollErrors = 0;
-    const MAX_POLL_ERRORS = 5;
+    // Long meetings poll for many minutes; a transient network outage (router
+    // reboot, tunnel restart, wifi blip) must NOT kill a transcription Soniox
+    // is still processing on its side. Tolerate poll errors for up to 10 min
+    // since the last successful poll before giving up — a 3h meeting's precise
+    // transcript is too valuable to abandon over a 30s blip.
+    const POLL_ERROR_GRACE_MS = 10 * 60 * 1000;
+    let lastPollOkAt = Date.now();
     let polls = 0;
     for (;;) {
       // Heartbeat every ~2 min so the meeting's updated_at stays fresh during a
@@ -141,9 +158,9 @@ async function transcribeFile(apiKey, filePath, opts = {}) {
       let st;
       try {
         st = await soniox(apiKey, "GET", `/v1/transcriptions/${transcriptionId}`);
-        pollErrors = 0;
+        lastPollOkAt = Date.now();
       } catch (e) {
-        if (++pollErrors > MAX_POLL_ERRORS) throw e;
+        if (Date.now() - lastPollOkAt > POLL_ERROR_GRACE_MS) throw e;
         if (Date.now() > deadline) throw new Error("transcription timed out");
         await sleep(pollIntervalMs);
         continue;
