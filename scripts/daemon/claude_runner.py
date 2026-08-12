@@ -198,7 +198,7 @@ def build_project_prompt(project: str) -> str:
 
     connected_services = "" if is_demo else build_connected_services_note()
 
-    return "\n\n".join(p for p in [sys_prompt, system_prompt_pv, common_prompt, connected_services, global_wiki, prompt_content, wiki_index, session_context] if p)
+    return "\n\n".join(p for p in [sys_prompt, system_prompt_pv, common_prompt, connected_services, prompt_content, global_wiki, wiki_index, session_context] if p)
 
 
 def run_claude(
