@@ -200,8 +200,8 @@ launchctl list | grep petervoice
 # 2. 최근 로그 확인 (에러 메시지 찾기)
 tail -30 ~/.claude-daemon/daemon.log
 
-# 3. 재시작 (반드시 이 방법으로)
-(sleep 5 && launchctl stop com.petervoice.claude-daemon) &
+# 3. 재시작 (반드시 이 방법으로 — 라벨은 설치 세대에 따라 둘 중 하나)
+(sleep 5 && (launchctl stop com.petervoice.daemon 2>/dev/null || launchctl stop com.petervoice.claude-daemon)) &
 # → launchd가 10초 내 자동 재시작함
 # ⚠️ 절대 pkill, kill, killall 사용 금지
 ```

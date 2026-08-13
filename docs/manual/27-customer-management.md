@@ -169,8 +169,8 @@ cd ~/peter-voice && git pull --ff-only origin main
 # 5. 의존성 업데이트 (변경 시)
 .venv/bin/pip install -r requirements.txt
 
-# 6. 데몬 재시작
-launchctl stop com.petervoice.claude-daemon
+# 6. 데몬 재시작 (고객 설치본 라벨 = com.petervoice.daemon, 일부 구/개발 머신만 claude-daemon)
+launchctl stop com.petervoice.daemon 2>/dev/null || launchctl stop com.petervoice.claude-daemon
 # launchd가 자동으로 10초 내 재시작
 
 # 7. 재시작 확인
