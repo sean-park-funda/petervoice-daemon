@@ -748,7 +748,16 @@ def compose_system_prompt(user_id: int, project: str) -> str:
     if proj_p:
         label = "브랜치 프롬프트" if project.startswith("branch:") else "프로젝트 프롬프트"
         parts.append(f"# {label}\n\n{proj_p}")
-    return "\n\n".join(parts)
+    combined = "\n\n".join(parts)
+    # {담당자 명부}: 맥 데몬은 실시간 목록으로 치환한다(daemon/prompts.py). 클라우드는 아직
+    # 미지원이라 치환 대신 조회 방법으로 바꿔 둔다 — 플레이스홀더가 그대로 노출되지 않게.
+    if "{담당자 명부}" in combined:
+        combined = combined.replace(
+            "{담당자 명부}",
+            "## 담당자 명부\n대상 목록은 `GET $API_URL/api/projects` 와 "
+            "`GET $API_URL/api/branches?all_active=1` 로 조회할 것 (추측 금지).",
+        )
+    return combined
 
 
 def _sysprompt_filename(project: str) -> str:

@@ -38,7 +38,7 @@ from daemon.sessions import (
     get_codex_session_id, update_codex_session, reset_codex_session,
 )
 from daemon.tasks import get_current_task, get_task_description
-from daemon.prompts import get_prompt_file, build_system_prompt, build_connected_services_note
+from daemon.prompts import get_prompt_file, build_system_prompt, build_connected_services_note, apply_roster_placeholder
 
 
 # ── 종료 드레인 센티널 ─────────────────────────────────────────
@@ -223,7 +223,9 @@ def build_project_prompt(project: str) -> str:
 
     connected_services = "" if is_demo else build_connected_services_note()
 
-    return "\n\n".join(p for p in [sys_prompt, system_prompt_pv, common_prompt, connected_services, prompt_content, global_wiki, wiki_index, session_context] if p)
+    combined = "\n\n".join(p for p in [sys_prompt, system_prompt_pv, common_prompt, connected_services, prompt_content, global_wiki, wiki_index, session_context] if p)
+    # 프롬프트에 {담당자 명부}가 있으면 실시간 프로젝트·브랜치 목록으로 치환
+    return apply_roster_placeholder(combined)
 
 
 def run_claude(

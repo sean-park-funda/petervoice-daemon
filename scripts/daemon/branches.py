@@ -85,7 +85,7 @@ def build_branch_prompt(branch: dict) -> str:
     3. 프로젝트 프롬프트
     4. 브랜치/칸반 규칙
     """
-    from daemon.prompts import get_prompt_file, build_connected_services_note
+    from daemon.prompts import get_prompt_file, build_connected_services_note, apply_roster_placeholder
 
     project_id = branch.get("project_id", "")
 
@@ -144,7 +144,7 @@ def build_branch_prompt(branch: dict) -> str:
         from daemon.kanban import build_kanban_prompt
         kanban_combined = build_kanban_prompt(kanban_card_full)
         combined = "\n\n".join(p for p in [system_prompt_pv, kanban_combined, lead_patch, relay_guide, conversation_hint, heartbeat_hint] if p)
-        return combined
+        return apply_roster_placeholder(combined)
     else:
         # 순수 브랜치 → 간결한 브랜치 규칙
         branch_num = branch.get("branch_number", branch.get("id"))
@@ -175,7 +175,7 @@ curl -X PATCH "$API_URL/api/branches/{branch_id}" \\
 """
         connected_services = build_connected_services_note()
         combined = "\n\n".join(p for p in [system_prompt_pv, common_prompt, connected_services, project_prompt, branch_prompt, branch_rules, lead_patch, relay_guide, conversation_hint, heartbeat_hint] if p)
-        return combined
+        return apply_roster_placeholder(combined)
 
 
 def build_branch_context(branch: dict) -> str:
