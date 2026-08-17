@@ -15,7 +15,11 @@ from daemon.globals import (
     MAX_CONTEXT_OVERFLOW_RETRIES,
     config, sessions_lock, shutdown_event, logger,
 )
-from daemon.limits import build_claude_env, detect_cap_hit, record_cap_hit, cap_notice
+from daemon.limits import (
+    build_claude_env, detect_cap_hit, record_cap_hit, cap_notice,
+    detect_usage_limit, usage_limit_notice,
+    start_account_cooldown, clear_account_cooldown, account_cooldown_notice,
+)
 import daemon.globals as g
 import signal
 import threading
@@ -72,6 +76,27 @@ def _text_signals_auth_expired(text: str) -> bool:
     if "401" in text:
         return True
     return any(m in low for m in _AUTH_EXPIRED_MARKERS)
+
+
+# ── 모델별 한도 폴백 체인 ──────────────────────────────────────
+# "Switch to another model" 은 에러 메시지 자체가 말하는 처방이다. 모델별 주간 쿼터는 서로
+# 독립이라 한 단계만 내려가도 대개 살아난다. sonnet 은 더 내리지 않는다 — 거기서 막혔다면
+# 계정 전체가 소진된 것에 가깝고, haiku 로 내려서 나오는 결과는 자율 루프에 오히려 해롭다.
+_MODEL_FALLBACK = (
+    ("fable", "claude-opus-5"),
+    ("opus", "claude-sonnet-5"),
+)
+
+
+def _fallback_model(current: str) -> str | None:
+    explicit = config.get("limit_fallback_model")
+    if explicit and explicit != current:
+        return explicit
+    low = (current or "").lower()
+    for needle, target in _MODEL_FALLBACK:
+        if needle in low and target != current:
+            return target
+    return None
 
 
 def _probe_auth_expired(config_dir: str | None = None) -> bool:
@@ -215,6 +240,9 @@ def run_claude(
     # 리스트를 넘기면 각 발화가 따로 담긴다 → 호출자가 별도 메시지로 보낼 수 있다.
     # 안 넘기면 기존과 동일하게 합쳐진 response_text만 쓰면 된다.
     segments_out: list[str] | None = None,
+    # 계정 한도(모델별) 폴백 재시도용 — 원래 모델 대신 이 모델로 1회 다시 띄운다
+    model_override: str | None = None,
+    _limit_retry: int = 0,
 ) -> tuple[str, str | None, list[str], bool]:
     api_key = config["api_key"]
 
@@ -257,7 +285,7 @@ def run_claude(
 
     branch_model = branch_data.get("model") if is_branch and branch_data else None
     # 기본 모델은 Opus 5. 브랜치/프로젝트/config에 지정이 없으면 opus-5로 폴백.
-    model = branch_model or proj_settings.get("model") or config.get("claude_model") or "claude-opus-5"
+    model = model_override or branch_model or proj_settings.get("model") or config.get("claude_model") or "claude-opus-5"
     # 엔진=claude인데 Codex(gpt-*) 모델 코드가 남아있으면 무시하고 Claude 기본값 사용.
     if model.startswith("gpt-"):
         model = config.get("claude_model") or "claude-sonnet-5"
@@ -342,11 +370,33 @@ def run_claude(
     else:
         logger.info(f"[{bot_name}] Claude: project={project}, dir={project_dir}, session={sid or 'new'}")
 
+    # 계정 세션 한도 쿨다운 중이면 CLI 를 아예 띄우지 않는다. 계정 한도는 프로젝트들이
+    # 나눠 쓰는 자원이라, 한 프로젝트가 계속 찔러대면 다른 프로젝트의 자율 루프까지 죽는다.
+    # (2026-08-18 02:18~02:36 릴레이 백로그가 18분간 201회 헛스폰한 실사고)
+    _cooldown_msg = account_cooldown_notice(account_name)
+    if _cooldown_msg:
+        logger.warning(f"[limits] {project}: 계정 한도 쿨다운 중 — 스폰 생략 (account={account_name})")
+        return (_cooldown_msg, sid, [], False)
+
     total_usage = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "model": ""}
     _counted = False
     _spawn_concurrency = 0   # 진단용 기본값 (로그 경로에서 NameError 나지 않도록)
+
+    # 세마포어는 이 함수에서 '반드시 한 번만' 반납한다.
+    # 에러 분기들이 재귀 전에 release() 하고 finally 가 또 release() 했는데,
+    # threading.Semaphore(BoundedSemaphore 아님)라 예외 없이 카운트만 +1 된다
+    # → 재시도가 일어날 때마다 max_concurrent 가 영구히 늘어난다(동시 스폰 증가 = 한도 소진 가속).
+    _sem_held = False
+
+    def _release_semaphore():
+        nonlocal _sem_held
+        if _sem_held:
+            _sem_held = False
+            g.claude_semaphore.release()
+
     try:
         g.claude_semaphore.acquire()
+        _sem_held = True
         # 인증만료 진단: 이 스폰 시점의 동시 실행 수 기록 (RT 갱신 레이스 가설 확증용)
         with g.claude_inflight_lock:
             g.claude_inflight += 1
@@ -618,13 +668,36 @@ def run_claude(
                                     "text": f"(Anthropic 서버 과부하, {wait}초 후 재시도 {_overload_retry + 1}/{MAX_OVERLOAD_RETRIES}...)", "project": project, "is_final": False,
                                 })
                             proc.wait(timeout=5)
-                            g.claude_semaphore.release()
+                            _release_semaphore()
                             time.sleep(wait)
                             # D9-B: forward team params on retry
                             return run_claude(prompt, project, _retry_count, _overload_retry + 1,
                                 session_key_override=session_key_override, prompt_override=prompt_override, stream_to_chat=stream_to_chat,
                                 segments_out=segments_out)
                         return ("(Anthropic 서버 과부하 - 잠시 후 다시 시도해주세요)", new_session_id, tool_lines, False)
+                    # 계정 사용 한도 — 세션 리셋도 재시도도 답이 아니다. 모델별이면 갈아타고,
+                    # 세션창이면 리셋까지 전역으로 멈춘다. (2026-08-16~18 실사고, limits.py 주석 참조)
+                    _limit = detect_usage_limit(error_text)
+                    if _limit:
+                        record_cap_hit(project, f"계정 한도({_limit['kind']}:{_limit['label']})", config)
+                        proc.wait(timeout=5)
+                        _release_semaphore()
+                        if _limit["kind"] == "model":
+                            _fb = _fallback_model(model) if _limit_retry == 0 else None
+                            if _fb:
+                                logger.warning(f"[{bot_name}] {model} limit for {project} → falling back to {_fb}")
+                                if stream_to_chat:
+                                    api_request(api_key, "POST", "/api/bot/reply", {
+                                        "text": f"({_limit['label']} 한도 도달 — {_fb} 로 전환해 다시 시도합니다)",
+                                        "project": project, "is_final": False,
+                                    })
+                                return run_claude(prompt, project, _retry_count, 0,
+                                    session_key_override=session_key_override, prompt_override=prompt_override,
+                                    stream_to_chat=stream_to_chat, segments_out=segments_out,
+                                    model_override=_fb, _limit_retry=_limit_retry + 1)
+                            return (usage_limit_notice(_limit), new_session_id, tool_lines, False)
+                        start_account_cooldown("세션 한도", _limit.get("resets", ""), account_name)
+                        return (usage_limit_notice(_limit), new_session_id, tool_lines, False)
                     if "could not process image" in error_text.lower() or "invalid_request_error" in error_text.lower():
                         logger.warning(f"[{bot_name}] Image/request error for {project}, resetting session (retry {_retry_count + 1})")
                         conv = _fetch_recent_conversation(project, limit=10)
@@ -632,7 +705,7 @@ def run_claude(
                             _save_session_summary(project, f"[이미지 처리 오류로 자동 리셋 — 최근 대화 원본]\n\n{conv}")
                         reset_session(project, key_override=_sid_key)
                         proc.wait(timeout=5)
-                        g.claude_semaphore.release()
+                        _release_semaphore()
                         if _retry_count >= MAX_CONTEXT_OVERFLOW_RETRIES:
                             return ("(이미지 처리 오류 - 세션이 초기화되었습니다. 다시 말씀해주세요.)", None, tool_lines, False)
                         return run_claude(prompt, project, _retry_count + 1, 0,
@@ -645,7 +718,7 @@ def run_claude(
                             _save_session_summary(project, f"[컨텍스트 오버플로우로 자동 리셋 — 최근 대화 원본]\n\n{conv}")
                         reset_session(project, key_override=_sid_key)
                         proc.wait(timeout=5)
-                        g.claude_semaphore.release()
+                        _release_semaphore()
                         if _retry_count >= MAX_CONTEXT_OVERFLOW_RETRIES:
                             return ("(컨텍스트 초과 - 최대 재시도 횟수 초과)", None, tool_lines, False)
                         return run_claude(prompt, project, _retry_count + 1, 0,
@@ -657,7 +730,7 @@ def run_claude(
                         # credential source (file may be expired while Keychain is valid).
                         logger.warning(f"[{bot_name}] Auth expired for {project}: starting self-service re-login {_auth_diag(_spawn_concurrency)}")
                         proc.kill()
-                        g.claude_semaphore.release()
+                        _release_semaphore()
                         return (_trigger_relogin(project, account_config_dir), new_session_id, tool_lines, False)
 
         proc.wait(timeout=300)
@@ -671,7 +744,7 @@ def run_claude(
                 if conv:
                     _save_session_summary(project, f"[컨텍스트 오버플로우(stderr)로 자동 리셋 — 최근 대화 원본]\n\n{conv}")
                 reset_session(project, key_override=_sid_key)
-                g.claude_semaphore.release()
+                _release_semaphore()
                 if _retry_count >= MAX_CONTEXT_OVERFLOW_RETRIES:
                     return ("(컨텍스트 초과 - 최대 재시도 횟수 초과)", None, tool_lines, False)
                 return run_claude(prompt, project, _retry_count + 1, 0,
@@ -680,21 +753,36 @@ def run_claude(
             if "no conversation found" in stderr_output.lower():
                 logger.warning(f"[{bot_name}] Invalid session for {project}, clearing and retrying")
                 reset_session(project, key_override=_sid_key)
-                g.claude_semaphore.release()
+                _release_semaphore()
                 if _retry_count >= MAX_CONTEXT_OVERFLOW_RETRIES:
                     return ("(세션 오류 - 최대 재시도 횟수 초과)", None, tool_lines, False)
                 return run_claude(prompt, project, _retry_count + 1, 0,
                     session_key_override=session_key_override, prompt_override=prompt_override, stream_to_chat=stream_to_chat,
                                 segments_out=segments_out)
+            # 한도 문구가 stderr 로만 새는 경우(스트림에 result 이벤트가 안 온 턴)도 같이 잡는다
+            _limit = detect_usage_limit(stderr_output)
+            if _limit:
+                record_cap_hit(project, f"계정 한도(stderr:{_limit['kind']})", config)
+                _release_semaphore()
+                if _limit["kind"] == "session":
+                    start_account_cooldown("세션 한도", _limit.get("resets", ""))
+                elif _limit_retry == 0 and _fallback_model(model):
+                    _fb = _fallback_model(model)
+                    logger.warning(f"[{bot_name}] {model} limit (stderr) for {project} → falling back to {_fb}")
+                    return run_claude(prompt, project, _retry_count, 0,
+                        session_key_override=session_key_override, prompt_override=prompt_override,
+                        stream_to_chat=stream_to_chat, segments_out=segments_out,
+                        model_override=_fb, _limit_retry=_limit_retry + 1)
+                return (usage_limit_notice(_limit), new_session_id, tool_lines, False)
             # stderr 에 인증만료 텍스트가 직접 보이면 즉시 재로그인
             if _text_signals_auth_expired(stderr_output):
                 logger.warning(f"[{bot_name}] Auth expired (stderr) for {project}: starting self-service re-login {_auth_diag(_spawn_concurrency)}")
-                g.claude_semaphore.release()
+                _release_semaphore()
                 return (_trigger_relogin(project, account_config_dir), new_session_id, tool_lines, False)
             # 원인 불명(exit≠0 & stderr 빈값 & 응답 빈값) → plain 프로브로 인증만료 확정 (hoon 사례)
             if not stderr_output and _probe_auth_expired(account_config_dir):
                 logger.warning(f"[{bot_name}] Auth expired (probe) for {project}: starting self-service re-login {_auth_diag(_spawn_concurrency)}")
-                g.claude_semaphore.release()
+                _release_semaphore()
                 return (_trigger_relogin(project, account_config_dir), new_session_id, tool_lines, False)
             return (f"(Claude 오류: exit {proc.returncode})", new_session_id, tool_lines, False)
 
@@ -722,7 +810,7 @@ def run_claude(
             if conv:
                 _save_session_summary(project, f"[프롬프트 초과로 자동 리셋 — 최근 대화 원본]\n\n{conv}")
             reset_session(project, key_override=_sid_key)
-            g.claude_semaphore.release()
+            _release_semaphore()
             return run_claude(prompt, project, _retry_count + 1, 0,
                 session_key_override=session_key_override, prompt_override=prompt_override, stream_to_chat=stream_to_chat,
                                 segments_out=segments_out)
@@ -743,6 +831,8 @@ def run_claude(
 
         # 정상 완료 = 이 시점엔 access token 이 유효했다는 뜻 (토큰 신선도 기준점)
         g.last_claude_ok = time.time()
+        # 한도도 풀렸다는 뜻 — 쿨다운이 걸려 있었다면(카나리아 통과) 즉시 해제
+        clear_account_cooldown(account_name)
         return (response_text, new_session_id, tool_lines, False)
 
     except subprocess.TimeoutExpired:
@@ -769,7 +859,7 @@ def run_claude(
             with g.claude_inflight_lock:
                 g.claude_inflight -= 1
         try:
-            g.claude_semaphore.release()
+            _release_semaphore()
         except ValueError:
             pass
 
@@ -959,8 +1049,18 @@ def run_codex(prompt: str, project: str, _retry_count: int = 0) -> tuple[str, st
 
     logger.info(f"[{bot_name}] Codex: project={project}, dir={project_dir}, session={sid or 'new'}, model={model or 'default'}")
 
+    # run_claude 와 동일한 이유로 한 번만 반납한다 (세션 오류 재시도 시 이중 release → 동시성 누수)
+    _sem_held = False
+
+    def _release_semaphore():
+        nonlocal _sem_held
+        if _sem_held:
+            _sem_held = False
+            g.claude_semaphore.release()
+
     try:
         g.claude_semaphore.acquire()
+        _sem_held = True
         codex_env = {
             **os.environ,
             "LANG": "en_US.UTF-8",
@@ -1112,7 +1212,7 @@ def run_codex(prompt: str, project: str, _retry_count: int = 0) -> tuple[str, st
             if "session" in stderr_output.lower() or "not found" in stderr_output.lower():
                 logger.warning(f"[{bot_name}] Invalid codex session for {project}, resetting (retry {_retry_count + 1})")
                 reset_codex_session(project)
-                g.claude_semaphore.release()
+                _release_semaphore()
                 if _retry_count >= MAX_CONTEXT_OVERFLOW_RETRIES:
                     return ("(Codex 세션 오류 - 최대 재시도 횟수 초과)", None, tool_lines, False)
                 return run_codex(prompt, project, _retry_count + 1)
@@ -1143,6 +1243,6 @@ def run_codex(prompt: str, project: str, _retry_count: int = 0) -> tuple[str, st
         return (f"(Codex 실행 오류: {e})", sid, [], False)
     finally:
         try:
-            g.claude_semaphore.release()
+            _release_semaphore()
         except ValueError:
             pass
