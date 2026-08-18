@@ -373,8 +373,21 @@ def run_kanban_claude(
                 continue
 
             etype = event.get("type", "")
-            if etype == "result":
-                response_text = _strip_ansi(event.get("result", ""))
+            # claude_runner 와 동일한 텍스트 유실 수정 (2026-08-19): result 필드는 턴의
+            # '마지막 메시지'만 담아 "텍스트→도구→텍스트" 턴에서 앞 텍스트가 사라진다.
+            # 정본은 assistant text 블록이고, result 는 수집분에 없을 때만 폴백으로 쓴다.
+            if etype == "assistant" and "message" in event:
+                for block in event["message"].get("content", []):
+                    if block.get("type") == "text":
+                        _t = block.get("text", "")
+                        if _t:
+                            if response_text and not response_text.endswith("\n\n"):
+                                response_text += "\n\n"
+                            response_text += _t
+            elif etype == "result":
+                _rtxt = _strip_ansi(event.get("result", ""))
+                if _rtxt and _rtxt.strip() not in response_text:
+                    response_text = (response_text.rstrip() + "\n\n" + _rtxt) if response_text.strip() else _rtxt
                 new_session_id = event.get("session_id", new_session_id)
             elif etype == "system" and event.get("subtype") == "init":
                 new_session_id = event.get("session_id", new_session_id)
@@ -401,6 +414,8 @@ def run_kanban_claude(
             card_copy["session_id"] = None
             return run_kanban_claude(prompt, card_copy)
 
+        # assistant 경로로 수집된 텍스트도 result 와 동일하게 ANSI 이스케이프를 벗긴다
+        response_text = _strip_ansi(response_text).strip()
         return (response_text or "(응답 없음)", new_session_id)
 
     except Exception as e:

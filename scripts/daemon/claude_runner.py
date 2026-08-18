@@ -447,6 +447,14 @@ def run_claude(
         response_text = ""
         _cap_notified = False   # 폭주 상한 알림은 턴당 1회
         result_segments: list[str] = []
+        # ── 텍스트 유실 수정 (2026-08-19, general 버그리포트) ──
+        # 텍스트의 주 수집원은 assistant 이벤트의 text 블록이다. result 이벤트의 result
+        # 필드는 '턴의 마지막 메시지'만 담으므로, "텍스트→도구→텍스트" 턴에서 앞 텍스트가
+        # 통째로 사라졌다 (content_block_delta는 --include-partial-messages 없이는 안 옴).
+        # _seg_start: 마지막 result 이후 수집분의 시작 위치 — result 마다 그 구간이 발화 1개.
+        # _pending_boundary: result 를 지나 턴이 재개되면(백그라운드) 합본에 --- 경계를 넣는다.
+        _seg_start = 0
+        _pending_boundary = False
         new_session_id = sid
         last_stream_time = time.time()
         last_activity_time = time.time()
@@ -612,8 +620,18 @@ def run_claude(
                                 api_request(api_key, "POST", "/api/bot/reply", {
                                     "text": "\n".join(tool_lines), "project": project, "is_final": False,
                                 })
-                if response_text and not response_text.endswith("\n\n"):
-                    response_text += "\n\n"
+                    elif block.get("type") == "text":
+                        # 도구 앞뒤의 모든 텍스트를 여기서 수집한다 (유일하게 완전한 소스)
+                        _t = block.get("text", "")
+                        if _t:
+                            if _pending_boundary:
+                                if response_text.strip():
+                                    response_text = response_text.rstrip() + "\n\n---\n\n"
+                                    _seg_start = len(response_text)
+                                _pending_boundary = False
+                            elif response_text and not response_text.endswith("\n\n"):
+                                response_text += "\n\n"
+                            response_text += _t
 
             if etype == "content_block_delta":
                 delta = event.get("delta", {})
@@ -633,18 +651,29 @@ def run_claude(
                     new_session_id = event["session_id"]
                 _rtxt = event.get("result")
                 if _rtxt and not event.get("is_error"):
-                    # 한 claude -p 턴에서 result 이벤트가 여러 번 올 수 있다.
-                    # (run_in_background 서브에이전트 완료 시 턴이 재개되며 두 번째 result 발생)
-                    # 각 result는 '완결된 메시지'이므로 첫 것만 남기지 말고 모두 이어붙인다.
-                    # (예전엔 `not response_text.strip()` 가드가 2번째 이후 result를 버려 백그라운드 결과가 유실됨)
-                    # 각 result는 '다른 시각에 끝난' 별개의 발화다.
-                    # (예: "분석 중입니다" → 수 분 뒤 "분석 완료했습니다")
-                    result_segments.append(_rtxt)
-                    if response_text.strip():
-                        # 합본(programmatic 호출자용)에는 구분선으로 발화 경계를 표시
-                        response_text = response_text.rstrip() + "\n\n---\n\n" + _rtxt
+                    # 한 claude -p 턴에서 result 이벤트가 여러 번 올 수 있다
+                    # (run_in_background 서브에이전트 완료 시 턴이 재개되며 두 번째 result 발생).
+                    # 각 result는 '다른 시각에 끝난' 별개의 발화 → result_segments 에 하나씩 담는다.
+                    # 발화 본문은 assistant text 블록에서 이미 수집된 _seg_start 이후 구간이 정본이고,
+                    # result 필드는 '마지막 메시지만' 담으므로 **이미 수집된 내용이면 덧붙이지 않는다**
+                    # (덧붙이면 마지막 메시지가 두 번 나간다 — 유실 수정과 짝인 중복 가드).
+                    _seg = response_text[_seg_start:].strip()
+                    _rt = _rtxt.strip()
+                    if not _seg:
+                        # 이 구간에 assistant 텍스트가 없었다(구형 CLI 등) → result 가 유일한 소스
+                        result_segments.append(_rtxt)
+                        if response_text.strip():
+                            response_text = response_text.rstrip() + "\n\n---\n\n" + _rtxt
+                        else:
+                            response_text = _rtxt
+                    elif _rt and _rt not in _seg:
+                        # result 에만 있는 꼬리가 있으면 보존 (정상 경로에선 _seg 가 _rt 를 포함)
+                        result_segments.append(_seg + "\n\n" + _rtxt)
+                        response_text = response_text.rstrip() + "\n\n" + _rtxt
                     else:
-                        response_text = _rtxt
+                        result_segments.append(_seg)
+                    _seg_start = len(response_text)
+                    _pending_boundary = True
                 if event.get("is_error"):
                     error_text = str(event.get("error", "")) + str(event.get("result", ""))
                     _err_lc = error_text.lower()
