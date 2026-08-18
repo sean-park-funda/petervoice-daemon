@@ -777,6 +777,85 @@ def _write_turn_sysprompt(user_id: int, project: str) -> str | None:
         return None
 
 
+# ── 모델/에포트 (웹 프로젝트 설정 반영) ───────────────────────────
+# 웹 UI 에서 고른 프로젝트·브랜치 모델을 실제 턴에 반영한다.
+# 우선순위는 셀프호스팅 데몬(daemon/claude_runner.py)과 동일: 브랜치 > 프로젝트 > 호스트 config.
+# 어디에도 지정이 없으면 --model 을 붙이지 않는다 (기존 동작 = CLI 기본 모델 유지).
+
+_MODEL_TTL_SEC = 120
+_proj_settings_cache: dict[int, tuple[float, dict]] = {}
+_branch_settings_cache: dict[int, tuple[float, dict]] = {}
+_model_cache_lock = threading.Lock()
+_BRANCH_RE = re.compile(r"^branch:(\d+)$")
+
+
+def _fetch_project_settings(user_id: int, api_key: str) -> dict:
+    """유저의 프로젝트 설정 {project_id: row}. 조회 실패 시 이전 캐시 유지."""
+    now = time.time()
+    with _model_cache_lock:
+        hit = _proj_settings_cache.get(user_id)
+    if hit and now - hit[0] < _MODEL_TTL_SEC:
+        return hit[1]
+    result = user_api(api_key, "GET", "/api/projects")
+    if result is None:
+        return hit[1] if hit else {}
+    rows = {str(p.get("id")): p for p in (result.get("projects") or []) if p.get("id")}
+    with _model_cache_lock:
+        _proj_settings_cache[user_id] = (now, rows)
+    return rows
+
+
+def _fetch_branch_settings(user_id: int, api_key: str) -> dict:
+    """유저의 active 브랜치 설정 {branch_id: row}. 브랜치 턴에서만 호출한다(응답이 큼)."""
+    now = time.time()
+    with _model_cache_lock:
+        hit = _branch_settings_cache.get(user_id)
+    if hit and now - hit[0] < _MODEL_TTL_SEC:
+        return hit[1]
+    result = user_api(api_key, "GET", "/api/branches?all_active=1")
+    if result is None:
+        return hit[1] if hit else {}
+    rows = {}
+    for b in (result.get("branches") or []):
+        try:
+            rows[int(b.get("id"))] = b
+        except (TypeError, ValueError):
+            continue
+    with _model_cache_lock:
+        _branch_settings_cache[user_id] = (now, rows)
+    return rows
+
+
+def resolve_model_effort(user_id: int, project: str) -> tuple[str | None, str | None]:
+    """이 턴에 쓸 (model, effort). 없으면 (None, None) → CLI 기본값."""
+    user = roster.get(user_id)
+    api_key = (user or {}).get("apiKey") or ""
+    model = effort = None
+    if api_key:
+        try:
+            projects = _fetch_project_settings(user_id, api_key)
+            m = _BRANCH_RE.match(project or "")
+            if m:
+                branch = _fetch_branch_settings(user_id, api_key).get(int(m.group(1))) or {}
+                model, effort = branch.get("model"), branch.get("effort")
+                parent = projects.get(str(branch.get("project_id") or "")) or {}
+                model = model or parent.get("model")
+                effort = effort or parent.get("effort")
+            else:
+                row = projects.get(project or "") or {}
+                model, effort = row.get("model"), row.get("effort")
+        except Exception as e:  # 설정 조회 실패가 턴을 막지 않게
+            logger.warning(f"[model] resolve failed user={user_id} project={project}: {e}")
+    model = model or config.get("claude_model")
+    effort = effort or config.get("claude_effort")
+    # engine=codex 로 쓰던 프로젝트에 gpt-* 코드가 남아 있으면 claude CLI 가 거부한다 → 무시
+    if model and str(model).startswith("gpt-"):
+        model = config.get("claude_model")
+        if model and str(model).startswith("gpt-"):
+            model = None
+    return (str(model) if model else None, str(effort) if effort else None)
+
+
 # ── Claude 실행 (리소스 상한: systemd-run cgroup) ────────────────
 # 각 턴을 systemd 일회성 유닛으로 격리 실행 → 메모리/CPU/태스크/시간 상한을 강제한다.
 # 폭주해도 그 턴 유닛만 죽고 호스트/데몬/타 유저는 무사. PrivateTmp 로 /tmp 도 사설.
@@ -961,8 +1040,10 @@ def run_claude_turn(user_id: int, project: str, prompt: str) -> tuple[str, str]:
         sp = ctr.sysprompt_path_in_home(user_id, compose_system_prompt(user_id, project),
                                         name=_sysprompt_filename(project))
         sid = load_session(user_id, project)
+        model, effort = resolve_model_effort(user_id, project)
         rc, out, err = ctr.exec_claude_turn(user_id, project, prompt, sid, secrets, sp,
-                                            limits=user_limits(user_id))
+                                            limits=user_limits(user_id),
+                                            model=model, effort=effort)
         if rc == 137:
             return ("", "heavy_mem")
         if rc == 124:
@@ -975,6 +1056,14 @@ def run_claude_turn(user_id: int, project: str, prompt: str) -> tuple[str, str]:
         "--output-format", "json",
         "--dangerously-skip-permissions",
     ]
+    # 웹에서 고른 프로젝트/브랜치 모델·에포트 반영 (지정 없으면 CLI 기본값)
+    model, effort = resolve_model_effort(user_id, project)
+    if model:
+        cmd.extend(["--model", model])
+    if effort:
+        cmd.extend(["--effort", effort])
+    logger.info(f"[turn] user={user_id} project={project} model={model or '(default)'} "
+                f"effort={effort or '(default)'}")
     sp = _write_turn_sysprompt(user_id, project) or _ensure_cloud_system_prompt(user_id)
     if sp:
         cmd.extend(["--append-system-prompt-file", sp])

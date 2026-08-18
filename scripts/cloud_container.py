@@ -379,9 +379,12 @@ def _envfile(user_id: int, env: dict) -> str:
 def exec_claude_turn(user_id: int, project: str, prompt: str,
                      session_id: str | None, secrets: dict,
                      system_prompt_path: str | None,
-                     limits: dict | None = None) -> tuple[int, str, str]:
+                     limits: dict | None = None,
+                     model: str | None = None,
+                     effort: str | None = None) -> tuple[int, str, str]:
     """컨테이너 안에서 claude 한 턴. returns (rc, stdout, stderr).
-    limits: 로스터 티어 한도 (메모리·턴 시간). None = 호스트 config 일괄값."""
+    limits: 로스터 티어 한도 (메모리·턴 시간). None = 호스트 config 일괄값.
+    model/effort: 웹 프로젝트·브랜치 설정 (None = CLI 기본값)."""
     if not ensure_running(user_id, limits):
         return (1, "", "container start failed")
     ensure_skills(user_id)  # 번들 스킬 심링크 (프로세스당 1회)
@@ -390,6 +393,10 @@ def exec_claude_turn(user_id: int, project: str, prompt: str,
     _podman("exec", name(user_id), "mkdir", "-p", f"{ws}/docs", timeout=15)
 
     cmd = ["claude", "-p", "--output-format", "json", "--dangerously-skip-permissions"]
+    if model:
+        cmd += ["--model", model]
+    if effort:
+        cmd += ["--effort", effort]
     if system_prompt_path:
         cmd += ["--append-system-prompt-file", system_prompt_path]
     if session_id:
