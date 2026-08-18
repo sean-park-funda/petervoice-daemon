@@ -1469,6 +1469,34 @@ function cdpHostOf(u) {
   try { return new URL(u).host; } catch { return ""; }
 }
 
+// CDP 다운 시 브라우저 셀프힐 — 9222(맥 설치형/컨테이너 내부)에서만.
+// 클라우드 호스트 포탈(19000+uid)은 컨테이너 안에서 떠야 하므로 여기서 스폰하면 안 된다
+// (그쪽은 데몬 HandoffThread 가 keep-alive 담당).
+const browserStartAttempts = new Map(); // port → 마지막 시도 ts (30초 스로틀)
+function maybeStartBrowser(port) {
+  if (port !== 9222) return false;
+  const now = Date.now();
+  if (now - (browserStartAttempts.get(port) || 0) < 30000) return true; // 이미 기동 중
+  browserStartAttempts.set(port, now);
+  const script = [
+    path.join(os.homedir(), ".claude", "skills", "browser-handoff", "scripts", "start-browser.sh"),
+    "/srv/pv/shared/skills/browser-handoff/scripts/start-browser.sh",
+  ].find(p => { try { return fs.existsSync(p); } catch { return false; } });
+  if (!script) return false;
+  try {
+    const child = spawn("bash", [script], {
+      env: { ...process.env, PV_CDP_PORT: String(port) },
+      detached: true,
+      stdio: "ignore",
+    });
+    child.unref();
+    console.log(`[browser] CDP ${port} down — start-browser.sh spawned for self-heal`);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function cdpConnect(port, matchUrl) {
   // matchUrl(인계의 대상 URL)이 있으면 같은 호스트의 탭을 우선 선택 — 여러 탭 중
   // 엉뚱한 탭을 스트리밍하던 문제의 수정 (2026-07-30 포트원 가입 인계에서 실측)
@@ -2599,7 +2627,16 @@ document.addEventListener('click', e => {
     (async () => {
       const port = cdpPortForDir(url.searchParams.get("dir"));
       if (!port) return json({ error: "잘못된 dir" }, 403);
-      const s = await cdpConnect(port, url.searchParams.get("url") || "");
+      let s;
+      try {
+        s = await cdpConnect(port, url.searchParams.get("url") || "");
+      } catch (e) {
+        // CDP 죽음 → 셀프힐: 인계 뷰어가 900ms~3s 로 폴링 중이므로 여기서 브라우저를
+        // 재기동해 두면 몇 초 안에 자동 복구된다 (2026-08-18 저녁 chromium 사망으로
+        // 유저가 '연결 중' 무한 대기한 실사고 — infohub 제보)
+        const starting = maybeStartBrowser(port);
+        return json({ error: "browser_unavailable", starting, detail: String((e && e.message) || e) }, 502);
+      }
       // 인계 종료 시 뷰포트 오버라이드 원복 — 에이전트가 세션을 이어받을 때
       // 폰 크기 뷰포트가 남아 스크래핑이 모바일 레이아웃을 보게 되는 것을 방지
       if (url.searchParams.get("reset") === "1") {

@@ -47,6 +47,10 @@ if ! curl -sf -m 2 "http://127.0.0.1:$CDP_PORT/json/version" >/dev/null 2>&1; th
   fi
 
   mkdir -p "$HOME/.pv-browser"
+  # set -m: 백그라운드 잡을 자기 프로세스 그룹으로 분리한다. 없으면 chromium 이 이 스크립트를
+  # 부른 부모(에이전트 턴 셸/데몬)의 프로세스 그룹에 남아, 부모 정리(타임아웃 킬, 서비스 재시작,
+  # 프로세스 그룹 킬)에 브라우저가 같이 죽는다 — 2026-08-18 저녁 chromium 원인불명 사망 후 예방 조치.
+  set -m
   # shellcheck disable=SC2086
   nohup "$BIN" $HEADLESS_FLAG \
     --remote-debugging-port="$CDP_PORT" \
