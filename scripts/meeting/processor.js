@@ -109,8 +109,38 @@ async function triggerMinutes(config, meeting, transcriptDocRelPath, opts = {}) 
         processed: false,
       }),
     });
+    if (!res.ok) console.warn(`[meeting] ${meeting.id} minutes trigger failed: HTTP ${res.status}`);
     return res.ok;
-  } catch {
+  } catch (e) {
+    console.warn(`[meeting] ${meeting.id} minutes trigger failed: ${e.message || e}`);
+    return false;
+  }
+}
+
+/**
+ * Post a bot-side notice straight into the meeting session's chat via
+ * /api/bot/reply — a plain bot message, so the agent is NOT invoked (no
+ * Claude turn, no cost). Fills the silent gap between meeting end and the
+ * label-or-grace-period-delayed minutes.
+ */
+async function postChatNotice(config, project, text) {
+  const apiUrl = config.api_url || "https://www.peter-voice.site";
+  const apiKey = config.api_key;
+  if (!apiKey || !project) return false;
+  try {
+    const res = await fetch(`${apiUrl}/api/bot/reply`, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${apiKey}`,
+        "X-Api-Key": apiKey,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ project, text, subtype: "meeting_notice" }),
+    });
+    if (!res.ok) console.warn(`[meeting] chat notice failed: HTTP ${res.status} (${project})`);
+    return res.ok;
+  } catch (e) {
+    console.warn(`[meeting] chat notice failed: ${e.message || e} (${project})`);
     return false;
   }
 }
@@ -213,6 +243,12 @@ async function processMeeting({ configDir, config, meetingId, projectDocsDir, lo
       // labelMeeting (or the auto-minutes checker after the grace period) triggers
       // minutes with the resolved names — otherwise the bot guesses names.
       out(`[meeting] ${meetingId} awaiting speaker labels before minutes`);
+      const durMin = Math.max(1, Math.round((updated.duration_sec || meta.duration_sec || 0) / 60));
+      await postChatNotice(config || {}, updated.project,
+        `🎙️ 회의 전사가 저장되었습니다 (약 ${durMin}분, 화자 ${speakers.length}명).\n` +
+        `- 전체 대화 기록: ${transcriptRel} (문서 탭에서 확인)\n` +
+        `- 회의 화면에서 화자 이름을 입력하면 실명으로 회의록을 정리합니다.\n` +
+        `- 이름 입력이 없으면 약 ${AUTO_MINUTES_AFTER_MIN}분 후 화자1/화자2 표기로 자동 정리됩니다.`);
     }
   } catch (e) {
     // Fallback: if async diarization failed but we captured a live transcript,
