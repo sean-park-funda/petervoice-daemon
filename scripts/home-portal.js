@@ -2600,6 +2600,29 @@ document.addEventListener('click', e => {
       const port = cdpPortForDir(url.searchParams.get("dir"));
       if (!port) return json({ error: "잘못된 dir" }, 403);
       const s = await cdpConnect(port, url.searchParams.get("url") || "");
+      // 인계 종료 시 뷰포트 오버라이드 원복 — 에이전트가 세션을 이어받을 때
+      // 폰 크기 뷰포트가 남아 스크래핑이 모바일 레이아웃을 보게 되는 것을 방지
+      if (url.searchParams.get("reset") === "1") {
+        try { await cdpSend(s, "Emulation.clearDeviceMetricsOverride", {}); } catch {}
+        s.appliedViewport = "";
+        return json({ ok: true });
+      }
+      // 유저 창 크기에 원격 뷰포트를 맞춘다 (2026-08-19 개선):
+      // 폰으로 열면 원격 브라우저가 폰 크기(모바일 레이아웃)가 되어 화면을 꽉 채우고,
+      // dpr(최대 2)로 캡처 해상도를 올려 클라이언트 확대 시에도 글자가 선명하다.
+      // 파라미터가 없으면(구버전 웹) 기존 동작 그대로.
+      const vw = Math.min(2560, parseInt(url.searchParams.get("vw")) || 0);
+      const vh = Math.min(2560, parseInt(url.searchParams.get("vh")) || 0);
+      const dpr = Math.max(1, Math.min(2, parseInt(url.searchParams.get("dpr")) || 1));
+      if (vw >= 320 && vh >= 320) {
+        const want = vw + "x" + vh + "@" + dpr;
+        if (s.appliedViewport !== want) {
+          await cdpSend(s, "Emulation.setDeviceMetricsOverride", {
+            width: vw, height: vh, deviceScaleFactor: dpr, mobile: vw < 768,
+          });
+          s.appliedViewport = want;
+        }
+      }
       const [shot, metrics] = await Promise.all([
         cdpSend(s, "Page.captureScreenshot", { format: "jpeg", quality: 60 }),
         cdpSend(s, "Page.getLayoutMetrics", {}),
