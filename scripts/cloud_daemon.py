@@ -1781,13 +1781,24 @@ class CloudWorker:
     def _process_safe(self, msg: dict):
         key = (msg.get("user_id"), msg.get("project", "general") or "general")
         msg_id = msg.get("id")
+        lock = self._key_lock(*key)
+        # 같은 (유저, 프로젝트) 턴이 진행 중이면 **워커를 붙들지 않고** 물러난다.
+        # 블로킹 대기는 긴 턴 하나 + 같은 키 후속 메시지들이 워커 풀(5개)을 전부
+        # 잠식해, 다른 유저 메시지까지 픽업이 서는 wedge 를 만든다 (2026-08-19 뉴넥스 장애).
+        # 메시지는 아직 processed 전이므로 _spawned 에서 빼두면 다음 폴링에 다시 온다.
+        if not lock.acquire(blocking=False):
+            with self._spawned_guard:
+                self._spawned.discard(msg_id)
+            return
         try:
-            with self._key_lock(*key):
+            try:
                 if shutdown_event.is_set():
                     return  # 아직 시작 전 — processed 마킹도 안 됐으니 그대로 재전달된다
                 with self._spawned_guard:
                     self._inflight[msg_id] = msg
                 self.process(msg)
+            finally:
+                lock.release()
         except Exception as e:
             logger.error(f"process error msg #{msg_id}: {e}", exc_info=True)
             user = roster.get(msg.get("user_id"))
@@ -1807,6 +1818,28 @@ class CloudWorker:
     # 클라우드는 턴 시작 **전에** processed 를 마킹한다(2026-07-06 폴링 핫루프 사고 대응).
     # 그래서 턴 도중에 데몬이 죽으면 그 메시지는 다시 폴링되지 않고 **영구 유실**된다.
     # 종료 시 (1) 진행 중인 턴을 잠시 기다리고 (2) 그래도 안 끝난 것은 되돌려 재전달시킨다.
+
+    def handle_force_restart(self, user_ids) -> bool:
+        """웹 재시작 버튼(user_status.force_restart) 처리. True = 데몬 자체 재시작.
+
+        멀티테넌트라 재시작은 호스트 전체에 걸린다 — 진행 중 턴은 drain 후 requeue 로
+        재전달되므로 유실은 없다. **플래그 clear 가 성공했을 때만 재시작한다**
+        (clear 없이 재시작하면 기동 직후 플래그를 또 읽어 재시작 루프가 된다)."""
+        for uid in (user_ids or []):
+            if not user_allowed(uid):
+                continue
+            user = roster.get(uid)
+            if not user:
+                continue
+            ok = user_api(user["apiKey"], "PATCH", "/api/bot/status",
+                          {"force_restart": False})
+            if ok is None:
+                logger.error(f"force_restart clear failed user={uid} — 재시작 보류")
+                continue
+            logger.warning(f"force_restart requested by user={uid} — restarting daemon "
+                           "(systemd Restart=always 가 재기동)")
+            return True
+        return False
 
     def drain(self) -> int:
         """진행 중인 턴이 끝날 때까지 대기. 남은 개수를 반환(0이면 깨끗이 종료)."""
@@ -1944,6 +1977,8 @@ class CloudWorker:
                     continue
                 errors = 0
                 _set_usage_refresh(result.get("usage_refresh"))
+                if self.handle_force_restart(result.get("force_restart")):
+                    break  # → drain() → 프로세스 종료 → systemd 재기동
 
                 spawned_any = False
                 # 우선 큐: MAX 티어 메시지를 먼저 워커에 배정 (정렬은 안정적 — 같은 티어끼리는 도착순)
