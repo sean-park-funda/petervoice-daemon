@@ -1402,10 +1402,36 @@ def _load_usage_ok() -> set[int]:
 _usage_ok: set[int] = set()
 
 
+def _claude_account_email(user_id: int) -> str | None:
+    """유저 Claude 계정 이메일 (CLAUDE_CONFIG_DIR/.claude.json 의 oauthAccount).
+    맥 데몬의 배너 계정 표시(daemon/heartbeat.py)와 동일 기능 — 이 필드가 없으면
+    웹 UsageBanner 에 "어느 계정으로 로그인돼 있는지" 버튼 자체가 안 뜬다.
+    홈이 다른 uid 소유(700)라 직접 읽기 실패 시 sudo cat 으로 폴백."""
+    path = user_claude_dir(user_id) / ".claude.json"
+    text = None
+    try:
+        text = path.read_text(encoding="utf-8")
+    except Exception:
+        try:
+            r = subprocess.run(["sudo", "-n", "cat", str(path)],
+                               capture_output=True, text=True, timeout=5)
+            if r.returncode == 0:
+                text = r.stdout
+        except Exception:
+            pass
+    if not text:
+        return None
+    try:
+        return (json.loads(text).get("oauthAccount") or {}).get("emailAddress") or None
+    except Exception:
+        return None
+
+
 def collect_and_store_usage(user_id: int, api_key: str, allow_wake: bool = False) -> bool:
     limits = probe_usage(user_id, allow_wake=allow_wake)
     if not limits:
         return False
+    limits["account"] = _claude_account_email(user_id)
     if user_id not in _usage_ok:
         _usage_ok.add(user_id)
         try:
