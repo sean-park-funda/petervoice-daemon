@@ -804,7 +804,10 @@ def run_claude(
                 record_cap_hit(project, f"계정 한도(stderr:{_limit['kind']})", config)
                 _release_semaphore()
                 if _limit["kind"] == "session":
-                    start_account_cooldown("세션 한도", _limit.get("resets", ""))
+                    # account_name 을 빼먹으면 "default" 슬롯에 걸린다 — 정작 막힌 계정은
+                    # 계속 헛스폰하고 멀쩡한 default 프로젝트 전체가 멈춘다(스폰 검사는
+                    # account_name 으로 조회한다). 738행 stream 경로와 반드시 같은 키.
+                    start_account_cooldown("세션 한도", _limit.get("resets", ""), account_name)
                 elif _limit_retry == 0 and _fallback_model(model):
                     _fb = _fallback_model(model)
                     logger.warning(f"[{bot_name}] {model} limit (stderr) for {project} → falling back to {_fb}")

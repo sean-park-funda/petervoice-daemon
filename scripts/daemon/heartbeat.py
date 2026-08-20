@@ -12,6 +12,7 @@ import daemon.globals as g
 from daemon.globals import config, active_projects, active_projects_lock, shutdown_event, logger, CLAUDE_CMD
 from daemon.api import api_request, inject_system_message
 from daemon.supabase import get_project_dir
+from daemon.limits import clear_account_cooldown_if_stale
 
 
 # ─── Claude 사용 한도(/usage) 수집 — 주기(heartbeat) + 온디맨드(main loop) 공용 ───
@@ -74,6 +75,9 @@ def collect_and_store_usage() -> bool:
         return False
     api_request(api_key, "PATCH", "/api/bot/status", body={"usage_limits": limits}, timeout=10)
     logger.info(f"[usage] session={limits.get('session_pct')}% week={limits.get('week_pct')}%")
+    # 배너만 갱신하고 끝내면 안 된다 — 여기서 얻은 계정/사용률은 채팅을 막고 있는 쿨다운이
+    # 아직 유효한지 판정할 수 있는 유일한 신호다(재로그인·오파싱 자가복구).
+    clear_account_cooldown_if_stale(limits.get("account"), limits.get("session_pct"))
     return True
 
 

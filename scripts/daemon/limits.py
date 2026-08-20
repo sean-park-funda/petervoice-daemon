@@ -135,6 +135,11 @@ COOLDOWN_MAX_SEC = 6 * 3600      # 파싱이 틀려도 이 이상은 절대 멈�
 _cooldown_lock = threading.Lock()
 _cooldowns: dict[str, dict] = {}
 
+# 주기 /usage 가 알려주는 기본 계정 이메일. 바뀌면 = 재로그인 → 옛 쿨다운은 무효.
+_last_account_email: str | None = None
+# 이 아래면 "세션 한도"라는 판단이 틀린 것으로 본다(한도면 100% 근처여야 한다).
+USAGE_CLEAR_PCT = 90
+
 
 def _slot(account: str) -> dict:
     return _cooldowns.setdefault(
@@ -206,6 +211,37 @@ def clear_account_cooldown(account: str = "default") -> None:
         if slot["until"]:
             logger.info(f"[limits] 계정 한도 쿨다운 해제 (account={account}, 정상 응답 확인)")
             slot.update({"until": 0.0, "next_probe": 0.0, "reason": "", "resets": ""})
+
+
+def clear_account_cooldown_if_stale(email: str | None, session_pct: int | None) -> None:
+    """주기 /usage 수집이 부를 것 — 쿨다운이 이미 무의미해졌으면 스스로 푼다.
+
+    쿨다운은 데몬 메모리에만 있고 해제 경로가 "턴이 정상 완료됐을 때" 하나뿐이었다.
+    그래서 한도에 걸린 계정에서 **다른 계정으로 재로그인**하면, 배너(/usage)는 새 계정을
+    정상 표시하는데 채팅은 옛 계정의 리셋 시각까지 계속 막혀 있었다 — 쿨다운 키가 실제
+    Anthropic 계정이 아니라 config 라벨("default")이라 계정이 바뀐 걸 알 수도 없다.
+    (2026-08-20 실사고: 20:32~20:44, 카나리아 프로브가 풀 때까지 12분간 전 프로젝트 차단)
+
+    두 가지 신호로 푼다:
+      ① 계정 이메일이 바뀌었다 → 옛 계정의 한도는 이제 무관하다.
+      ② 세션 사용률에 여유가 있다 → 한도라는 판단 자체가 틀렸다(리셋 시각 오파싱 포함).
+
+    **"default" 슬롯만** 건드린다. /usage 는 계정 config dir 지정 없이 도므로 기본 계정의
+    상태만 말해준다 — 이걸로 다른 계정의 쿨다운까지 풀면 진짜 막힌 계정을 헛스폰시킨다.
+    """
+    global _last_account_email
+    with _cooldown_lock:
+        prev, _last_account_email = _last_account_email, email or _last_account_email
+        active = bool(_slot("default")["until"])
+    if not active:
+        return
+    if email and prev and email != prev:
+        logger.info(f"[limits] 계정 변경 감지 ({prev} → {email}) — 쿨다운 해제")
+        clear_account_cooldown("default")
+        return
+    if session_pct is not None and session_pct < USAGE_CLEAR_PCT:
+        logger.info(f"[limits] 세션 사용률 {session_pct}% (여유 있음) — 쿨다운 오판으로 보고 해제")
+        clear_account_cooldown("default")
 
 
 def account_cooldown_notice(account: str = "default") -> str | None:
