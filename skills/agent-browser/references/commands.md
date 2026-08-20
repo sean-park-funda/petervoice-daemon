@@ -218,6 +218,13 @@ agent-browser state load auth.json    # Restore saved state
 
 ```bash
 agent-browser --session <name> ...    # Isolated browser session
+agent-browser --restore [name] ...    # Auto-save/restore cookies + localStorage
+                                      # (no name = uses --session as the key)
+agent-browser --restore-save <policy> # auto | always | never (default: auto)
+agent-browser --restore-check-url <glob>   # Verify restored state by URL
+agent-browser --restore-check-text <txt>   # Verify restored state by page text
+agent-browser --restore-check-fn <js>      # Verify restored state by JS expression
+agent-browser --namespace <name> ...  # Namespace for session/restore storage
 agent-browser --json ...              # JSON output for parsing
 agent-browser --headed ...            # Show browser window (not headless)
 agent-browser --full ...              # Full page screenshot (-f)

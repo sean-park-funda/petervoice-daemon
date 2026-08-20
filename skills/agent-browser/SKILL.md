@@ -2,7 +2,7 @@
 name: agent-browser
 description: Browser automation CLI for AI agents. Use when the user needs to interact with websites, including navigating pages, filling forms, clicking buttons, taking screenshots, extracting data, testing web apps, or automating any browser task. Triggers include requests to "open a website", "fill out a form", "click a button", "take a screenshot", "scrape data from a page", "test this web app", "login to a site", "automate browser actions", or any task requiring programmatic web interaction.
 allowed-tools: Bash(npx agent-browser:*), Bash(agent-browser:*)
-pv_version: "1.3.0"
+pv_version: "1.4.0"
 ---
 
 # Browser Automation with agent-browser
@@ -120,17 +120,19 @@ agent-browser open https://app.example.com/dashboard
 ### Session Persistence
 
 ```bash
-# Auto-save/restore cookies and localStorage across browser restarts
-agent-browser --session-name myapp open https://app.example.com/login
+# Auto-save/restore cookies and localStorage across browser restarts.
+# --session 은 "브라우저 인스턴스 격리", --restore 는 "쿠키 영속화 키"로 별개다.
+# (--session-name 은 CLI 가 restore 키의 legacy alias 로 표기하는 옛 플래그다. 쓰지 마라.)
+agent-browser --session myapp --restore myapp open https://app.example.com/login
 # ... login flow ...
-agent-browser close  # State auto-saved to ~/.agent-browser/sessions/
+agent-browser --session myapp close  # State auto-saved to ~/.agent-browser/sessions/
 
 # Next time, state is auto-loaded
-agent-browser --session-name myapp open https://app.example.com/dashboard
+agent-browser --session myapp --restore myapp open https://app.example.com/dashboard
 
 # Encrypt state at rest
 export AGENT_BROWSER_ENCRYPTION_KEY=$(openssl rand -hex 32)
-agent-browser --session-name secure open https://app.example.com
+agent-browser --session secure --restore secure open https://app.example.com
 
 # Manage saved states
 agent-browser state list
