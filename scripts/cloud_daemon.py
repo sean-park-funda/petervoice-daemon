@@ -1486,10 +1486,13 @@ class UsageThread(threading.Thread):
         with roster._lock:
             return list(roster._users.values())
 
+    REFRESH_MAX_TRIES = 5  # 새로고침 재시도 상한 (30초 주기 → 최대 ~2.5분)
+
     def run(self):
         _usage_ok.update(_load_usage_ok())
         logger.info("[usage] thread started")
         shutdown_event.wait(30)  # 기동 직후 로스터 동기화 대기
+        retry_counts: dict[int, int] = {}  # uid → 새로고침 연속 실패 횟수
         while not shutdown_event.is_set():
             try:
                 now = time.time()
@@ -1500,18 +1503,36 @@ class UsageThread(threading.Thread):
                     if uid is None or not api_key:
                         continue
                     due = now - self._last.get(uid, 0) > USAGE_INTERVAL_SEC
-                    if not due:
-                        # 배너 새로고침 버튼 요청 — 폴링 응답이 실어다 준 목록으로 판단한다.
-                        # 유저마다 GET /api/bot/status 를 때리면 안 쓰는 유저까지
-                        # 하루 2,880회가 붙는다(가입자 수에 선형 비례).
-                        if not _usage_refresh_wanted(uid):
-                            continue
+                    # 배너 새로고침 버튼 요청 — 폴링 응답이 실어다 준 목록으로 판단한다.
+                    # 유저마다 GET /api/bot/status 를 때리면 안 쓰는 유저까지
+                    # 하루 2,880회가 붙는다(가입자 수에 선형 비례).
+                    refresh = _usage_refresh_wanted(uid)
+                    if not due and not refresh:
+                        continue
+                    self._last[uid] = time.time()
+                    # 직렬 실행 (부하 제한). 값이 한 번도 없는 유저와 명시적 새로고침은
+                    # 컨테이너를 깨워서라도 수집 (버튼을 누른 유저는 지금 값을 원한다)
+                    ok = collect_and_store_usage(
+                        uid, api_key, allow_wake=(refresh or uid not in _usage_ok))
+                    if not refresh:
+                        continue
+                    # 새로고침 플래그는 **성공했을 때만** 내린다. 실패를 조용히 삼키면
+                    # 버튼이 "눌렀는데 안 바뀜"이 된다 (2026-08-20 뉴넥스 재로그인 직후 실측).
+                    # /usage 가 계속 실패하는 환경(미로그인 등)에서 무한 재시도가 되지 않게
+                    # 상한 후에는 포기 로그를 남기고 내린다.
+                    if ok or retry_counts.get(uid, 0) + 1 >= self.REFRESH_MAX_TRIES:
+                        if not ok:
+                            logger.warning(f"[usage] on-demand refresh gave up user={uid} "
+                                           f"({self.REFRESH_MAX_TRIES} tries)")
+                        else:
+                            logger.info(f"[usage] on-demand refresh done user={uid}")
                         user_api(api_key, "PATCH", "/api/bot/status",
                                  {"usage_refresh": False})
-                        logger.info(f"[usage] on-demand refresh user={uid}")
-                    self._last[uid] = time.time()
-                    # 직렬 실행 (부하 제한). 아직 값이 한 번도 없는 유저는 컨테이너를 깨워서라도 수집
-                    collect_and_store_usage(uid, api_key, allow_wake=(uid not in _usage_ok))
+                        retry_counts.pop(uid, None)
+                    else:
+                        retry_counts[uid] = retry_counts.get(uid, 0) + 1
+                        logger.info(f"[usage] on-demand refresh failed user={uid} — "
+                                    f"retry {retry_counts[uid]}/{self.REFRESH_MAX_TRIES}")
             except Exception as e:
                 logger.error(f"[usage] loop error: {e}", exc_info=True)
             shutdown_event.wait(USAGE_REFRESH_POLL_SEC)
