@@ -2,7 +2,7 @@
 name: agent-browser
 description: Browser automation CLI for AI agents. Use when the user needs to interact with websites, including navigating pages, filling forms, clicking buttons, taking screenshots, extracting data, testing web apps, or automating any browser task. Triggers include requests to "open a website", "fill out a form", "click a button", "take a screenshot", "scrape data from a page", "test this web app", "login to a site", "automate browser actions", or any task requiring programmatic web interaction.
 allowed-tools: Bash(npx agent-browser:*), Bash(agent-browser:*)
-pv_version: "1.1.0"
+pv_version: "1.2.0"
 ---
 
 # Browser Automation with agent-browser
@@ -260,6 +260,14 @@ When dealing with consistently slow websites, use `wait --load networkidle` afte
    `--session`은 CDP를 거치지 않는 독립 브라우저 인스턴스(쿠키·스토리지 분리)를 만들고, `--restore <키>`는 쿠키를 파일로 주기 저장해 인스턴스가 죽어도 복원한다.
 4. **로그인이 필요한 전용 세션**: login-manager(로그인 관리) 프로젝트가 있는 환경에서는 세션명을 명시해 릴레이로 요청하면 그 세션에 로그인해 넘겨준다.
 5. **구글은 헤드리스 브라우저 로그인을 차단한다** ("브라우저 또는 앱이 안전하지 않을 수 있습니다"). 구글 로그인 세션을 유지해야 하는 공유 브라우저는 headful(일반 창) 모드로 운영할 것 — `--headless=new`로 재기동하면 세션이 깨진다.
+
+6. **작업이 끝나면 반드시 닫아라 — `agent-browser close`** (전용 세션이면 `--session <이름> close`).
+   닫지 않으면 임시 프로필 크롬이 그대로 남는다. 인스턴스 하나가 렌더러·GPU·네트워크 헬퍼
+   9~11 프로세스를 물고 있어서, 며칠치가 쌓이면 기계가 마비된다 — 2026-08-20 맥미니 실사고:
+   방치된 인스턴스 14개(121 프로세스)가 CPU 575%를 먹어 로드 애버리지가 158까지 올랐다
+   (10코어 기준 정상은 10 안팎). 가장 오래된 것은 13일째 돌고 있었다.
+   운영 머신에는 24시간 넘은 인스턴스를 정리하는 리퍼(`scripts/ops/agent-browser-reaper.sh`)를
+   걸어두지만, **그건 안전망이지 면허가 아니다.** 쓴 사람이 닫아라.
 
 ## Session Management and Cleanup
 
