@@ -29,6 +29,8 @@ class SecretsSyncer(threading.Thread):
         super().__init__(daemon=True, name="secrets-syncer")
         self.api_key = config["api_key"]
         self._last_google_refresh_token: str | None = None
+        # 키체인 접근이 GUI 인증창에 막힌 적이 있으면 True — 이후 시도 중단
+        self._keyring_blocked = False
         # 직전 싱크에서 주입한 시크릿 키 집합 — 이번에 사라진 키를 os.environ에서 제거하기 위해 추적
         self._synced_keys: set[str] = set()
 
@@ -44,6 +46,11 @@ class SecretsSyncer(threading.Thread):
         # Skip if token hasn't changed since last sync
         if refresh_token == self._last_google_refresh_token:
             return
+
+        # 시도 전에 먼저 마킹 — 키체인이 GUI 인증창을 띄워 블록되면 이 함수는
+        # 영영 반환하지 않는다. 아래에서 마킹하면 60초마다 새 스레드+새 인증창이
+        # 무한히 쌓인다(실측: 3시간에 166개). 실패해도 재시도하지 않는 편이 안전하다.
+        self._last_google_refresh_token = refresh_token
 
         try:
             import keyring
@@ -74,7 +81,6 @@ class SecretsSyncer(threading.Thread):
             except Exception:
                 pass
 
-        self._last_google_refresh_token = refresh_token
         if updated:
             logger.info(f"[secrets] Google keyring synced for: {', '.join(updated)}")
 
@@ -118,11 +124,18 @@ class SecretsSyncer(threading.Thread):
 
         # Sync Google tokens to keyring — run in a separate thread with timeout
         # to prevent blocking on headless keychain GUI prompts (launchd context)
-        t = threading.Thread(target=self._sync_google_keyring, daemon=True)
-        t.start()
-        t.join(timeout=5)
-        if t.is_alive():
-            logger.warning("[secrets] keyring sync timed out (headless keychain), skipping")
+        # 한 번 막히면 이 데몬 수명 동안 다시 시도하지 않는다 (인증창 누적 방지).
+        # Google 스킬들은 keyring 없이 환경변수(GOOGLE_REFRESH_TOKEN)로도 동작한다.
+        if not self._keyring_blocked:
+            t = threading.Thread(target=self._sync_google_keyring, daemon=True)
+            t.start()
+            t.join(timeout=5)
+            if t.is_alive():
+                self._keyring_blocked = True
+                logger.warning(
+                    "[secrets] keyring sync blocked (keychain prompt/locked) — "
+                    "disabled for this daemon run; Google skills use env vars instead"
+                )
 
     def run(self):
         logger.info("[secrets] Syncer started")
