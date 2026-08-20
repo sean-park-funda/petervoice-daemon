@@ -21,6 +21,14 @@ started=""
 if ! curl -sf -m 2 "http://127.0.0.1:$CDP_PORT/json/version" >/dev/null 2>&1; then
   BIN=""
   HEADLESS_FLAG="--headless=new"
+  # 맥에 GUI 콘솔 세션이 있으면 헤드리스를 쓰지 않는다 (일반 모드).
+  # 구글은 헤드리스 크롬의 로그인을 차단한다("브라우저 또는 앱이 안전하지 않을 수 있습니다") —
+  # 헤드리스로 뜨면 구글/유튜브/애드센스/슬랙(구글 연동) 세션을 아예 복구할 수 없다.
+  # 클라우드 컨테이너·리눅스는 화면이 없으므로 헤드리스를 유지한다.
+  if [ "$(uname)" = "Darwin" ] && [ -n "$(stat -f%Su /dev/console 2>/dev/null)" ] \
+     && [ "$(stat -f%Su /dev/console 2>/dev/null)" != "root" ]; then
+    HEADLESS_FLAG=""
+  fi
   if [ "$(uname)" = "Darwin" ]; then
     # macOS (설치형/맥미니): 설치된 Chrome/Chromium 우선, 없으면 playwright 캐시
     for c in "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
@@ -47,6 +55,21 @@ if ! curl -sf -m 2 "http://127.0.0.1:$CDP_PORT/json/version" >/dev/null 2>&1; th
   fi
 
   mkdir -p "$HOME/.pv-browser"
+  # 헤드리스가 아니면(맥 GUI) 크롬 창이 고객 화면에 실제로 보인다. 빈 about:blank 창이
+  # 갑자기 뜨면 무슨 창인지 알 수 없으므로, 정체를 알리는 랜딩 탭으로 띄운다.
+  START_URL="about:blank"
+  if [ -z "$HEADLESS_FLAG" ] && [ "$(uname)" = "Darwin" ]; then
+    cat > "$HOME/.pv-browser/landing.html" << 'LANDING'
+<!doctype html><meta charset="utf-8"><title>피터보이스 공유 브라우저</title>
+<style>body{margin:0;height:100vh;display:flex;flex-direction:column;align-items:center;
+justify-content:center;font-family:-apple-system,BlinkMacSystemFont,sans-serif;color:#374151;
+background:#f9fafb}h1{font-size:20px;margin:0 0 8px}p{font-size:13px;color:#6b7280;margin:2px 0}</style>
+<h1>피터보이스 공유 브라우저</h1>
+<p>AI 비서가 웹사이트 작업에 사용하는 창입니다. 닫지 말고 그대로 두세요.</p>
+<p>로그인 화면이 뜨면 직접 로그인해 주시면 비서가 이어서 진행합니다.</p>
+LANDING
+    START_URL="file://$HOME/.pv-browser/landing.html"
+  fi
   # set -m: 백그라운드 잡을 자기 프로세스 그룹으로 분리한다. 없으면 chromium 이 이 스크립트를
   # 부른 부모(에이전트 턴 셸/데몬)의 프로세스 그룹에 남아, 부모 정리(타임아웃 킬, 서비스 재시작,
   # 프로세스 그룹 킬)에 브라우저가 같이 죽는다 — 2026-08-18 저녁 chromium 원인불명 사망 후 예방 조치.
@@ -59,7 +82,7 @@ if ! curl -sf -m 2 "http://127.0.0.1:$CDP_PORT/json/version" >/dev/null 2>&1; th
     --disable-gpu \
     --window-size=1280,800 \
     --user-data-dir="$HOME/.pv-browser" \
-    about:blank >/dev/null 2>&1 &
+    "$START_URL" >/dev/null 2>&1 &
   started="chromium"
 fi
 
