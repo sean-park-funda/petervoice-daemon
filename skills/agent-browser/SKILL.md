@@ -2,7 +2,7 @@
 name: agent-browser
 description: Browser automation CLI for AI agents. Use when the user needs to interact with websites, including navigating pages, filling forms, clicking buttons, taking screenshots, extracting data, testing web apps, or automating any browser task. Triggers include requests to "open a website", "fill out a form", "click a button", "take a screenshot", "scrape data from a page", "test this web app", "login to a site", "automate browser actions", or any task requiring programmatic web interaction.
 allowed-tools: Bash(npx agent-browser:*), Bash(agent-browser:*)
-pv_version: "1.2.0"
+pv_version: "1.3.0"
 ---
 
 # Browser Automation with agent-browser
@@ -251,6 +251,8 @@ When dealing with consistently slow websites, use `wait --load networkidle` afte
 1. **CDP 공유 브라우저(`--cdp 9222`)의 활성 탭 포인터는 모든 접속자가 공유한다.** `--session`을 나눠도 다른 에이전트가 `open`을 실행하면 활성 탭이 그쪽으로 이동해 내 명령이 남의 탭에 들어간다. 공유 브라우저에서는:
    - `tab new`로 내 탭을 만들고 탭 id(tN)를 확보
    - **매 명령 직전 `tab tN`으로 내 탭을 다시 활성화**
+   - **일이 끝나면 `tab close` 로 내 탭을 닫아라.** 이 지침이 탭을 만들라고 시키는 만큼
+     안 닫으면 공유 브라우저에 탭이 쌓인다 — 남들이 계속 쓰는 브라우저라 아무도 안 치운다.
    - 이 완화책도 완전하지 않으므로 **짧은 조회에만** 공유 브라우저를 사용
 2. **별도 CDP 포트(9223 등)를 띄워도 격리되지 않는다.** agent-browser가 실행 중인 CDP 브라우저를 자동 탐색해 붙기 때문에 몇 초 만에 다른 에이전트의 페이지가 흘러들어온다. 포트 분리는 해법이 아니다.
 3. **긴 작업(폼 작성·결제·다단계 플로우)은 반드시 전용 세션으로:**
@@ -261,7 +263,13 @@ When dealing with consistently slow websites, use `wait --load networkidle` afte
 4. **로그인이 필요한 전용 세션**: login-manager(로그인 관리) 프로젝트가 있는 환경에서는 세션명을 명시해 릴레이로 요청하면 그 세션에 로그인해 넘겨준다.
 5. **구글은 헤드리스 브라우저 로그인을 차단한다** ("브라우저 또는 앱이 안전하지 않을 수 있습니다"). 구글 로그인 세션을 유지해야 하는 공유 브라우저는 headful(일반 창) 모드로 운영할 것 — `--headless=new`로 재기동하면 세션이 깨진다.
 
-6. **작업이 끝나면 반드시 닫아라 — `agent-browser close`** (전용 세션이면 `--session <이름> close`).
+6. **여러 사이트를 훑을 때 탭을 새로 만들지 마라.** `open` 은 현재 탭을 재사용하므로
+   (실측 확인) 사이트 목록을 도는 벤치마킹·조사에는 `open` 을 반복하면 그만이다.
+   `tab new` 는 탭을 실제로 늘리고, 탭 하나가 렌더러 프로세스 하나다. 로그인 플로우나
+   `target=_blank` 링크가 저절로 연 탭도 다 쓰고 나면 `tab close` 로 닫아라
+   (2026-08-20: 로그인 자동화가 성공 페이지를 100개 넘게 쌓아 CPU 100%를 25시간 먹었다).
+
+7. **작업이 끝나면 반드시 닫아라 — `agent-browser close`** (전용 세션이면 `--session <이름> close`).
    닫지 않으면 임시 프로필 크롬이 그대로 남는다. 인스턴스 하나가 렌더러·GPU·네트워크 헬퍼
    9~11 프로세스를 물고 있어서, 며칠치가 쌓이면 기계가 마비된다 — 2026-08-20 맥미니 실사고:
    방치된 인스턴스 14개(121 프로세스)가 CPU 575%를 먹어 로드 애버리지가 158까지 올랐다

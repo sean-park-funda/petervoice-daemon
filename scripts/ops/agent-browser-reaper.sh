@@ -25,6 +25,7 @@
 
 set -uo pipefail
 MAX_AGE_HOURS="${AGENT_BROWSER_MAX_AGE_HOURS:-24}"
+TAB_WARN="${AGENT_BROWSER_TAB_WARN:-15}"        # 이 이상 쌓이면 경고
 DRY_RUN="${DRY_RUN:-0}"
 PATTERN="agent-browser-chrome-"
 AB_DIR="$HOME/.agent-browser"
@@ -118,6 +119,38 @@ for cfg in "$AB_DIR"/*.config; do
   cleaned=$((cleaned + 1))
 done
 [ "$cleaned" -gt 0 ] && log "cleaned runtime files for $cleaned dead session(s)"
+
+# ── ④ 탭 누적 조기 경보 ───────────────────────────────────────
+# 살아 있는 세션 안에서 탭이 쌓이는 건 위 어느 단계에도 안 걸린다(활동 중인 세션은 오히려
+# 보호 대상이다). 탭 하나가 렌더러 프로세스 하나라 방치하면 결국 같은 사고가 난다 —
+# 2026-08-20 에 100개 넘게 쌓인 인스턴스가 CPU 100%를 25시간 먹었다.
+# **닫지는 않는다.** 작업 중인 탭을 뺏으면 진행 중인 일이 깨지므로 로그로만 알린다.
+count_tabs() {  # 세션명 → 탭 수 (실패하면 빈 값)
+  agent-browser --session "$1" tab list 2>/dev/null | grep -c '\[t'
+}
+
+for pidfile in "$AB_DIR"/*.pid; do
+  [ -e "$pidfile" ] || continue
+  name=$(basename "$pidfile" .pid)
+  pid=$(cat "$pidfile" 2>/dev/null)
+  [ -n "${pid:-}" ] && ps -p "$pid" >/dev/null 2>&1 || continue
+  # 크롬을 물고 있는 세션만 센다 — 크롬이 없으면 쌓일 탭도 없고, 괜히 세션 소켓을
+  # 두드릴 이유도 없다. (tab list 자체가 브라우저를 띄우지는 않는 것은 실측 확인)
+  pgrep -P "$pid" 2>/dev/null | xargs -I{} ps -o command= -p {} 2>/dev/null \
+    | grep -q "Google Chrome" || continue
+  tabs=$(count_tabs "$name")
+  if [ -n "$tabs" ] && [ "$tabs" -ge "$TAB_WARN" ]; then
+    log "WARN session '$name' has $tabs tabs — 닫지 않은 탭이 쌓이는 중 (owner=$(owner_of "$name"))"
+  fi
+done
+
+# 공유 브라우저(CDP 9222)도 같은 이유로 본다. 여러 에이전트가 tab new 로 탭을 만들도록
+# 안내받는 곳이라 아무도 안 치우면 여기부터 쌓인다.
+shared_tabs=$(curl -sf -m 3 http://127.0.0.1:9222/json/list 2>/dev/null \
+  | grep -c '"type": *"page"')
+if [ -n "$shared_tabs" ] && [ "$shared_tabs" -ge "$TAB_WARN" ]; then
+  log "WARN shared browser (CDP 9222) has $shared_tabs tabs — 에이전트들이 tab close 를 안 하고 있다"
+fi
 
 if [ $((killed_chrome + killed_srv + cleaned)) -gt 0 ]; then
   log "summary: chrome=$killed_chrome server=$killed_srv files=$cleaned"
