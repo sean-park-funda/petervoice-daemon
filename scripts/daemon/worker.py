@@ -401,9 +401,6 @@ class Worker(threading.Thread):
 
         # D8: skip post-processing for team projects (already handled inside process_team_message)
         if not _is_team:
-            if tool_lines:
-                self.reply("\n".join(tool_lines), reply_to=[msg_id], project=project, is_final=True, subtype="tool_log")
-
             # Rewriter — skip for manager-injected messages
             from daemon.manager.thread import ManagerThread
             is_manager_msg = text.startswith(ManagerThread.MANAGER_PREFIX)
@@ -417,6 +414,10 @@ class Worker(threading.Thread):
                     _msg_text = rewrite_for_voice(_msg_text)
                 for chunk in _split_text_chunks(_msg_text):
                     self.reply(chunk, reply_to=[msg_id], project=project, is_final=True)
+
+            # 도구 로그는 본문 뒤에 보낸다 — 스트리밍 중 레이아웃(버블 위·도구 아래)과 완료 후 배치를 맞춤
+            if tool_lines:
+                self.reply("\n".join(tool_lines), reply_to=[msg_id], project=project, is_final=True, subtype="tool_log")
 
         self.reply("", reply_to=None, project=project, is_final=False)
 

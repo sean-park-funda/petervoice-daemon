@@ -617,8 +617,14 @@ def run_claude(
                         if tool_name:
                             tool_lines.append(f"🔧 {tool_name}{tool_detail}")
                             if stream_to_chat:
+                                # 주기 틱과 동일한 포맷(도구줄 + 텍스트)으로 보낸다.
+                                # 도구줄만 보내면 이미 보이던 중간 텍스트가 사라졌다 되살아나며
+                                # 웹 버블이 깜빡인다 (2026-08-20 브랜치 #51).
+                                _stream_txt = "\n".join(tool_lines)
+                                if response_text:
+                                    _stream_txt += "\n\n" + response_text
                                 api_request(api_key, "POST", "/api/bot/reply", {
-                                    "text": "\n".join(tool_lines), "project": project, "is_final": False,
+                                    "text": _stream_txt, "project": project, "is_final": False,
                                 })
                     elif block.get("type") == "text":
                         # 도구 앞뒤의 모든 텍스트를 여기서 수집한다 (유일하게 완전한 소스)
