@@ -89,6 +89,14 @@ for pidfile in "$AB_DIR"/*.pid; do
   if pgrep -P "$pid" 2>/dev/null | xargs -I{} ps -o command= -p {} 2>/dev/null | grep -q "Google Chrome"; then
     continue
   fi
+  # 최근에 restore 쿠키가 저장된 세션은 사용 중으로 본다. agent-browser 는 세션이 살아 있는
+  # 동안 쿠키를 주기적으로 파일에 쓰므로, 이 파일의 mtime 이 곧 마지막 활동 시각이다.
+  # 크롬이 잠깐 닫힌 순간에 서버가 정리되는 것을 막는다 — 로그인 세션을 든 채로
+  # 다단계 폼을 작성하는 작업(pv4-inicis 등)이 여기 걸린다.
+  if [ -n "$(find "$AB_DIR/sessions" -name "$name-*.json" -newermt "-${MAX_AGE_HOURS} hours" 2>/dev/null)" ]; then
+    continue
+  fi
+
   age=$(etime_hours "$et")
   if [ "$age" -ge "$MAX_AGE_HOURS" ]; then
     log "reap server '$name' (age=${age}h, no chrome, owner=$(owner_of "$name"))"
