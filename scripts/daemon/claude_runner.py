@@ -600,7 +600,9 @@ def run_claude(
                         tool_input = block.get("input", {})
                         tool_detail = ""
                         if tool_name == "Bash":
-                            c = tool_input.get("command", "")
+                            # 여러 줄 명령(heredoc 등)의 줄바꿈을 한 줄로 접는다 — 줄바꿈이 남으면
+                            # 웹이 둘째 줄부터를 본문 텍스트로 오인해 버블에 코드 조각이 섞여 보인다 (2026-08-20)
+                            c = " ".join(tool_input.get("command", "").split())
                             tool_detail = f": {c[:80]}" if c else ""
                         elif tool_name in ("Read", "Write", "Edit"):
                             fp = tool_input.get("file_path", "")
@@ -1221,7 +1223,7 @@ def run_codex(prompt: str, project: str, _retry_count: int = 0) -> tuple[str, st
 
                 elif item_type == "command":
                     cmd_str = item.get("exec_command", "")
-                    tool_lines.append(f"🔧 Shell: {cmd_str[:80]}")
+                    tool_lines.append(f"🔧 Shell: {' '.join(str(cmd_str).split())[:80]}")
                     api_request(api_key, "POST", "/api/bot/reply", {
                         "text": "\n".join(tool_lines), "project": project, "is_final": False,
                     })
