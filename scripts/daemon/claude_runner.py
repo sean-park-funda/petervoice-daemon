@@ -375,7 +375,7 @@ def run_claude(
     # 계정 세션 한도 쿨다운 중이면 CLI 를 아예 띄우지 않는다. 계정 한도는 프로젝트들이
     # 나눠 쓰는 자원이라, 한 프로젝트가 계속 찔러대면 다른 프로젝트의 자율 루프까지 죽는다.
     # (2026-08-18 02:18~02:36 릴레이 백로그가 18분간 201회 헛스폰한 실사고)
-    _cooldown_msg = account_cooldown_notice(account_name)
+    _cooldown_msg = account_cooldown_notice(account_name, account_config_dir)
     if _cooldown_msg:
         logger.warning(f"[limits] {project}: 계정 한도 쿨다운 중 — 스폰 생략 (account={account_name})")
         return (_cooldown_msg, sid, [], False)
@@ -735,7 +735,7 @@ def run_claude(
                                     stream_to_chat=stream_to_chat, segments_out=segments_out,
                                     model_override=_fb, _limit_retry=_limit_retry + 1)
                             return (usage_limit_notice(_limit), new_session_id, tool_lines, False)
-                        start_account_cooldown("세션 한도", _limit.get("resets", ""), account_name)
+                        start_account_cooldown("세션 한도", _limit.get("resets", ""), account_name, account_config_dir)
                         return (usage_limit_notice(_limit), new_session_id, tool_lines, False)
                     if "could not process image" in error_text.lower() or "invalid_request_error" in error_text.lower():
                         logger.warning(f"[{bot_name}] Image/request error for {project}, resetting session (retry {_retry_count + 1})")
@@ -807,7 +807,7 @@ def run_claude(
                     # account_name 을 빼먹으면 "default" 슬롯에 걸린다 — 정작 막힌 계정은
                     # 계속 헛스폰하고 멀쩡한 default 프로젝트 전체가 멈춘다(스폰 검사는
                     # account_name 으로 조회한다). 738행 stream 경로와 반드시 같은 키.
-                    start_account_cooldown("세션 한도", _limit.get("resets", ""), account_name)
+                    start_account_cooldown("세션 한도", _limit.get("resets", ""), account_name, account_config_dir)
                 elif _limit_retry == 0 and _fallback_model(model):
                     _fb = _fallback_model(model)
                     logger.warning(f"[{bot_name}] {model} limit (stderr) for {project} → falling back to {_fb}")

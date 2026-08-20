@@ -138,24 +138,31 @@ _cooldowns: dict[str, dict] = {}
 # 이 아래면 "세션 한도"라는 판단이 틀린 것으로 본다(한도면 100% 근처여야 한다).
 USAGE_CLEAR_PCT = 90
 
-_CLAUDE_JSON = Path(os.path.expanduser("~/.claude.json"))
-_email_cache: dict = {"mtime": 0.0, "email": None}
+# 경로별 캐시 — 계정마다 파일이 다르므로 단일 슬롯으로 두면 계정 간에 값이 서로 덮인다.
+_email_cache: dict[str, dict] = {}
 
 
-def claude_account_email() -> str | None:
-    """데몬이 지금 쓰는 Claude Code 계정 이메일 (~/.claude.json oauthAccount).
+def claude_account_email(config_dir: str | None = None) -> str | None:
+    """해당 계정의 Claude Code 로그인 이메일 (oauthAccount.emailAddress).
 
-    ~/.claude.json 은 수 MB까지 커지므로 mtime 이 변할 때만 다시 파싱한다. 호출부도
-    쿨다운이 실제로 걸려 있을 때만 부른다 — 평상시 스폰 경로에는 부담이 없다.
+    계정마다 CLAUDE_CONFIG_DIR 이 다르고 설정 파일도 그 안에 따로 있다. config_dir 를
+    무시하고 기본 계정 파일만 읽으면, secondary 슬롯에 기본 계정 이메일이 기록돼
+    "기본 계정 재로그인"이 secondary 쿨다운을 풀어버린다(= 진짜 막힌 계정으로 헛스폰).
+
+    파일이 수 MB까지 커지므로 mtime 이 변할 때만 다시 파싱한다. 호출부도 쿨다운이
+    실제로 걸려 있을 때만 부른다 — 평상시 스폰 경로에는 부담이 없다.
     """
+    path = (Path(os.path.expanduser(config_dir)) / ".claude.json"
+            if config_dir else Path(os.path.expanduser("~/.claude.json")))
+    slot = _email_cache.setdefault(str(path), {"mtime": 0.0, "email": None})
     try:
-        mtime = _CLAUDE_JSON.stat().st_mtime
-        if mtime != _email_cache["mtime"]:
-            with _CLAUDE_JSON.open(encoding="utf-8") as f:
+        mtime = path.stat().st_mtime
+        if mtime != slot["mtime"]:
+            with path.open(encoding="utf-8") as f:
                 data = json.load(f)
-            _email_cache["email"] = (data.get("oauthAccount") or {}).get("emailAddress") or None
-            _email_cache["mtime"] = mtime
-        return _email_cache["email"]
+            slot["email"] = (data.get("oauthAccount") or {}).get("emailAddress") or None
+            slot["mtime"] = mtime
+        return slot["email"]
     except Exception:
         return None
 
@@ -204,7 +211,8 @@ def detect_usage_limit(text: str) -> dict | None:
     return None
 
 
-def start_account_cooldown(reason: str, resets: str = "", account: str = "default") -> float:
+def start_account_cooldown(reason: str, resets: str = "", account: str = "default",
+                           config_dir: str | None = None) -> float:
     """계정 한도 쿨다운 시작. 쿨다운 종료 epoch 반환."""
     ts = _parse_reset_ts(resets)
     now = time.time()
@@ -216,7 +224,7 @@ def start_account_cooldown(reason: str, resets: str = "", account: str = "defaul
             slot.update({"until": until, "reason": reason, "resets": resets,
                          "next_probe": now + COOLDOWN_PROBE_INTERVAL,
                          # 한도에 걸린 게 "어느 계정"이었는지. 이게 바뀌면 = 재로그인.
-                         "email": claude_account_email()})
+                         "email": claude_account_email(config_dir)})
         else:
             until = slot["until"]
     logger.warning(
@@ -260,7 +268,7 @@ def clear_account_cooldown_if_stale(session_pct: int | None) -> None:
         clear_account_cooldown("default")
 
 
-def account_cooldown_notice(account: str = "default") -> str | None:
+def account_cooldown_notice(account: str = "default", config_dir: str | None = None) -> str | None:
     """쿨다운 중이면 사용자에게 보낼 안내를 돌려준다(=CLI 스폰 생략).
 
     None 이면 실행해도 된다. 쿨다운 중이라도 COOLDOWN_PROBE_INTERVAL 마다 한 번은
@@ -281,7 +289,7 @@ def account_cooldown_notice(account: str = "default") -> str | None:
     # 계정을 확인하지 않으면 옛 계정의 리셋 시각까지 채팅이 계속 막힌다(2026-08-20 실사고).
     # 파일 읽기는 쿨다운이 걸려 있는 동안에만 일어나고 mtime 캐시가 걸려 있다.
     if started_with:
-        current = claude_account_email()
+        current = claude_account_email(config_dir)
         if current and current != started_with:
             logger.info(f"[limits] 계정 변경 감지 ({started_with} → {current}) — 쿨다운 즉시 해제")
             clear_account_cooldown(account)

@@ -1,6 +1,5 @@
 """Heartbeat thread: periodically inject due task messages."""
 
-import json
 import os
 import re
 import subprocess
