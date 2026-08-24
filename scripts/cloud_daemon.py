@@ -1424,12 +1424,20 @@ _usage_last_lock = threading.Lock()
 # 메인 루프가 3초마다 갱신하고 사용량 스레드가 읽는다 — 유저별 status 조회를 없애기 위함.
 _usage_refresh: set[int] = set()
 _usage_refresh_lock = threading.Lock()
+# 새 새로고침 요청이 폴링에 실려 오면 UsageThread 를 즉시 깨운다. 이게 없으면 버튼을 눌러도
+# 30초 루프가 돌아올 때까지 기다려야 해서 웹 배너 스피너(25초 안전장치)가 먼저 포기하고
+# 옛 값을 보여준 뒤 몇 초 뒤에야 값이 바뀌는 것처럼 보였다 (2026-08-24 뉴넥스 재로그인 실측).
+_usage_wake = threading.Event()
 
 
 def _set_usage_refresh(user_ids) -> None:
+    wanted = {int(u) for u in (user_ids or [])}
     with _usage_refresh_lock:
+        new = wanted - _usage_refresh
         _usage_refresh.clear()
-        _usage_refresh.update(int(u) for u in (user_ids or []))
+        _usage_refresh.update(wanted)
+    if new:
+        _usage_wake.set()
 
 
 def _usage_refresh_wanted(user_id: int) -> bool:
@@ -1508,7 +1516,9 @@ class UsageThread(threading.Thread):
                                     f"retry {retry_counts[uid]}/{self.REFRESH_MAX_TRIES}")
             except Exception as e:
                 logger.error(f"[usage] loop error: {e}", exc_info=True)
-            shutdown_event.wait(USAGE_REFRESH_POLL_SEC)
+            # 30초 주기 대기 — 단, 새 새로고침 요청이 오면 즉시 깨어난다
+            _usage_wake.wait(USAGE_REFRESH_POLL_SEC)
+            _usage_wake.clear()
         logger.info("[usage] thread stopped")
 
 
