@@ -43,7 +43,7 @@ Peter Voice — 음성 기반 AI 어시스턴트 플랫폼.
 | 34 | [클라우드 데몬](./34-cloud-daemon.md) | 멀티테넌트 공용 데몬, daemon_target 유저 모델, 유저 격리(uid/ACL), 클로드 로그인, 클라우드 문서탭 |
 | 35 | [원격 로그인 인계](./35-browser-handoff.md) | browser-handoff 스킬 — 로그인 벽을 유저 원격 로그인으로 해소 |
 | 36 | [브라우저 자동화 동시 사용](./36-browser-automation.md) | 공유 브라우저(CDP 9222) vs 전용 세션(--session/--restore), 탭 덮어쓰기 방지, 구글 헤드리스 차단 |
-| 37. [데몬 자가진단 (`데몬 진단`)](37-daemon-selfcheck.md) | 공유 브라우저(CDP 9222) vs 전용 세션(--session/--restore), 탭 덮어쓰기 방지, 구글 헤드리스 차단 |
+| 37 | [데몬 자가진단](./37-daemon-selfcheck.md) | 채팅에 `데몬 진단` 입력 → 데몬이 직접 상태 리포트(코드 버전·서비스·사용량 스레드·/usage 프로브·고아 턴·최근 로그), 턴 미소비, 외부 릴레이 요청자에게 자동 회신 |
 
 ---
 
