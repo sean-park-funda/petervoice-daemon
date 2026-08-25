@@ -392,7 +392,7 @@ def exec_claude_turn(user_id: int, project: str, prompt: str,
     ws = f"/home/agent/workspace/{project if re.fullmatch(r'[a-z0-9_-]{1,60}', project or '') else 'general'}"
     _podman("exec", name(user_id), "mkdir", "-p", f"{ws}/docs", timeout=15)
 
-    cmd = ["claude", "-p", "--output-format", "json", "--dangerously-skip-permissions"]
+    cmd = ["claude", "-p", "--output-format", "stream-json", "--verbose", "--dangerously-skip-permissions"]
     if model:
         cmd += ["--model", model]
     if effort:

@@ -1071,7 +1071,9 @@ def run_claude_turn(user_id: int, project: str, prompt: str) -> tuple[str, str]:
     claude_cmd = config.get("claude_cmd", "claude")
     cmd = [
         claude_cmd, "-p",
-        "--output-format", "json",
+        # stream-json: assistant 텍스트 블록을 전부 받는다. "json" 은 result(마지막 메시지)만 줘서
+        # 도구 호출 사이의 중간 발화가 통째로 사라졌다 (2026-08-25 jenn — 맥 데몬은 이미 stream-json).
+        "--output-format", "stream-json", "--verbose",
         "--dangerously-skip-permissions",
     ]
     # 웹에서 고른 프로젝트/브랜치 모델·에포트 반영 (지정 없으면 CLI 기본값)
@@ -1133,11 +1135,8 @@ def run_claude_turn(user_id: int, project: str, prompt: str) -> tuple[str, str]:
 
     wrapped = build_systemd_run(user_id, cmd, env, ws, unit, str(env_file))
     try:
-        result = subprocess.run(wrapped, capture_output=True, text=True,
-                                timeout=turn_timeout_sec(user_id) + 30)
-        rc, out, err = result.returncode, result.stdout, result.stderr
-    except subprocess.TimeoutExpired:
-        rc, out, err = 124, "", "timeout"
+        rc, out, err = _run_streaming(wrapped, user_id, project,
+                                      timeout=turn_timeout_sec(user_id) + 30)
     finally:
         try:
             env_file.unlink()
@@ -1159,6 +1158,170 @@ def run_claude_turn(user_id: int, project: str, prompt: str) -> tuple[str, str]:
     return _parse_turn_result(rc, out, err, user_id, project, prompt, sid)
 
 
+# 턴에서 수집한 도구 호출 줄 — 워커가 최종 응답 뒤에 tool_log 로 보낸다 (맥 데몬과 같은 포맷)
+_turn_tool_lines: dict[tuple[int, str], list[str]] = {}
+STREAM_INTERVAL_SEC = 2.0
+
+
+def _tool_line(block: dict) -> str | None:
+    name = block.get("name", "")
+    inp = block.get("input", {}) or {}
+    if not name:
+        return None
+    detail = ""
+    if name == "Bash":
+        c = " ".join(str(inp.get("command", "")).split())
+        detail = f": {c[:80]}" if c else ""
+    elif name in ("Read", "Write", "Edit"):
+        fp = inp.get("file_path", "")
+        detail = f": {fp}" if fp else ""
+    elif name in ("Glob", "Grep"):
+        pat = inp.get("pattern", "")
+        detail = f": {pat}" if pat else ""
+    elif name in ("WebSearch",):
+        q = inp.get("query", "")
+        detail = f": {q[:60]}" if q else ""
+    elif name == "WebFetch":
+        u = inp.get("url", "")
+        detail = f": {u[:60]}" if u else ""
+    return f"🔧 {name}{detail}"
+
+
+class _StreamCollector:
+    """stream-json 이벤트를 먹여 응답 텍스트를 누적한다 (맥 daemon/claude_runner.py 규약 이식).
+
+    - 모든 assistant text 블록을 순서대로 합친다 (도구 앞뒤 발화 전부).
+    - result 이벤트는 '마지막 메시지만' 담으므로, 이미 수집된 구간이면 덧붙이지 않는다.
+      한 턴에 result 가 여러 번 오면(백그라운드 재개) 구간 사이에 --- 경계를 넣는다."""
+
+    def __init__(self):
+        self.text = ""
+        self.tool_lines: list[str] = []
+        self.session_id: str | None = None
+        self.is_error = False
+        self.error_text = ""
+        self._seg_start = 0
+        self._pending_boundary = False
+        self._saw_event = False
+
+    def feed(self, line: str) -> bool:
+        """한 줄 처리. 화면 갱신이 필요한 변화가 있으면 True."""
+        line = line.strip()
+        if not line.startswith("{"):
+            return False
+        try:
+            ev = json.loads(line)
+        except json.JSONDecodeError:
+            return False
+        self._saw_event = True
+        et = ev.get("type", "")
+        changed = False
+        if et == "assistant":
+            for block in (ev.get("message") or {}).get("content", []) or []:
+                bt = block.get("type")
+                if bt == "tool_use":
+                    tl = _tool_line(block)
+                    if tl:
+                        self.tool_lines.append(tl)
+                        changed = True
+                elif bt == "text":
+                    t = block.get("text", "")
+                    if not t:
+                        continue
+                    if self._pending_boundary:
+                        if self.text.strip():
+                            self.text = self.text.rstrip() + "\n\n---\n\n"
+                            self._seg_start = len(self.text)
+                        self._pending_boundary = False
+                    elif self.text and not self.text.endswith("\n\n"):
+                        self.text += "\n\n"
+                    self.text += t
+                    changed = True
+        elif et == "result":
+            if ev.get("session_id"):
+                self.session_id = ev["session_id"]
+            rt = (ev.get("result") or "")
+            if ev.get("is_error"):
+                self.is_error = True
+                self.error_text = str(ev.get("error", "")) + str(rt)
+            elif rt:
+                seg = self.text[self._seg_start:].strip()
+                rts = rt.strip()
+                if not seg:
+                    self.text = (self.text.rstrip() + "\n\n---\n\n" + rt) if self.text.strip() else rt
+                elif rts and rts not in seg:
+                    self.text = self.text.rstrip() + "\n\n" + rt
+                self._seg_start = len(self.text)
+                self._pending_boundary = True
+                changed = True
+        return changed
+
+    def display(self) -> str:
+        if self.tool_lines:
+            return "\n".join(self.tool_lines) + ("\n\n" + self.text if self.text else "")
+        return self.text
+
+
+def _run_streaming(wrapped: list[str], user_id: int, project: str, timeout: int) -> tuple[int, str, str]:
+    """claude 를 실행하며 stdout 을 줄 단위로 읽어 중간 응답을 웹에 흘린다.
+    returns (rc, stdout 전체, stderr). 파싱은 _parse_turn_result 가 다시 한다."""
+    user = roster.get(user_id)
+    api_key = user["apiKey"] if user else None
+    col = _StreamCollector()
+    out_lines: list[str] = []
+    err_buf: list[str] = []
+    try:
+        proc = subprocess.Popen(wrapped, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, bufsize=1)
+    except OSError as e:
+        return (1, "", str(e))
+
+    def _drain_err():
+        try:
+            for l in proc.stderr:
+                err_buf.append(l)
+        except Exception:
+            pass
+    threading.Thread(target=_drain_err, daemon=True).start()
+
+    deadline = time.time() + timeout
+    last_push = 0.0
+    dirty = False
+    try:
+        for line in proc.stdout:
+            out_lines.append(line)
+            if col.feed(line):
+                dirty = True
+            now = time.time()
+            if api_key and dirty and (now - last_push) >= STREAM_INTERVAL_SEC:
+                disp = col.display()
+                if disp:
+                    user_api(api_key, "POST", "/api/bot/reply",
+                             {"text": disp, "project": project, "is_final": False})
+                last_push, dirty = now, False
+            if now > deadline:
+                proc.kill()
+                break
+    except Exception as e:
+        logger.warning(f"stream read failed user={user_id}: {e}")
+    try:
+        rc = proc.wait(timeout=30)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        rc = 124
+    if time.time() > deadline and rc != 0:
+        return (124, "".join(out_lines), "timeout")
+    return (rc, "".join(out_lines), "".join(err_buf))
+
+
+def _collect_stream(out: str) -> _StreamCollector | None:
+    """stdout 전체를 stream-json 으로 해석. 이벤트가 하나도 없으면 None (구형 json 출력)."""
+    col = _StreamCollector()
+    for line in out.splitlines():
+        col.feed(line)
+    return col if col._saw_event else None
+
+
 def _parse_turn_result(rc, out, err, user_id, project, prompt, sid) -> tuple[str, str]:
     out = (out or "").strip()
     err = (err or "").strip()
@@ -1173,6 +1336,18 @@ def _parse_turn_result(rc, out, err, user_id, project, prompt, sid) -> tuple[str
             return run_claude_turn(user_id, project, prompt)
         logger.error(f"claude exit {rc} user={user_id}: {combined[:300]}")
         return ("(처리 중 오류가 발생했어요. 다시 시도해주세요.)", "ok")
+    col = _collect_stream(out)
+    if col is not None:
+        if col.session_id:
+            save_session(user_id, project, col.session_id)
+        _turn_tool_lines[(user_id, project)] = list(col.tool_lines)
+        if col.is_error:
+            if any(m.lower() in (col.error_text or err).lower() for m in auth_markers):
+                return ("", "auth")
+            if not col.text.strip():
+                logger.error(f"claude result error user={user_id}: {col.error_text[:300]}")
+                return ("(처리 중 오류가 발생했어요. 다시 시도해주세요.)", "ok")
+        return (col.text.strip() or "(응답이 비어 있어요)", "ok")
     try:
         payload = json.loads(out)
         text = payload.get("result", "")
@@ -1800,6 +1975,13 @@ class CloudWorker:
             user_api(api_key, "POST", "/api/bot/reply", {
                 "text": chunk, "reply_to": [msg_id], "project": project,
                 "is_final": True, **({"subtype": st} if st else {}),
+            })
+        # 도구 호출 로그는 본문 뒤에 별도 tool_log 로 (맥 데몬과 동일한 배치)
+        tool_lines = _turn_tool_lines.pop((user_id, project), None)
+        if tool_lines:
+            user_api(api_key, "POST", "/api/bot/reply", {
+                "text": "\n".join(tool_lines), "reply_to": [msg_id], "project": project,
+                "is_final": True, "subtype": "tool_log",
             })
 
     def maybe_warn_quota(self, api_key, user_id, project, msg_id):
