@@ -42,6 +42,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import cloud_container as ctr
+import usage_api
 
 CONFIG_PATH = Path(os.environ.get("PV_CLOUD_CONFIG", "/etc/pv-cloud/config.json"))
 
@@ -1566,9 +1567,6 @@ def _parse_usage_output(out: str) -> dict | None:
     }
 
 
-OAUTH_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
-
-
 def _read_credentials(user_id: int) -> dict | None:
     """CLAUDE_CONFIG_DIR/.credentials.json 을 읽는다 (격리 모드는 root cat).
     토큰 값은 절대 로그에 남기지 않는다."""
@@ -1587,79 +1585,14 @@ def _read_credentials(user_id: int) -> dict | None:
         return None
 
 
-def _fmt_reset(iso: str | None) -> str:
-    """resets_at ISO → CLI 표기와 같은 'Aug 25, 11pm' 꼴 (Asia/Seoul)."""
-    if not iso:
-        return ""
-    try:
-        dt = datetime.fromisoformat(str(iso).replace("Z", "+00:00"))
-        dt = dt.astimezone(timezone(timedelta(hours=9)))
-        hour = dt.strftime("%I").lstrip("0") or "12"
-        mins = f":{dt.minute:02d}" if dt.minute else ""
-        return f"{dt.strftime('%b')} {dt.day}, {hour}{mins}{dt.strftime('%p').lower()}"
-    except Exception:
-        return str(iso)
-
-
 def _oauth_usage_probe(user_id: int) -> dict | None:
     """OAuth usage API 직접 조회 — 1초 미만, 클로드 세션을 새로 띄우지 않는다.
-
-    2026-08-25 뉴넥스 제안: CLI 프로브(`claude -p /usage`)는 매번 세션을 하나 소비하고
-    (24h에 275세션 중 상당수), 느린 호스트에선 83초씩 걸렸다. API 는 같은 값을 즉시 준다.
-    토큰이 만료/폐기됐거나 응답 형태를 못 읽으면 None → 호출부가 CLI 프로브로 폴백한다
-    (CLI 실행이 토큰을 자동 갱신하므로 다음 주기부터 API 가 다시 살아난다)."""
+    파싱·폴백 규칙은 usage_api 모듈(맥 데몬과 공용) 참조."""
     cred = _read_credentials(user_id)
     tok = ((cred or {}).get("claudeAiOauth") or {}).get("accessToken")
     if not tok:
         return None
-    try:
-        req = urllib.request.Request(OAUTH_USAGE_URL, headers={
-            "Authorization": f"Bearer {tok}",
-            "anthropic-beta": "oauth-2025-04-20",
-            "User-Agent": "pv-cloud",
-        })
-        with urllib.request.urlopen(req, timeout=15) as r:
-            data = json.loads(r.read().decode())
-    except Exception as e:
-        logger.info(f"[usage] oauth probe miss user={user_id}: {type(e).__name__} → CLI fallback")
-        return None
-
-    # 실측 응답 구조 (2026-08-25, 공용 호스트에서 확인):
-    #   five_hour/seven_day: {"utilization": 7.0(=7%), "resets_at": ISO}
-    #   limits: [{"kind": "session"|"weekly_all"|"weekly_scoped", "percent": int, "resets_at": ...}]
-    #   weekly_scoped 가 CLI 의 "Current week (Fable)" 에 해당.
-    # utilization 은 이미 0~100 스케일이다 — 1 이하라고 ×100 하면 1%가 100%로 오독된다.
-    def _pct(v):
-        try:
-            return int(round(float(v)))
-        except (TypeError, ValueError):
-            return None
-
-    fh = data.get("five_hour") or {}
-    sd = data.get("seven_day") or {}
-    session_pct, session_reset = _pct(fh.get("utilization")), fh.get("resets_at")
-    week_pct, week_reset = _pct(sd.get("utilization")), sd.get("resets_at")
-    fable_pct = None
-    for lim in (data.get("limits") or []):
-        kind = (lim or {}).get("kind")
-        if kind == "weekly_scoped" and fable_pct is None:
-            fable_pct = _pct(lim.get("percent"))
-        elif kind == "session" and session_pct is None:
-            session_pct, session_reset = _pct(lim.get("percent")), lim.get("resets_at")
-        elif kind == "weekly_all" and week_pct is None:
-            week_pct, week_reset = _pct(lim.get("percent")), lim.get("resets_at")
-    if session_pct is None and week_pct is None:
-        logger.warning(f"[usage] oauth probe: 응답 형태를 못 읽음 keys={sorted(data)[:8]}")
-        return None
-    return {
-        "session_pct": session_pct,
-        "week_pct": week_pct,
-        "week_fable_pct": fable_pct,
-        "session_reset": _fmt_reset(session_reset),
-        "week_reset": _fmt_reset(week_reset),
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-        "probe_src": "api",
-    }
+    return usage_api.fetch_oauth_usage(tok)
 
 
 def probe_usage(user_id: int, allow_wake: bool = False) -> dict | None:
@@ -2122,6 +2055,9 @@ class CloudWorker:
                 self.reply(api_key,
                            "✅ 클로드 계정이 연결됐어요! 이제 뭐든 시켜보세요.",
                            [msg_id], project)
+                # 로그인 직후 배너를 새 계정 값으로 즉시 갱신 (API 프로브라 1초 내)
+                threading.Thread(target=collect_and_store_usage, args=(user_id, api_key, True),
+                                 daemon=True, name=f"usage-login-{user_id}").start()
             else:
                 self.reply(api_key,
                            "연결에 실패했어요. `클로드 로그인` 이라고 입력해 다시 시도해주세요.",
