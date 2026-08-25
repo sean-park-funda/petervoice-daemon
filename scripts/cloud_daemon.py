@@ -637,11 +637,20 @@ CLOUD_SYSTEM_PROMPT_TMPL = """# 실행 환경: 피터보이스 클라우드 (공
 "이 작업은 클라우드 환경의 한도를 넘어요. 내 컴퓨터(맥/PC)에 피터를 직접 설치하면 제한 없이 할 수 있어요. 설정에서 '내 AI 비서 설치'를 신청해보세요."
 - 머신러닝/딥러닝 모델 학습·추론, GPU 필요 작업
 - 대량 크롤링/스크래핑, 대용량(수 GB) 데이터 처리
-- 영상 렌더링·인코딩 등 장시간 CPU 작업
+- 장편 영상 렌더링(수십 분 분량 4K 등) 같은 장시간 CPU 작업
 - 상시 실행 서버/봇 운영, 시스템 패키지 설치가 꼭 필요한 작업
 이런 요청에는 응답 어딘가에 `[HEAVY_TASK]` 를 포함하세요 (사용자에겐 보이지 않게 처리됩니다).
 
 가벼운 작업(리서치, 문서 작성, 데이터 분석, 소규모 코드/스크립트, 웹 API 호출)은 자유롭게 하세요.
+
+## 미디어(영상·이미지) 작업 규칙 — 메모리 상한 안에서 끝내기
+쇼츠 자막·컷 편집·썸네일 같은 **몇 분짜리 영상 작업은 정상 범위**입니다. 단, 턴 하나에 메모리 상한이 있으므로
+(클로드 프로세스 포함) 아래를 지키세요. 지키지 않으면 ffmpeg 가 OOM 으로 죽고 작업이 통째로 중단됩니다.
+- ffmpeg 는 `-threads 2 -preset veryfast` 로, 한 번에 필터 하나씩. `-filter_complex` 로 여러 오버레이·스케일을 한 그래프에 쌓지 말 것
+- 자막은 `subtitles`/`drawtext` 필터(가벼움)를 우선. PNG 오버레이는 이미지 1~2장까지만, **프레임별 이미지 생성(PIL 루프) 금지**
+- 1080p 초과 입력은 먼저 1080p 이하로 스케일한 중간 파일을 만든 뒤 작업. 3분 넘는 영상은 `-ss/-t` 로 구간을 나눠 처리 후 `concat`
+- 이미지 일괄 처리는 한 장씩 열고 닫기(리스트로 전부 메모리에 올리지 말 것)
+- 작업 전 `ls -lh` 로 입력 크기를 확인하고, 500MB 넘는 입력은 사용자에게 분할을 먼저 제안
 """
 
 
@@ -897,6 +906,22 @@ def turn_timeout_sec(user_id: int) -> int:
     return int(config.get("limits", {}).get("turn_timeout_sec", TURN_TIMEOUT_SEC))
 
 
+def turn_swap_mb(user_id: int) -> int:
+    """턴 스왑 허용량(MB). 베이직(1GB 이하)은 0, 그 위는 기본 1024 — 순간 피크에 즉사(OOM) 대신
+    느려지는 쪽으로. config "limits.turn_swap_mb" 로 호스트별 조정. (2026-08-25 Sean 승인)"""
+    tl = user_limits(user_id, peek=True) or {}
+    try:
+        mem_mb = int(tl.get("turnMemoryMb") or 0)
+    except (TypeError, ValueError):
+        mem_mb = 0
+    if mem_mb and mem_mb <= 1024:
+        return 0
+    try:
+        return int(config.get("limits", {}).get("turn_swap_mb", 1024))
+    except (TypeError, ValueError):
+        return 1024
+
+
 def build_systemd_run(user_id: int, cmd: list[str], env: dict, cwd: str, unit: str,
                       env_file: str) -> list[str]:
     lim = config.get("limits", {})
@@ -917,7 +942,7 @@ def build_systemd_run(user_id: int, cmd: list[str], env: dict, cwd: str, unit: s
         f"--unit={unit}", "--wait", "--pipe", "--quiet",
         f"--property=EnvironmentFile={env_file}",
         f"--property=WorkingDirectory={cwd}",
-        f"--property=MemoryMax={mem}", "--property=MemorySwapMax=0",
+        f"--property=MemoryMax={mem}", f"--property=MemorySwapMax={turn_swap_mb(user_id)}M",
         f"--property=CPUQuota={cpu}", f"--property=TasksMax={tasks}",
         f"--property=RuntimeMaxSec={runtime_max}",
         "--property=PrivateTmp=yes", "--property=NoNewPrivileges=yes",
@@ -2203,17 +2228,31 @@ class CloudWorker:
         else:
             mins = turn_timeout_sec(user_id) // 60
             reason = f"작업이 시간 한도({mins}분)를 넘어 중단됐어요."
-        msg = (
-            f"⚠️ {reason}\n\n"
-            "클라우드 피터보이스는 리서치·문서·가벼운 코드 작업에 맞춰져 있어요. "
-            "지금처럼 무거운 작업(대용량 처리·머신러닝·상시 서버 등)은 "
-            "**내 컴퓨터(맥/PC)에 피터를 직접 설치하면 제한 없이** 할 수 있어요.\n\n"
-            "설정 화면에서 '내 AI 비서 설치'를 신청하시면 안내해드릴게요."
-        )
-        # subtype 으로 웹이 CTA 카드(설치 신청 버튼)를 렌더 + heavy 이벤트 기록
+        tier = str((tl or {}).get("tier") or (roster.get(user_id) or {}).get("tier") or "").lower()
+        paid = tier in ("pro", "max")
+        if paid:
+            # 유료 유저에게 "맥 설치" CTA 를 먼저 내미는 건 상품 메시지로 나쁘다 (2026-08-25 jenn 자막 작업).
+            # 나눠서 다시 시도하도록 안내하고, 한도 자체가 문제면 상위 티어를 언급한다.
+            msg = (
+                f"⚠️ {reason}\n\n"
+                "같은 작업을 **작게 나눠서** 다시 시켜주세요 — 예: 영상은 구간을 나누거나 해상도를 낮춰 처리, "
+                "데이터는 파일을 쪼개서 순서대로. 제가 메모리를 아끼는 방식(ffmpeg 스레드 제한, 스트리밍 처리)으로 "
+                "다시 시도하겠습니다.\n\n"
+                + ("이런 작업을 자주 하신다면 MAX 요금제(8GB·120분)가 맞을 수 있어요." if tier == "pro" else "")
+            ).rstrip()
+            subtype = None
+        else:
+            msg = (
+                f"⚠️ {reason}\n\n"
+                "클라우드 피터보이스는 리서치·문서·가벼운 코드 작업에 맞춰져 있어요. "
+                "지금처럼 무거운 작업(대용량 처리·머신러닝·상시 서버 등)은 "
+                "**내 컴퓨터(맥/PC)에 피터를 직접 설치하면 제한 없이** 할 수 있어요.\n\n"
+                "설정 화면에서 '내 AI 비서 설치'를 신청하시면 안내해드릴게요."
+            )
+            subtype = "provision_suggest"  # 웹이 CTA 카드(설치 신청 버튼)를 렌더
         user_api(api_key, "POST", "/api/bot/reply", {
             "text": msg, "reply_to": [msg_id], "project": project, "is_final": True,
-            "subtype": "provision_suggest",
+            **({"subtype": subtype} if subtype else {}),
         })
         user_api(api_key, "POST", "/api/cloud/heavy-event", {
             "kind": status, "project": project, "context": user_text[:200],
