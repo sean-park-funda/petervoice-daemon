@@ -962,6 +962,29 @@ def kill_systemd_turns(user_id: int) -> None:
                            capture_output=True, timeout=15)
 
 
+def reap_orphan_turns() -> None:
+    """이전 데몬 프로세스가 남긴 pvturn-* 유닛을 정지한다 (기동 시 1회).
+
+    배포 재시작에서 드레인(90s)을 넘긴 턴은 데몬만 죽고 claude 유닛은 계속 돈다. 그 출력은 아무도
+    안 받는데 부작용(브라우저 조작·업로드)은 그대로 일어나고, 새 데몬이 같은 메시지를 재처리해
+    **같은 작업이 두 번** 실행된다 (2026-08-25 jenn 유튜브 업로드·SMS 인증에서 실제 발생)."""
+    if not isolation_enabled():
+        return
+    mine = f"-{os.getpid()}-"
+    try:
+        r = subprocess.run(["systemctl", "list-units", "--no-legend", "--plain", "pvturn-*.service"],
+                           capture_output=True, text=True, timeout=10)
+    except Exception as e:
+        logger.warning(f"orphan scan failed: {e}")
+        return
+    for line in (r.stdout or "").splitlines():
+        unit = line.split()[0] if line.split() else ""
+        if unit.startswith("pvturn-") and mine not in unit:
+            logger.warning(f"stopping orphan turn unit from previous daemon: {unit}")
+            subprocess.run(["sudo", "-n", "systemctl", "stop", unit], capture_output=True, timeout=20)
+            subprocess.run(["sudo", "-n", "systemctl", "reset-failed", unit], capture_output=True, timeout=10)
+
+
 def _unit_result(unit: str) -> str:
     """systemd 유닛 종료 사유: success | oom-kill | timeout | ... """
     try:
@@ -2427,6 +2450,7 @@ class CloudWorker:
 
     def run(self):
         logger.info("cloud daemon started")
+        reap_orphan_turns()
         # 재시작 시 지난 턴의 잔여 env 파일 정리 (600, 시크릿 잔존 방지)
         try:
             for f in _turnenv_dir().glob("*.env"):
