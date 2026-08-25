@@ -1287,6 +1287,18 @@ def _run_streaming(wrapped: list[str], user_id: int, project: str, timeout: int)
     deadline = time.time() + timeout
     last_push = 0.0
     dirty = False
+    timed_out = threading.Event()
+
+    def _watchdog():
+        timed_out.set()
+        try:
+            proc.kill()
+        except Exception:
+            pass
+    # 출력이 없으면 아래 for 가 블록돼 데드라인 검사가 안 돈다 → 타이머로 강제 종료
+    wd = threading.Timer(timeout, _watchdog)
+    wd.daemon = True
+    wd.start()
     try:
         for line in proc.stdout:
             out_lines.append(line)
@@ -1309,7 +1321,8 @@ def _run_streaming(wrapped: list[str], user_id: int, project: str, timeout: int)
     except subprocess.TimeoutExpired:
         proc.kill()
         rc = 124
-    if time.time() > deadline and rc != 0:
+    wd.cancel()
+    if timed_out.is_set() or (time.time() > deadline and rc != 0):
         return (124, "".join(out_lines), "timeout")
     return (rc, "".join(out_lines), "".join(err_buf))
 
