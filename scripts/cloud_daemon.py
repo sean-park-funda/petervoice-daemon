@@ -1624,44 +1624,33 @@ def _oauth_usage_probe(user_id: int) -> dict | None:
         logger.info(f"[usage] oauth probe miss user={user_id}: {type(e).__name__} → CLI fallback")
         return None
 
-    # 응답 형태에 방어적으로 대응 — 키 이름이 달라도 최대한 뽑고, 못 뽑으면 폴백
-    def _walk(obj, path=""):
-        if isinstance(obj, dict):
-            for k, v in obj.items():
-                yield from _walk(v, f"{path}.{k}".lower())
-        else:
-            yield path, obj
-
-    flat = dict(_walk(data))
-    def _find(*keys, contains):
-        for want in keys:
-            for path, v in flat.items():
-                if all(c in path for c in contains) and path.endswith(want):
-                    return v
-        return None
-
-    def _pct(contains):
-        v = _find(".utilization", ".pct", ".percent", ".used", contains=contains)
-        if v is None:
-            return None
+    # 실측 응답 구조 (2026-08-25, 공용 호스트에서 확인):
+    #   five_hour/seven_day: {"utilization": 7.0(=7%), "resets_at": ISO}
+    #   limits: [{"kind": "session"|"weekly_all"|"weekly_scoped", "percent": int, "resets_at": ...}]
+    #   weekly_scoped 가 CLI 의 "Current week (Fable)" 에 해당.
+    # utilization 은 이미 0~100 스케일이다 — 1 이하라고 ×100 하면 1%가 100%로 오독된다.
+    def _pct(v):
         try:
-            f = float(v)
-            return int(round(f * 100)) if f <= 1 else int(round(f))
+            return int(round(float(v)))
         except (TypeError, ValueError):
             return None
 
-    session_pct = _pct(["five_hour"]) if any("five_hour" in k for k in flat) else _pct(["session"])
-    week_pct = _pct(["seven_day"]) if any("seven_day" in k for k in flat) else _pct(["week"])
+    fh = data.get("five_hour") or {}
+    sd = data.get("seven_day") or {}
+    session_pct, session_reset = _pct(fh.get("utilization")), fh.get("resets_at")
+    week_pct, week_reset = _pct(sd.get("utilization")), sd.get("resets_at")
     fable_pct = None
-    for tag in ("fable", "opus", "seven_day_sonnet"):  # 모델별 주간 한도 키 후보
-        if any(tag in k for k in flat):
-            fable_pct = _pct([tag])
-            break
+    for lim in (data.get("limits") or []):
+        kind = (lim or {}).get("kind")
+        if kind == "weekly_scoped" and fable_pct is None:
+            fable_pct = _pct(lim.get("percent"))
+        elif kind == "session" and session_pct is None:
+            session_pct, session_reset = _pct(lim.get("percent")), lim.get("resets_at")
+        elif kind == "weekly_all" and week_pct is None:
+            week_pct, week_reset = _pct(lim.get("percent")), lim.get("resets_at")
     if session_pct is None and week_pct is None:
-        logger.warning(f"[usage] oauth probe: 응답 형태를 못 읽음 keys={sorted(set(k.split('.')[1] for k in flat if '.' in k))[:8]}")
+        logger.warning(f"[usage] oauth probe: 응답 형태를 못 읽음 keys={sorted(data)[:8]}")
         return None
-    session_reset = _find(".resets_at", ".resets", contains=["five_hour"]) or _find(".resets_at", contains=["session"])
-    week_reset = _find(".resets_at", ".resets", contains=["seven_day"]) or _find(".resets_at", contains=["week"])
     return {
         "session_pct": session_pct,
         "week_pct": week_pct,
