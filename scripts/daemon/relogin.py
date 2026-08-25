@@ -156,6 +156,16 @@ class ReloginSession:
             self._reply(self._url_message())
 
     def _publish_result(self, ok: bool):
+        if ok:
+            # 재로그인 직후 배너를 새 계정 값으로 즉시 갱신하고, 한도 쿨다운도 재판정한다
+            # (다른 계정으로 갈아탔을 때 "배너는 새 계정인데 채팅은 막힘" 방지). API 프로브라 1초 내.
+            def _refresh():
+                try:
+                    from daemon.heartbeat import collect_and_store_usage  # 순환 import 회피
+                    collect_and_store_usage()
+                except Exception as e:
+                    logger.warning(f"[relogin] usage refresh after login failed: {e}")
+            threading.Thread(target=_refresh, daemon=True, name="usage-after-login").start()
         if self._on_event:
             try:
                 self._on_event({"type": "done" if ok else "failed"})
