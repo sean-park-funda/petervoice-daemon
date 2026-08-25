@@ -1371,9 +1371,16 @@ def _parse_turn_result(rc, out, err, user_id, project, prompt, sid) -> tuple[str
         combined = f"{out}\n{err}"
         if any(m.lower() in combined.lower() for m in auth_markers):
             return ("", "auth")
-        if sid and ("No conversation found" in combined or "session" in combined.lower()):
+        # 세션 리셋+재실행은 CLI 가 "그 세션을 못 찾는다" 고 말했을 때만.
+        # 예전 조건("session" 문자열 포함)은 너무 넓어서, 운영자가 턴 유닛을 stop 한 경우(SIGTERM)에도
+        # 세션을 지우고 맥락 없이 다시 돌렸다 (2026-08-25 jenn 브랜치 #4 맥락 유실 사고).
+        killed = rc in (124, 137, 143) or rc < 0
+        if sid and not killed and re.search(r"No conversation found|session .*not found|Unknown session", combined, re.I):
             save_session(user_id, project, None)
             return run_claude_turn(user_id, project, prompt)
+        if killed:
+            logger.warning(f"claude turn killed rc={rc} user={user_id} project={project}")
+            return ("(작업이 중단됐어요. 이어서 하려면 다시 말씀해주세요.)", "ok")
         logger.error(f"claude exit {rc} user={user_id}: {combined[:300]}")
         return ("(처리 중 오류가 발생했어요. 다시 시도해주세요.)", "ok")
     col = _collect_stream(out)
