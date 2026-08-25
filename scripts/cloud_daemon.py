@@ -29,6 +29,7 @@ import re
 import select
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -1689,6 +1690,113 @@ def collect_usage_after_turn(user_id: int, api_key: str):
                      daemon=True, name=f"usage-{user_id}").start()
 
 
+# ── 자가진단 (2026-08-25) ────────────────────────────────────────────
+# SSH 가 닫힌 전용 호스트(뉴넥스 사내 서버 등)에서 운영자·에이전트가 채팅만으로 데몬 상태를
+# 볼 수 있게 한다. claude 턴을 돌리지 않고 데몬 프로세스가 직접 리포트를 만든다(턴 미소비).
+# 트리거: 메시지 본문이 "데몬 진단"/"/selfcheck"/"/진단" 이거나 어디든 [[pv/selfcheck]] 마커 포함.
+# 외부 릴레이([외부 relay @핸들 …])로 온 요청이면 보낸 핸들에게도 같은 리포트를 회신한다.
+SELFCHECK_MARKER = "[[pv/selfcheck]]"
+SELFCHECK_WORDS = {"데몬 진단", "데몬진단", "/selfcheck", "/진단", "pv selfcheck"}
+_SECRET_RE = re.compile(r"(sk-ant-[A-Za-z0-9_\-]{8,}|chk_[0-9a-f]{12,}|pv_[A-Za-z0-9]{16,}|Bearer\s+\S+|[A-Za-z0-9_\-]{40,})")
+
+
+def is_selfcheck_trigger(text: str) -> bool:
+    t = (text or "").strip()
+    if not t:
+        return False
+    if SELFCHECK_MARKER in t:
+        return True
+    # 외부 릴레이 머리말 뒤 본문만 비교
+    body = t.split("\n", 1)[1].strip() if t.startswith("[외부 relay") and "\n" in t else t
+    return body.lower() in SELFCHECK_WORDS
+
+
+def _redact(s: str) -> str:
+    return _SECRET_RE.sub("***", s or "")
+
+
+def _sh(cmd: list[str], timeout: int = 20) -> str:
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        out = (r.stdout or "") + (("\n" + r.stderr) if r.stderr and r.returncode != 0 else "")
+        return out.strip() or f"(exit {r.returncode}, no output)"
+    except FileNotFoundError:
+        return f"(없음: {cmd[0]})"
+    except subprocess.TimeoutExpired:
+        return "(timeout)"
+    except Exception as e:
+        return f"(error: {e})"
+
+
+def selfcheck_report(user_id: int) -> str:
+    """호스트·데몬·사용량 스레드 상태를 한 장으로. 비밀값은 마스킹."""
+    t0 = time.time()
+    L: list[str] = []
+    repo = Path(__file__).resolve().parent.parent
+    L.append("## 🩺 피터보이스 데몬 자가진단")
+    L.append(f"- 시각(UTC): {time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime())} / 호스트: {socket.gethostname()} / 데몬 PID: {os.getpid()}")
+    head = _sh(["git", "-C", str(repo), "log", "-1", "--format=%h %ad %s", "--date=short"])
+    branch = _sh(["git", "-C", str(repo), "branch", "--show-current"])
+    L.append(f"- 데몬 코드: `{_redact(head)}` (branch {branch})")
+    st = _sh(["systemctl", "show", "pv-cloud", "-p", "ActiveState", "-p", "ActiveEnterTimestamp", "-p", "MainPID"])
+    L.append("- 서비스: " + " / ".join(x for x in st.splitlines() if x))
+    L.append(f"- 시스템: load {_sh(['cat', '/proc/loadavg']).split()[0:3]} | " + _sh(["free", "-m"]).replace("\n", " ; ")[:160])
+    L.append(f"- 디스크(/): {' '.join(_sh(['df', '-h', '/']).splitlines()[-1].split()[1:5])}")
+
+    # 설정 요약 (키 제외)
+    safe = {k: v for k, v in config.items() if k not in ("api_key", "host_key", "supabase_key")}
+    L.append(f"- 설정: api_url={safe.get('api_url')} max_concurrent={safe.get('max_concurrent')} dedicated={safe.get('dedicated')} "
+             f"container={'on' if (safe.get('container') or {}).get('enabled') else 'off'} limits={safe.get('limits')}")
+
+    # API 연결
+    t = time.time()
+    try:
+        poll = host_api("GET", "/api/cloud/poll")
+    except Exception as e:
+        poll = None
+        L.append(f"- 중앙 API 폴링: 예외 {e}")
+    L.append(f"- 중앙 API 폴링: {'OK' if poll is not None else '실패'} ({int((time.time()-t)*1000)}ms)"
+             + (f", usage_refresh 대기={poll.get('usage_refresh')} pending={len(poll.get('pending') or [])}" if poll else ""))
+
+    # 유저·사용량 스레드
+    u = roster.get(user_id) or {}
+    lim = user_limits(user_id, peek=True) or {}
+    L.append(f"- 유저 {user_id}: tier={u.get('tier')} limits={ {k: lim.get(k) for k in ('memoryMax','cpuQuota','turnsPerMonth','containerAlwaysOn') if k in lim} }")
+    last = _usage_last.get(user_id)
+    L.append(f"- 사용량 수집: 마지막 시도 {int(time.time()-last)}초 전" if last else "- 사용량 수집: 기동 후 시도 없음")
+    L.append(f"  - 새로고침 대기 플래그(데몬 메모리): {user_id in _usage_refresh} / 수집 성공 이력: {user_id in _usage_ok}")
+    L.append(f"  - 로그인(credentials): {has_credentials(user_id)}"
+             + (f" / 컨테이너: {ctr.container_state(user_id)}" if ctr.enabled_for(user_id) else " / 모드: systemd"))
+    t = time.time()
+    try:
+        probe = probe_usage(user_id, allow_wake=True)
+        L.append(f"  - 지금 /usage 프로브: {'OK '+json.dumps(probe, ensure_ascii=False)[:300] if probe else '실패(None)'} ({int(time.time()-t)}초)")
+    except Exception as e:
+        L.append(f"  - 지금 /usage 프로브: 예외 {e}")
+
+    # 턴 유닛 / 고아
+    units = _sh(["systemctl", "list-units", "--no-legend", "--plain", "pvturn-*"])
+    mine = f"-{os.getpid()}-"
+    names = [ln.split()[0] for ln in units.splitlines() if ln.startswith("pvturn-")]
+    orphans = [n for n in names if mine not in n]
+    L.append(f"- 실행 중 턴: {len(names)}개" + (f" ⚠️ 고아(이전 데몬 소속) {orphans}" if orphans else ""))
+
+    # 로그
+    jl = _sh(["sudo", "-n", "journalctl", "-u", "pv-cloud", "--since", "-3h", "--no-pager", "-o", "short-iso"], timeout=30)
+    lines = jl.splitlines()
+    usage_lines = [x for x in lines if "[usage]" in x and "session=" not in x][-15:]
+    err_lines = [x for x in lines if "ERROR" in x or "Traceback" in x or "WARNING" in x][-15:]
+    def _trim(x: str) -> str:
+        x = re.sub(r"^\S+ \S+ python3\[\d+\]: ", "", x)
+        return _redact(x)[:180]
+    L.append("- 최근 3h [usage] 로그:")
+    L.extend("  " + _trim(x) for x in usage_lines) if usage_lines else L.append("  (없음 — journalctl 권한/로그 확인)")
+    L.append("- 최근 3h 오류/경고:")
+    L.extend("  " + _trim(x) for x in err_lines) if err_lines else L.append("  (없음)")
+    L.append(f"_생성 {int(time.time()-t0)}초_")
+    return "\n".join(L)
+
+
 class UsageThread(threading.Thread):
     """유저별 사용 한도 수집 — 15분 주기 + 배너 새로고침 버튼(usage_refresh) 대응."""
 
@@ -1868,6 +1976,23 @@ class CloudWorker:
             self.reply(api_key, "(일시적 오류로 준비에 실패했어요. 잠시 후 다시 시도해주세요.)", [msg_id], project)
             return
         logger.info(f"msg #{msg_id} user={user_id} project={project}: {text[:60]}")
+
+        # ── 자가진단 (턴 미소비, claude 미실행) ──
+        if is_selfcheck_trigger(text):
+            self.reply(api_key, "🩺 데몬 자가진단을 실행 중입니다 (1분 내)...", [msg_id], project)
+            try:
+                report = selfcheck_report(user_id)
+            except Exception as e:
+                logger.error(f"selfcheck failed user={user_id}: {e}", exc_info=True)
+                report = f"자가진단 중 오류: {e}"
+            for chunk in _split_chunks(report):
+                self.reply(api_key, chunk, [msg_id], project)
+            m = re.match(r"\[외부 relay @([A-Za-z0-9_.\-]+)", text)
+            if m:  # 외부 요청자에게도 회신 (진단을 요청한 쪽이 결과를 봐야 한다)
+                user_api(api_key, "POST", "/api/relay/external",
+                         {"to_handle": f"@{m.group(1)}", "from_project": project,
+                          "kind": "message", "text": "[자가진단 결과 회신]\n" + report})
+            return
 
         # ── 로그인 플로우 ──
         with login_lock:
