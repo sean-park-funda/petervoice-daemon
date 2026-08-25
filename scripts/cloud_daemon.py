@@ -974,7 +974,25 @@ def fetch_attachments(user_id: int, project: str, files: list) -> list[str]:
     for f in files:
         url = (f.get("url") or "").strip()
         name = re.sub(r"[^\w.\-가-힣 ]", "_", f.get("name") or "file")[:80]
+        # 웹이 이미 클라우드 홈에 직접 저장한 첨부(local_path) — 다시 받지 않고 그대로 쓴다.
+        # (2026-08-25 jenn: url 이 "/api/cloud/portal/..." 상대경로라 아래 http 검사에서 조용히
+        #  버려져 이미지 첨부가 통째로 무시됐다)
+        lp = (f.get("local_path") or "").strip()
+        if lp and os.path.isfile(lp):
+            try:
+                os.chmod(lp, 0o644)
+            except OSError:
+                pass
+            dest = Path(lp)
+            if ctr.enabled_for(user_id):
+                out.append(f"/home/agent/workspace/{pdir.name}/docs/uploaded/{dest.name}")
+            else:
+                out.append(str(dest))
+            continue
+        if url.startswith("/"):
+            url = config["api_url"].rstrip("/") + url
         if not url.startswith(("http://", "https://")):
+            logger.warning(f"attachment skipped (bad url) user={user_id} name={name}")
             continue
         dest = updir / f"{int(time.time() * 1000)}_{name}"
         try:
