@@ -74,6 +74,22 @@ sync_skills() {
   log "번들 스킬 동기화: ${n}개 → $dst"
 }
 
+# 매뉴얼 동기화 — 시스템 가이드가 "매뉴얼을 읽으라"고 하는데 클라우드 유저 홈엔 레포가 없다
+# (2026-08-25 jenn: 가이드 경로 ~/peter-voice/docs/manual 이 존재하지 않아 에이전트가 환경을 추측함).
+# 유저 계정이 읽을 수 있게 root:root 755/644 로 둔다.
+sync_manual() {
+  local src="$REPO/docs/manual"
+  local dst="${PV_SHARED_MANUAL:-/srv/pv/shared/manual}"
+  [ -d "$src" ] || return 0
+  sudo mkdir -p "$dst"
+  if command -v rsync >/dev/null 2>&1; then
+    sudo rsync -a --delete --chmod=D755,F644 "$src/" "$dst/" || return 0
+  else
+    sudo rm -rf "$dst" && sudo cp -a "$src" "$dst" && sudo chmod -R a+rX "$dst" || return 0
+  fi
+  log "매뉴얼 동기화: $(ls "$dst" | wc -l)개 → $dst"
+}
+
 # 일시정지 — 락도 잡기 전에 조용히 빠진다
 [ -f "$REPO/.deploy-pause" ] && exit 0
 
@@ -116,6 +132,8 @@ if git diff --name-only "$LOCAL" "$REMOTE" | grep -q '^requirements.txt$'; then
 fi
 
 sync_skills
+
+sync_manual
 
 # 배포 전 기준선 — 헬스체크에서 로스터 수가 줄지 않았는지 비교한다
 BASE_ROSTER=$(sudo journalctl -u pv-cloud --no-pager -n 200 \
