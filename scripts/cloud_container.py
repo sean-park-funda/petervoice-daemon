@@ -162,6 +162,21 @@ def _current_mem_bytes(user_id: int) -> int:
         return 0
 
 
+def _swap_total(target_mem: str, limits: dict | None) -> str:
+    """podman --memory-swap 은 (메모리+스왑) 합계. 베이직(1GB 이하)은 스왑 0, 그 위는 +1GB
+    (config limits.turn_swap_mb). systemd 경로의 turn_swap_mb 와 같은 규칙."""
+    try:
+        mem_mb = int((limits or {}).get("turnMemoryMb") or 0)
+    except (TypeError, ValueError):
+        mem_mb = 0
+    if mem_mb and mem_mb <= 1024:
+        return target_mem
+    swap_mb = int((_config.get("limits") or {}).get("turn_swap_mb", 1024))
+    m = target_mem.lower()
+    base_mb = int(m[:-1]) * 1024 if m.endswith("g") else int(m[:-1]) if m.endswith("m") else int(m) // (1024 * 1024)
+    return f"{base_mb + swap_mb}m"
+
+
 def _target_mem(limits: dict | None) -> str:
     """티어 한도 → 이 컨테이너의 메모리 스펙. limits 없음(전용 호스트·구 웹) = 호스트 config.
 
@@ -230,7 +245,7 @@ def ensure_running(user_id: int, limits: dict | None = None) -> bool:
             "--memory=" + target_mem,
             # 기본은 스왑 금지(memory-swap=memory). 전용 호스트는 memory_swap 을 크게 줘서
             # 상한 초과 시 즉사(OOM) 대신 스왑으로 버티게 할 수 있다.
-            "--memory-swap=" + str(c.get("memory_swap", target_mem)),
+            "--memory-swap=" + str(c.get("memory_swap") or _swap_total(target_mem, limits)),
             "--cpus=" + str(c.get("cpus", 1.5)),
             "--pids-limit=" + str(c.get("pids_limit", 256)),
             "--restart=no",
