@@ -624,15 +624,17 @@ tail -20 ~/.claude-daemon/daemon.log | grep account
 
 ### 시작/중지
 
-```bash
-# 데몬 시작
-launchctl load ~/Library/LaunchAgents/com.petervoice.claude-daemon.plist
+launchd 라벨은 설치 세대에 따라 다르다: **고객 설치본 = `com.petervoice.daemon`** (install.sh·willy-install.sh·onboarding_daemon.py 기준), 일부 개발 머신(Sean·Joory) = `com.petervoice.claude-daemon`. `launchctl list | grep petervoice`로 확인.
 
-# 데몬 중지 (10초 내 자동 재시작)
-launchctl stop com.petervoice.claude-daemon
+```bash
+# 데몬 시작 (라벨에 맞는 plist 사용)
+launchctl load ~/Library/LaunchAgents/com.petervoice.daemon.plist
+
+# 데몬 중지 (10초 내 자동 재시작) — 라벨 폴백 포함
+launchctl stop com.petervoice.daemon 2>/dev/null || launchctl stop com.petervoice.claude-daemon
 
 # 지연 재시작 (현재 응답 완료 후)
-(sleep 5 && launchctl stop com.petervoice.claude-daemon) &
+(sleep 5 && (launchctl stop com.petervoice.daemon 2>/dev/null || launchctl stop com.petervoice.claude-daemon)) &
 ```
 
 ### 재시작 트리거

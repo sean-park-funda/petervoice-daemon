@@ -133,11 +133,11 @@ class Worker(threading.Thread):
                     self.reply("재로그인 세션이 만료됐어요. '재로그인' 이라고 입력해 다시 시작해 주세요.", reply_to=[msg_id], project=project)
             dequeue_message(msg_id)
             return
-        # (b) 명시적 트리거: "재로그인" / "/relogin" (401 발생 전 선제 갱신용)
-        if text in ("재로그인", "/relogin", "리로그인"):
+        # (b) 명시적 트리거: "재로그인"/"로그인"/"클로드 로그인" 등 (401 발생 전 선제 갱신용)
+        if relogin.is_login_trigger(text):
             from daemon.claude_runner import resolve_account_config_dir
             relogin.start(project, config_dir=resolve_account_config_dir(project))
-            self.reply("재로그인을 시작합니다. 잠시 후 안내 링크를 보내드릴게요...", reply_to=[msg_id], project=project)
+            self.reply("클로드 로그인을 시작합니다. 잠시 후 안내 링크를 보내드릴게요...", reply_to=[msg_id], project=project)
             dequeue_message(msg_id)
             return
 
@@ -401,9 +401,6 @@ class Worker(threading.Thread):
 
         # D8: skip post-processing for team projects (already handled inside process_team_message)
         if not _is_team:
-            if tool_lines:
-                self.reply("\n".join(tool_lines), reply_to=[msg_id], project=project, is_final=True, subtype="tool_log")
-
             # Rewriter — skip for manager-injected messages
             from daemon.manager.thread import ManagerThread
             is_manager_msg = text.startswith(ManagerThread.MANAGER_PREFIX)
@@ -417,6 +414,10 @@ class Worker(threading.Thread):
                     _msg_text = rewrite_for_voice(_msg_text)
                 for chunk in _split_text_chunks(_msg_text):
                     self.reply(chunk, reply_to=[msg_id], project=project, is_final=True)
+
+            # 도구 로그는 본문 뒤에 보낸다 — 스트리밍 중 레이아웃(버블 위·도구 아래)과 완료 후 배치를 맞춤
+            if tool_lines:
+                self.reply("\n".join(tool_lines), reply_to=[msg_id], project=project, is_final=True, subtype="tool_log")
 
         self.reply("", reply_to=None, project=project, is_final=False)
 

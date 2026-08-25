@@ -1,6 +1,5 @@
 """Heartbeat thread: periodically inject due task messages."""
 
-import json
 import os
 import re
 import subprocess
@@ -12,19 +11,10 @@ import daemon.globals as g
 from daemon.globals import config, active_projects, active_projects_lock, shutdown_event, logger, CLAUDE_CMD
 from daemon.api import api_request, inject_system_message
 from daemon.supabase import get_project_dir
+from daemon.limits import clear_account_cooldown_if_stale, claude_account_email
 
 
 # ─── Claude 사용 한도(/usage) 수집 — 주기(heartbeat) + 온디맨드(main loop) 공용 ───
-def _claude_account_email() -> str | None:
-    """데몬이 쓰는 Claude Code 계정 이메일 (~/.claude.json oauthAccount)."""
-    try:
-        with open(os.path.expanduser("~/.claude.json"), encoding="utf-8") as f:
-            data = json.load(f)
-        return (data.get("oauthAccount") or {}).get("emailAddress") or None
-    except Exception:
-        return None
-
-
 def fetch_usage_limits() -> dict | None:
     """claude -p '/usage' 실행 후 세션/주간 리밋 % + 리셋 시각 파싱."""
     try:
@@ -59,7 +49,7 @@ def fetch_usage_limits() -> dict | None:
         "week_fable_pct": fable_pct,
         "session_reset": session_reset,
         "week_reset": week_reset,
-        "account": _claude_account_email(),
+        "account": claude_account_email(),
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -74,6 +64,9 @@ def collect_and_store_usage() -> bool:
         return False
     api_request(api_key, "PATCH", "/api/bot/status", body={"usage_limits": limits}, timeout=10)
     logger.info(f"[usage] session={limits.get('session_pct')}% week={limits.get('week_pct')}%")
+    # 배너만 갱신하고 끝내면 안 된다 — 여기서 얻은 계정/사용률은 채팅을 막고 있는 쿨다운이
+    # 아직 유효한지 판정할 수 있는 유일한 신호다(재로그인·오파싱 자가복구).
+    clear_account_cooldown_if_stale(limits.get("session_pct"))
     return True
 
 
@@ -128,20 +121,29 @@ class HeartbeatThread(threading.Thread):
             return result["tasks"]
         return []
 
+    @staticmethod
+    def _heartbeat_filename(project: str) -> str:
+        """브랜치 세션은 부모와 작업 디렉토리를 공유하므로 파일을 분리한다.
+        branch:656 → docs/HEARTBEAT-branch-656.md, 그 외 → docs/HEARTBEAT.md"""
+        if project.startswith("branch:"):
+            return f"HEARTBEAT-branch-{project.split(':')[1]}.md"
+        return "HEARTBEAT.md"
+
     def _check_heartbeat_md(self, project: str) -> str | None:
-        """Check if docs/HEARTBEAT.md exists. Returns warning message or None."""
+        """Check if the task's HEARTBEAT file exists. Returns warning message or None."""
         try:
             project_dir = get_project_dir(project)
             if not project_dir:
                 return "프로젝트 디렉토리를 찾을 수 없음"
-            heartbeat_path = os.path.join(project_dir, "docs", "HEARTBEAT.md")
+            filename = self._heartbeat_filename(project)
+            heartbeat_path = os.path.join(project_dir, "docs", filename)
             if not os.path.exists(heartbeat_path):
-                return "HEARTBEAT.md 파일 없음 — 태스크가 실행되어도 할 일이 정의되지 않음"
+                return f"{filename} 파일 없음 — 태스크가 실행되어도 할 일이 정의되지 않음"
             content = open(heartbeat_path).read().strip()
             if not content:
-                return "HEARTBEAT.md가 비어 있음"
+                return f"{filename}가 비어 있음"
             if "[ ]" not in content:
-                return "HEARTBEAT.md에 미완료 항목 없음"
+                return f"{filename}에 미완료 항목 없음"
             return None
         except Exception:
             return None
@@ -185,7 +187,8 @@ class HeartbeatThread(threading.Thread):
             logger.info(f"[heartbeat] {project} skipped (no HEARTBEAT.md)")
             return
 
-        msg_id, ts = inject_system_message(project, self.HEARTBEAT_MSG, prefix="[heartbeat]")
+        msg = self.HEARTBEAT_MSG.replace("HEARTBEAT.md", self._heartbeat_filename(project))
+        msg_id, ts = inject_system_message(project, msg, prefix="[heartbeat]")
         if not msg_id:
             logger.warning(f"[heartbeat] {project} inject failed")
             return

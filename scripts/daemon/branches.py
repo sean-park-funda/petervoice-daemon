@@ -85,7 +85,7 @@ def build_branch_prompt(branch: dict) -> str:
     3. 프로젝트 프롬프트
     4. 브랜치/칸반 규칙
     """
-    from daemon.prompts import get_prompt_file, build_connected_services_note
+    from daemon.prompts import get_prompt_file, build_connected_services_note, apply_roster_placeholder
 
     project_id = branch.get("project_id", "")
 
@@ -114,6 +114,17 @@ def build_branch_prompt(branch: dict) -> str:
     # 이전 대화 조회 시 사용할 project ID (kanban 카드가 아닌 branch ID)
     conversation_hint = f"\n## 이전 대화 조회\n이 세션의 대화 기록은 `project=branch:{branch_id}`로 조회하세요. 칸반 카드 ID가 아닌 **branch:{branch_id}**를 사용할 것.\n"
 
+    # 이 브랜치가 자기 반복 작업(하트비트)을 직접 등록하는 방법
+    heartbeat_hint = (
+        f"\n## 내 반복 작업(하트비트) 등록\n"
+        f"이 브랜치가 주기적으로 스스로 일하게 하려면 **프로젝트 메인이 아니라 이 브랜치로** 등록하세요.\n"
+        f"1. 부모 프로젝트 작업 디렉토리에 `docs/HEARTBEAT-branch-{branch_id}.md` 작성 (체크리스트 형식, `- [ ]` 항목 필수)\n"
+        f"   — 메인의 `docs/HEARTBEAT.md`와 **다른 파일**입니다. 메인 파일을 건드리지 마세요.\n"
+        f"2. 등록: `POST $API_URL/api/tasks` body `{{\"project\": \"branch:{branch_id}\", \"interval_min\": 30, \"max_runs\": 20}}`\n"
+        f"   (interval_min 최소 30, max_runs 필수. 메인과 별개로 등록되며 서로 간섭하지 않습니다)\n"
+        f"3. 하트비트 수신 시 그 파일을 읽고 다음 미완료 항목을 처리 → 완료 시 `[x]` 마킹\n"
+    )
+
     # 릴레이 가이드 (모든 브랜치 공통)
     relay_guide = _build_branch_relay_guide(project_id, branch_id)
 
@@ -132,8 +143,8 @@ def build_branch_prompt(branch: dict) -> str:
         # 칸반 카드가 연결된 브랜치 → 기존 카드 규칙 사용
         from daemon.kanban import build_kanban_prompt
         kanban_combined = build_kanban_prompt(kanban_card_full)
-        combined = "\n\n".join(p for p in [system_prompt_pv, kanban_combined, lead_patch, relay_guide, conversation_hint] if p)
-        return combined
+        combined = "\n\n".join(p for p in [system_prompt_pv, kanban_combined, lead_patch, relay_guide, conversation_hint, heartbeat_hint] if p)
+        return apply_roster_placeholder(combined)
     else:
         # 순수 브랜치 → 간결한 브랜치 규칙
         branch_num = branch.get("branch_number", branch.get("id"))
@@ -163,8 +174,8 @@ curl -X PATCH "$API_URL/api/branches/{branch_id}" \\
 ```
 """
         connected_services = build_connected_services_note()
-        combined = "\n\n".join(p for p in [system_prompt_pv, common_prompt, connected_services, project_prompt, branch_prompt, branch_rules, lead_patch, relay_guide, conversation_hint] if p)
-        return combined
+        combined = "\n\n".join(p for p in [system_prompt_pv, common_prompt, connected_services, project_prompt, branch_prompt, branch_rules, lead_patch, relay_guide, conversation_hint, heartbeat_hint] if p)
+        return apply_roster_placeholder(combined)
 
 
 def build_branch_context(branch: dict) -> str:

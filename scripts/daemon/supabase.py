@@ -117,8 +117,31 @@ def _ensure_pretooluse_hook(directory: str):
         pass  # non-critical
 
 
+def resolve_real_project(project: str) -> str:
+    """branch:{id} / kanban:{id} → 부모 프로젝트 ID. 그 외는 그대로.
+
+    브랜치·칸반 세션은 부모 프로젝트의 작업 디렉토리를 공유한다. 해석에 실패하면
+    (API 오류 등) 원래 문자열을 돌려줘 기존 동작으로 폴백한다.
+    """
+    try:
+        if project.startswith("branch:"):
+            from daemon.branches import fetch_branch
+            data = fetch_branch(int(project.split(":")[1]))
+            return data.get("project_id") or project if data else project
+        if project.startswith("kanban:"):
+            from daemon.kanban import _fetch_kanban_card
+            card = _fetch_kanban_card(int(project.split(":")[1]))
+            return card.get("project_id") or project if card else project
+    except Exception as e:
+        logger.warning(f"[project] resolve failed for {project}: {e}")
+    return project
+
+
 def get_project_dir(project: str) -> str:
     from daemon.globals import DAEMON_DIR
+    # 0) branch:/kanban: 세션은 부모 프로젝트 디렉토리를 쓴다
+    #    (해석 실패 시 원래 값 유지 → 기존 동작 폴백)
+    project = resolve_real_project(project)
     # 1) API에서 directory 조회
     directory = _fetch_project_directory(project)
     if directory:

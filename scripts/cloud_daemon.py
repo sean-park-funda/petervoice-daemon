@@ -29,6 +29,7 @@ import re
 import select
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -59,10 +60,28 @@ LOGIN_CODE_TTL_SEC = 600
 CODE_RE = re.compile(r"[A-Za-z0-9_\-]{20,}#[A-Za-z0-9_\-]{8,}")
 _URL_RE = re.compile(r"https?://[^\s\x00-\x1f\"']+")
 
+# 로그인 트리거 — 공백·대소문자·문장부호를 무시하고 매칭 (daemon/relogin.py 와 동일 세트).
+# cloud_daemon 은 독립 실행이라 daemon 패키지를 import 하지 않으므로 여기에 사본을 둔다.
+_LOGIN_TRIGGERS = {
+    "재로그인", "리로그인", "로그인", "relogin", "login", "/relogin", "/login",
+    "클로드로그인", "클로드재로그인", "클로드연결", "클로드계정연결", "계정연결", "연결",
+    "클로드로그인해줘", "로그인해줘", "재로그인해줘", "로그인하기", "클로드인증", "인증",
+    "claude로그인", "claudelogin",
+}
+
+
+def is_login_trigger(text: str) -> bool:
+    """유저 입력이 클로드 로그인 시작 요청인지. 공백/대소문자/끝문장부호 무시."""
+    if not text:
+        return False
+    s = re.sub(r"[\s​]+", "", text).strip().lower().rstrip(".!?~,")
+    return s in _LOGIN_TRIGGERS
+
+
 NEED_LOGIN_MESSAGE = (
     "아직 클로드(Claude) 계정이 연결되지 않아 AI 비서가 잠들어 있어요. 🌙\n\n"
     "**연결 방법** (2분이면 돼요)\n"
-    "1. 여기에 `재로그인` 이라고 입력해주세요.\n"
+    "1. 여기에 `클로드 로그인` 이라고 입력해주세요.\n"
     "2. 제가 보내드리는 링크를 열어 클로드 계정으로 로그인해주세요.\n"
     "3. 화면에 나오는 코드를 복사해서 이 채팅에 붙여넣어 주세요.\n\n"
     "클로드 구독 계정이 없다면, 다른 사용자의 프로젝트에 초대받아 대화하는 것은 지금도 가능해요."
@@ -730,7 +749,16 @@ def compose_system_prompt(user_id: int, project: str) -> str:
     if proj_p:
         label = "브랜치 프롬프트" if project.startswith("branch:") else "프로젝트 프롬프트"
         parts.append(f"# {label}\n\n{proj_p}")
-    return "\n\n".join(parts)
+    combined = "\n\n".join(parts)
+    # {담당자 명부}: 맥 데몬은 실시간 목록으로 치환한다(daemon/prompts.py). 클라우드는 아직
+    # 미지원이라 치환 대신 조회 방법으로 바꿔 둔다 — 플레이스홀더가 그대로 노출되지 않게.
+    if "{담당자 명부}" in combined:
+        combined = combined.replace(
+            "{담당자 명부}",
+            "## 담당자 명부\n대상 목록은 `GET $API_URL/api/projects` 와 "
+            "`GET $API_URL/api/branches?all_active=1` 로 조회할 것 (추측 금지).",
+        )
+    return combined
 
 
 def _sysprompt_filename(project: str) -> str:
@@ -947,7 +975,25 @@ def fetch_attachments(user_id: int, project: str, files: list) -> list[str]:
     for f in files:
         url = (f.get("url") or "").strip()
         name = re.sub(r"[^\w.\-가-힣 ]", "_", f.get("name") or "file")[:80]
+        # 웹이 이미 클라우드 홈에 직접 저장한 첨부(local_path) — 다시 받지 않고 그대로 쓴다.
+        # (2026-08-25 jenn: url 이 "/api/cloud/portal/..." 상대경로라 아래 http 검사에서 조용히
+        #  버려져 이미지 첨부가 통째로 무시됐다)
+        lp = (f.get("local_path") or "").strip()
+        if lp and os.path.isfile(lp):
+            try:
+                os.chmod(lp, 0o644)
+            except OSError:
+                pass
+            dest = Path(lp)
+            if ctr.enabled_for(user_id):
+                out.append(f"/home/agent/workspace/{pdir.name}/docs/uploaded/{dest.name}")
+            else:
+                out.append(str(dest))
+            continue
+        if url.startswith("/"):
+            url = config["api_url"].rstrip("/") + url
         if not url.startswith(("http://", "https://")):
+            logger.warning(f"attachment skipped (bad url) user={user_id} name={name}")
             continue
         dest = updir / f"{int(time.time() * 1000)}_{name}"
         try:
@@ -1026,7 +1072,9 @@ def run_claude_turn(user_id: int, project: str, prompt: str) -> tuple[str, str]:
     claude_cmd = config.get("claude_cmd", "claude")
     cmd = [
         claude_cmd, "-p",
-        "--output-format", "json",
+        # stream-json: assistant 텍스트 블록을 전부 받는다. "json" 은 result(마지막 메시지)만 줘서
+        # 도구 호출 사이의 중간 발화가 통째로 사라졌다 (2026-08-25 jenn — 맥 데몬은 이미 stream-json).
+        "--output-format", "stream-json", "--verbose",
         "--dangerously-skip-permissions",
     ]
     # 웹에서 고른 프로젝트/브랜치 모델·에포트 반영 (지정 없으면 CLI 기본값)
@@ -1088,11 +1136,8 @@ def run_claude_turn(user_id: int, project: str, prompt: str) -> tuple[str, str]:
 
     wrapped = build_systemd_run(user_id, cmd, env, ws, unit, str(env_file))
     try:
-        result = subprocess.run(wrapped, capture_output=True, text=True,
-                                timeout=turn_timeout_sec(user_id) + 30)
-        rc, out, err = result.returncode, result.stdout, result.stderr
-    except subprocess.TimeoutExpired:
-        rc, out, err = 124, "", "timeout"
+        rc, out, err = _run_streaming(wrapped, user_id, project,
+                                      timeout=turn_timeout_sec(user_id) + 30)
     finally:
         try:
             env_file.unlink()
@@ -1114,6 +1159,183 @@ def run_claude_turn(user_id: int, project: str, prompt: str) -> tuple[str, str]:
     return _parse_turn_result(rc, out, err, user_id, project, prompt, sid)
 
 
+# 턴에서 수집한 도구 호출 줄 — 워커가 최종 응답 뒤에 tool_log 로 보낸다 (맥 데몬과 같은 포맷)
+_turn_tool_lines: dict[tuple[int, str], list[str]] = {}
+STREAM_INTERVAL_SEC = 2.0
+
+
+def _tool_line(block: dict) -> str | None:
+    name = block.get("name", "")
+    inp = block.get("input", {}) or {}
+    if not name:
+        return None
+    detail = ""
+    if name == "Bash":
+        c = " ".join(str(inp.get("command", "")).split())
+        detail = f": {c[:80]}" if c else ""
+    elif name in ("Read", "Write", "Edit"):
+        fp = inp.get("file_path", "")
+        detail = f": {fp}" if fp else ""
+    elif name in ("Glob", "Grep"):
+        pat = inp.get("pattern", "")
+        detail = f": {pat}" if pat else ""
+    elif name in ("WebSearch",):
+        q = inp.get("query", "")
+        detail = f": {q[:60]}" if q else ""
+    elif name == "WebFetch":
+        u = inp.get("url", "")
+        detail = f": {u[:60]}" if u else ""
+    return f"🔧 {name}{detail}"
+
+
+class _StreamCollector:
+    """stream-json 이벤트를 먹여 응답 텍스트를 누적한다 (맥 daemon/claude_runner.py 규약 이식).
+
+    - 모든 assistant text 블록을 순서대로 합친다 (도구 앞뒤 발화 전부).
+    - result 이벤트는 '마지막 메시지만' 담으므로, 이미 수집된 구간이면 덧붙이지 않는다.
+      한 턴에 result 가 여러 번 오면(백그라운드 재개) 구간 사이에 --- 경계를 넣는다."""
+
+    def __init__(self):
+        self.text = ""
+        self.tool_lines: list[str] = []
+        self.session_id: str | None = None
+        self.is_error = False
+        self.error_text = ""
+        self._seg_start = 0
+        self._pending_boundary = False
+        self._saw_event = False
+
+    def feed(self, line: str) -> bool:
+        """한 줄 처리. 화면 갱신이 필요한 변화가 있으면 True."""
+        line = line.strip()
+        if not line.startswith("{"):
+            return False
+        try:
+            ev = json.loads(line)
+        except json.JSONDecodeError:
+            return False
+        self._saw_event = True
+        et = ev.get("type", "")
+        changed = False
+        if et == "assistant":
+            for block in (ev.get("message") or {}).get("content", []) or []:
+                bt = block.get("type")
+                if bt == "tool_use":
+                    tl = _tool_line(block)
+                    if tl:
+                        self.tool_lines.append(tl)
+                        changed = True
+                elif bt == "text":
+                    t = block.get("text", "")
+                    if not t:
+                        continue
+                    if self._pending_boundary:
+                        if self.text.strip():
+                            self.text = self.text.rstrip() + "\n\n---\n\n"
+                            self._seg_start = len(self.text)
+                        self._pending_boundary = False
+                    elif self.text and not self.text.endswith("\n\n"):
+                        self.text += "\n\n"
+                    self.text += t
+                    changed = True
+        elif et == "result":
+            if ev.get("session_id"):
+                self.session_id = ev["session_id"]
+            rt = (ev.get("result") or "")
+            if ev.get("is_error"):
+                self.is_error = True
+                self.error_text = str(ev.get("error", "")) + str(rt)
+            elif rt:
+                seg = self.text[self._seg_start:].strip()
+                rts = rt.strip()
+                if not seg:
+                    self.text = (self.text.rstrip() + "\n\n---\n\n" + rt) if self.text.strip() else rt
+                elif rts and rts not in seg:
+                    self.text = self.text.rstrip() + "\n\n" + rt
+                self._seg_start = len(self.text)
+                self._pending_boundary = True
+                changed = True
+        return changed
+
+    def display(self) -> str:
+        if self.tool_lines:
+            return "\n".join(self.tool_lines) + ("\n\n" + self.text if self.text else "")
+        return self.text
+
+
+def _run_streaming(wrapped: list[str], user_id: int, project: str, timeout: int) -> tuple[int, str, str]:
+    """claude 를 실행하며 stdout 을 줄 단위로 읽어 중간 응답을 웹에 흘린다.
+    returns (rc, stdout 전체, stderr). 파싱은 _parse_turn_result 가 다시 한다."""
+    user = roster.get(user_id)
+    api_key = user["apiKey"] if user else None
+    col = _StreamCollector()
+    out_lines: list[str] = []
+    err_buf: list[str] = []
+    try:
+        proc = subprocess.Popen(wrapped, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, bufsize=1)
+    except OSError as e:
+        return (1, "", str(e))
+
+    def _drain_err():
+        try:
+            for l in proc.stderr:
+                err_buf.append(l)
+        except Exception:
+            pass
+    threading.Thread(target=_drain_err, daemon=True).start()
+
+    deadline = time.time() + timeout
+    last_push = 0.0
+    dirty = False
+    timed_out = threading.Event()
+
+    def _watchdog():
+        timed_out.set()
+        try:
+            proc.kill()
+        except Exception:
+            pass
+    # 출력이 없으면 아래 for 가 블록돼 데드라인 검사가 안 돈다 → 타이머로 강제 종료
+    wd = threading.Timer(timeout, _watchdog)
+    wd.daemon = True
+    wd.start()
+    try:
+        for line in proc.stdout:
+            out_lines.append(line)
+            if col.feed(line):
+                dirty = True
+            now = time.time()
+            if api_key and dirty and (now - last_push) >= STREAM_INTERVAL_SEC:
+                disp = col.display()
+                if disp:
+                    user_api(api_key, "POST", "/api/bot/reply",
+                             {"text": disp, "project": project, "is_final": False})
+                last_push, dirty = now, False
+            if now > deadline:
+                proc.kill()
+                break
+    except Exception as e:
+        logger.warning(f"stream read failed user={user_id}: {e}")
+    try:
+        rc = proc.wait(timeout=30)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        rc = 124
+    wd.cancel()
+    if timed_out.is_set() or (time.time() > deadline and rc != 0):
+        return (124, "".join(out_lines), "timeout")
+    return (rc, "".join(out_lines), "".join(err_buf))
+
+
+def _collect_stream(out: str) -> _StreamCollector | None:
+    """stdout 전체를 stream-json 으로 해석. 이벤트가 하나도 없으면 None (구형 json 출력)."""
+    col = _StreamCollector()
+    for line in out.splitlines():
+        col.feed(line)
+    return col if col._saw_event else None
+
+
 def _parse_turn_result(rc, out, err, user_id, project, prompt, sid) -> tuple[str, str]:
     out = (out or "").strip()
     err = (err or "").strip()
@@ -1128,6 +1350,18 @@ def _parse_turn_result(rc, out, err, user_id, project, prompt, sid) -> tuple[str
             return run_claude_turn(user_id, project, prompt)
         logger.error(f"claude exit {rc} user={user_id}: {combined[:300]}")
         return ("(처리 중 오류가 발생했어요. 다시 시도해주세요.)", "ok")
+    col = _collect_stream(out)
+    if col is not None:
+        if col.session_id:
+            save_session(user_id, project, col.session_id)
+        _turn_tool_lines[(user_id, project)] = list(col.tool_lines)
+        if col.is_error:
+            if any(m.lower() in (col.error_text or err).lower() for m in auth_markers):
+                return ("", "auth")
+            if not col.text.strip():
+                logger.error(f"claude result error user={user_id}: {col.error_text[:300]}")
+                return ("(처리 중 오류가 발생했어요. 다시 시도해주세요.)", "ok")
+        return (col.text.strip() or "(응답이 비어 있어요)", "ok")
     try:
         payload = json.loads(out)
         text = payload.get("result", "")
@@ -1456,6 +1690,113 @@ def collect_usage_after_turn(user_id: int, api_key: str):
                      daemon=True, name=f"usage-{user_id}").start()
 
 
+# ── 자가진단 (2026-08-25) ────────────────────────────────────────────
+# SSH 가 닫힌 전용 호스트(뉴넥스 사내 서버 등)에서 운영자·에이전트가 채팅만으로 데몬 상태를
+# 볼 수 있게 한다. claude 턴을 돌리지 않고 데몬 프로세스가 직접 리포트를 만든다(턴 미소비).
+# 트리거: 메시지 본문이 "데몬 진단"/"/selfcheck"/"/진단" 이거나 어디든 [[pv/selfcheck]] 마커 포함.
+# 외부 릴레이([외부 relay @핸들 …])로 온 요청이면 보낸 핸들에게도 같은 리포트를 회신한다.
+SELFCHECK_MARKER = "[[pv/selfcheck]]"
+SELFCHECK_WORDS = {"데몬 진단", "데몬진단", "/selfcheck", "/진단", "pv selfcheck"}
+_SECRET_RE = re.compile(r"(sk-ant-[A-Za-z0-9_\-]{8,}|chk_[0-9a-f]{12,}|pv_[A-Za-z0-9]{16,}|Bearer\s+\S+|[A-Za-z0-9_\-]{40,})")
+
+
+def is_selfcheck_trigger(text: str) -> bool:
+    t = (text or "").strip()
+    if not t:
+        return False
+    if SELFCHECK_MARKER in t:
+        return True
+    # 외부 릴레이 머리말 뒤 본문만 비교
+    body = t.split("\n", 1)[1].strip() if t.startswith("[외부 relay") and "\n" in t else t
+    return body.lower() in SELFCHECK_WORDS
+
+
+def _redact(s: str) -> str:
+    return _SECRET_RE.sub("***", s or "")
+
+
+def _sh(cmd: list[str], timeout: int = 20) -> str:
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        out = (r.stdout or "") + (("\n" + r.stderr) if r.stderr and r.returncode != 0 else "")
+        return out.strip() or f"(exit {r.returncode}, no output)"
+    except FileNotFoundError:
+        return f"(없음: {cmd[0]})"
+    except subprocess.TimeoutExpired:
+        return "(timeout)"
+    except Exception as e:
+        return f"(error: {e})"
+
+
+def selfcheck_report(user_id: int) -> str:
+    """호스트·데몬·사용량 스레드 상태를 한 장으로. 비밀값은 마스킹."""
+    t0 = time.time()
+    L: list[str] = []
+    repo = Path(__file__).resolve().parent.parent
+    L.append("## 🩺 피터보이스 데몬 자가진단")
+    L.append(f"- 시각(UTC): {time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime())} / 호스트: {socket.gethostname()} / 데몬 PID: {os.getpid()}")
+    head = _sh(["git", "-C", str(repo), "log", "-1", "--format=%h %ad %s", "--date=short"])
+    branch = _sh(["git", "-C", str(repo), "branch", "--show-current"])
+    L.append(f"- 데몬 코드: `{_redact(head)}` (branch {branch})")
+    st = _sh(["systemctl", "show", "pv-cloud", "-p", "ActiveState", "-p", "ActiveEnterTimestamp", "-p", "MainPID"])
+    L.append("- 서비스: " + " / ".join(x for x in st.splitlines() if x))
+    L.append(f"- 시스템: load {_sh(['cat', '/proc/loadavg']).split()[0:3]} | " + _sh(["free", "-m"]).replace("\n", " ; ")[:160])
+    L.append(f"- 디스크(/): {' '.join(_sh(['df', '-h', '/']).splitlines()[-1].split()[1:5])}")
+
+    # 설정 요약 (키 제외)
+    safe = {k: v for k, v in config.items() if k not in ("api_key", "host_key", "supabase_key")}
+    L.append(f"- 설정: api_url={safe.get('api_url')} max_concurrent={safe.get('max_concurrent')} dedicated={safe.get('dedicated')} "
+             f"container={'on' if (safe.get('container') or {}).get('enabled') else 'off'} limits={safe.get('limits')}")
+
+    # API 연결
+    t = time.time()
+    try:
+        poll = host_api("GET", "/api/cloud/poll")
+    except Exception as e:
+        poll = None
+        L.append(f"- 중앙 API 폴링: 예외 {e}")
+    L.append(f"- 중앙 API 폴링: {'OK' if poll is not None else '실패'} ({int((time.time()-t)*1000)}ms)"
+             + (f", usage_refresh 대기={poll.get('usage_refresh')} pending={len(poll.get('pending') or [])}" if poll else ""))
+
+    # 유저·사용량 스레드
+    u = roster.get(user_id) or {}
+    lim = user_limits(user_id, peek=True) or {}
+    L.append(f"- 유저 {user_id}: tier={u.get('tier')} limits={ {k: lim.get(k) for k in ('memoryMax','cpuQuota','turnsPerMonth','containerAlwaysOn') if k in lim} }")
+    last = _usage_last.get(user_id)
+    L.append(f"- 사용량 수집: 마지막 시도 {int(time.time()-last)}초 전" if last else "- 사용량 수집: 기동 후 시도 없음")
+    L.append(f"  - 새로고침 대기 플래그(데몬 메모리): {user_id in _usage_refresh} / 수집 성공 이력: {user_id in _usage_ok}")
+    L.append(f"  - 로그인(credentials): {has_credentials(user_id)}"
+             + (f" / 컨테이너: {ctr.container_state(user_id)}" if ctr.enabled_for(user_id) else " / 모드: systemd"))
+    t = time.time()
+    try:
+        probe = probe_usage(user_id, allow_wake=True)
+        L.append(f"  - 지금 /usage 프로브: {'OK '+json.dumps(probe, ensure_ascii=False)[:300] if probe else '실패(None)'} ({int(time.time()-t)}초)")
+    except Exception as e:
+        L.append(f"  - 지금 /usage 프로브: 예외 {e}")
+
+    # 턴 유닛 / 고아
+    units = _sh(["systemctl", "list-units", "--no-legend", "--plain", "pvturn-*"])
+    mine = f"-{os.getpid()}-"
+    names = [ln.split()[0] for ln in units.splitlines() if ln.startswith("pvturn-")]
+    orphans = [n for n in names if mine not in n]
+    L.append(f"- 실행 중 턴: {len(names)}개" + (f" ⚠️ 고아(이전 데몬 소속) {orphans}" if orphans else ""))
+
+    # 로그
+    jl = _sh(["sudo", "-n", "journalctl", "-u", "pv-cloud", "--since", "-3h", "--no-pager", "-o", "short-iso"], timeout=30)
+    lines = jl.splitlines()
+    usage_lines = [x for x in lines if "[usage]" in x and "session=" not in x][-15:]
+    err_lines = [x for x in lines if "ERROR" in x or "Traceback" in x or "WARNING" in x][-15:]
+    def _trim(x: str) -> str:
+        x = re.sub(r"^\S+ \S+ python3\[\d+\]: ", "", x)
+        return _redact(x)[:180]
+    L.append("- 최근 3h [usage] 로그:")
+    L.extend("  " + _trim(x) for x in usage_lines) if usage_lines else L.append("  (없음 — journalctl 권한/로그 확인)")
+    L.append("- 최근 3h 오류/경고:")
+    L.extend("  " + _trim(x) for x in err_lines) if err_lines else L.append("  (없음)")
+    L.append(f"_생성 {int(time.time()-t0)}초_")
+    return "\n".join(L)
+
+
 class UsageThread(threading.Thread):
     """유저별 사용 한도 수집 — 15분 주기 + 배너 새로고침 버튼(usage_refresh) 대응."""
 
@@ -1636,6 +1977,23 @@ class CloudWorker:
             return
         logger.info(f"msg #{msg_id} user={user_id} project={project}: {text[:60]}")
 
+        # ── 자가진단 (턴 미소비, claude 미실행) ──
+        if is_selfcheck_trigger(text):
+            self.reply(api_key, "🩺 데몬 자가진단을 실행 중입니다 (1분 내)...", [msg_id], project)
+            try:
+                report = selfcheck_report(user_id)
+            except Exception as e:
+                logger.error(f"selfcheck failed user={user_id}: {e}", exc_info=True)
+                report = f"자가진단 중 오류: {e}"
+            for chunk in _split_chunks(report):
+                self.reply(api_key, chunk, [msg_id], project)
+            m = re.match(r"\[외부 relay @([A-Za-z0-9_.\-]+)", text)
+            if m:  # 외부 요청자에게도 회신 (진단을 요청한 쪽이 결과를 봐야 한다)
+                user_api(api_key, "POST", "/api/relay/external",
+                         {"to_handle": f"@{m.group(1)}", "from_project": project,
+                          "kind": "message", "text": "[자가진단 결과 회신]\n" + report})
+            return
+
         # ── 로그인 플로우 ──
         with login_lock:
             session = login_sessions.get(user_id)
@@ -1656,11 +2014,11 @@ class CloudWorker:
                            [msg_id], project)
             else:
                 self.reply(api_key,
-                           "연결에 실패했어요. `재로그인` 이라고 입력해 다시 시도해주세요.",
+                           "연결에 실패했어요. `클로드 로그인` 이라고 입력해 다시 시도해주세요.",
                            [msg_id], project)
             return
 
-        if text in ("재로그인", "/relogin", "리로그인", "로그인", "클로드 연결", "연결"):
+        if is_login_trigger(text):
             self.reply(api_key, "클로드 로그인을 시작할게요. 잠시만요...", [msg_id], project)
             new_session = LoginSession(user_id)
             with login_lock:
@@ -1677,7 +2035,7 @@ class CloudWorker:
                 with login_lock:
                     login_sessions.pop(user_id, None)
                 self.reply(api_key,
-                           "로그인 준비에 실패했어요. 잠시 후 `재로그인` 으로 다시 시도해주세요.",
+                           "로그인 준비에 실패했어요. 잠시 후 `클로드 로그인` 이라고 입력해 다시 시도해주세요.",
                            [msg_id], project)
             return
 
@@ -1733,7 +2091,7 @@ class CloudWorker:
             self.maybe_warn_quota(api_key, user_id, project, msg_id)
         if status == "auth":
             self.reply(api_key,
-                       "클로드 로그인이 만료됐어요. `재로그인` 이라고 입력해 다시 연결해주세요.",
+                       "클로드 로그인이 만료됐어요. `클로드 로그인` 이라고 입력해 다시 연결해주세요.",
                        [msg_id], project)
             return
         if status in ("heavy_mem", "heavy_time"):
@@ -1755,6 +2113,13 @@ class CloudWorker:
             user_api(api_key, "POST", "/api/bot/reply", {
                 "text": chunk, "reply_to": [msg_id], "project": project,
                 "is_final": True, **({"subtype": st} if st else {}),
+            })
+        # 도구 호출 로그는 본문 뒤에 별도 tool_log 로 (맥 데몬과 동일한 배치)
+        tool_lines = _turn_tool_lines.pop((user_id, project), None)
+        if tool_lines:
+            user_api(api_key, "POST", "/api/bot/reply", {
+                "text": "\n".join(tool_lines), "reply_to": [msg_id], "project": project,
+                "is_final": True, "subtype": "tool_log",
             })
 
     def maybe_warn_quota(self, api_key, user_id, project, msg_id):

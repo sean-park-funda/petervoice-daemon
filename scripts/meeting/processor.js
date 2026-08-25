@@ -61,7 +61,17 @@ async function triggerMinutes(config, meeting, transcriptDocRelPath, opts = {}) 
   const names = Object.values(meeting.speaker_map || {}).filter(Boolean);
   const attendees = names.length ? names.join(", ") : "미확정 (화자1/2/3 표기)";
 
-  const text = opts.relabel
+  const text = opts.upgraded
+    ? (
+      `[회의록 정밀 갱신] meeting_id=${meeting.id}\n` +
+      `실시간(러프) 전사로 임시 작성했던 회의의 **정밀 화자분리 전사**가 완료되었습니다.\n` +
+      `새 원본 전사: ${transcriptDocRelPath}\n` +
+      `참석자: ${attendees}\n` +
+      `회의록 파일: ${minutesDoc}\n\n` +
+      `위 회의록 문서가 있으면 **새 문서를 만들지 말고** 정밀 전사 기준으로 그 문서를 ` +
+      `갱신해주세요. 없으면 전사를 읽고 해당 경로에 회의록을 작성해주세요.`
+    )
+    : opts.relabel
     ? (
       `[회의록 이름 갱신] meeting_id=${meeting.id}\n` +
       `화자 이름이 수정되었습니다. 새 참석자: ${attendees}\n` +
@@ -99,8 +109,38 @@ async function triggerMinutes(config, meeting, transcriptDocRelPath, opts = {}) 
         processed: false,
       }),
     });
+    if (!res.ok) console.warn(`[meeting] ${meeting.id} minutes trigger failed: HTTP ${res.status}`);
     return res.ok;
-  } catch {
+  } catch (e) {
+    console.warn(`[meeting] ${meeting.id} minutes trigger failed: ${e.message || e}`);
+    return false;
+  }
+}
+
+/**
+ * Post a bot-side notice straight into the meeting session's chat via
+ * /api/bot/reply — a plain bot message, so the agent is NOT invoked (no
+ * Claude turn, no cost). Fills the silent gap between meeting end and the
+ * label-or-grace-period-delayed minutes.
+ */
+async function postChatNotice(config, project, text) {
+  const apiUrl = config.api_url || "https://www.peter-voice.site";
+  const apiKey = config.api_key;
+  if (!apiKey || !project) return false;
+  try {
+    const res = await fetch(`${apiUrl}/api/bot/reply`, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${apiKey}`,
+        "X-Api-Key": apiKey,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ project, text, subtype: "meeting_notice" }),
+    });
+    if (!res.ok) console.warn(`[meeting] chat notice failed: HTTP ${res.status} (${project})`);
+    return res.ok;
+  } catch (e) {
+    console.warn(`[meeting] chat notice failed: ${e.message || e} (${project})`);
     return false;
   }
 }
@@ -112,15 +152,19 @@ async function triggerMinutes(config, meeting, transcriptDocRelPath, opts = {}) 
  */
 async function processMeeting({ configDir, config, meetingId, projectDocsDir, log }) {
   const out = log || (() => {});
+  const meta = store.readMeta(configDir, meetingId);
+  if (!meta) { out(`[meeting] ${meetingId} meta missing`); return; }
+
   const sonioxKey = await resolveSonioxKey(config);
   if (!sonioxKey) {
-    store.updateMeta(configDir, meetingId, { status: "failed", error: "Soniox 키를 가져오지 못했습니다" });
+    // attempt counted so the sweep's precise-retry cap applies to key outages too
+    store.updateMeta(configDir, meetingId, {
+      status: "failed", error: "Soniox 키를 가져오지 못했습니다",
+      async_attempts: (meta.async_attempts || 0) + 1,
+    });
     out(`[meeting] ${meetingId} failed: no Soniox key (local + web both unavailable)`);
     return;
   }
-
-  const meta = store.readMeta(configDir, meetingId);
-  if (!meta) { out(`[meeting] ${meetingId} meta missing`); return; }
 
   try {
     store.updateMeta(configDir, meetingId, { status: "processing", phase: "transcribing" });
@@ -159,11 +203,13 @@ async function processMeeting({ configDir, config, meetingId, projectDocsDir, lo
     const rel = docPath.split("/docs/").pop();
     const transcriptRel = rel ? `docs/${rel}` : docPath;
 
-    store.updateMeta(configDir, meetingId, {
+    const updated = store.updateMeta(configDir, meetingId, {
       status: "transcribed",
       phase: "done",
       transcript_doc: transcriptRel,
-      minutes_doc: minutesDocFor(transcriptRel),
+      // A meeting retried after a fallback already has a minutes doc — keep
+      // that path so the bot updates the existing minutes in place.
+      minutes_doc: meta.minutes_doc || minutesDocFor(transcriptRel),
       docs_dir: projectDocsDir,
       speakers,
       speaker_map: speakerMap,
@@ -173,13 +219,37 @@ async function processMeeting({ configDir, config, meetingId, projectDocsDir, lo
     });
     out(`[meeting] ${meetingId} transcribed → ${transcriptRel} (${speakers.length} speakers)`);
 
+    // A precise retry supersedes an earlier fallback doc — remove it so the
+    // docs tab doesn't show two transcripts for one meeting.
+    if (meta.transcript_doc && meta.transcript_doc !== transcriptRel
+        && /-fallback-transcript\.md$/.test(meta.transcript_doc) && meta.docs_dir) {
+      try { fs.unlinkSync(path.join(meta.docs_dir, meta.transcript_doc.replace(/^docs\//, ""))); } catch { /* best-effort */ }
+    }
+
     // Audio is no longer needed once transcribed → delete to cap local disk use.
     try { store.deleteAudio(configDir, meetingId); } catch { /* best-effort */ }
 
-    // NOTE: minutes are NOT triggered here. The user labels speakers first, and
-    // labelMeeting (or the "이름 없이 작성"/close path) triggers minutes with the
-    // resolved names — otherwise the bot summarizes 화자N and guesses names.
-    out(`[meeting] ${meetingId} awaiting speaker labels before minutes`);
+    if (meta.minutes_requested_at) {
+      // Minutes already went out based on the rough live transcript (fallback).
+      // Tell the bot to refresh them from the precise transcript.
+      const triggered = await triggerMinutes(config || {}, updated, transcriptRel, { upgraded: true });
+      store.updateMeta(configDir, meetingId, {
+        status: triggered ? "minutes_pending" : "transcribed",
+        ...(triggered ? { minutes_requested_at: new Date().toISOString() } : {}),
+      });
+      out(`[meeting] ${meetingId} precise-upgrade minutes ${triggered ? "triggered" : "NOT triggered"}`);
+    } else {
+      // NOTE: minutes are NOT triggered here. The user labels speakers first, and
+      // labelMeeting (or the auto-minutes checker after the grace period) triggers
+      // minutes with the resolved names — otherwise the bot guesses names.
+      out(`[meeting] ${meetingId} awaiting speaker labels before minutes`);
+      const durMin = Math.max(1, Math.round((updated.duration_sec || meta.duration_sec || 0) / 60));
+      await postChatNotice(config || {}, updated.project,
+        `🎙️ 회의 전사가 저장되었습니다 (약 ${durMin}분, 화자 ${speakers.length}명).\n` +
+        `- 전체 대화 기록: ${transcriptRel} (문서 탭에서 확인)\n` +
+        `- 회의 화면에서 화자 이름을 입력하면 실명으로 회의록을 정리합니다.\n` +
+        `- 이름 입력이 없으면 약 ${AUTO_MINUTES_AFTER_MIN}분 후 화자1/화자2 표기로 자동 정리됩니다.`);
+    }
   } catch (e) {
     // Fallback: if async diarization failed but we captured a live transcript,
     // save that so the meeting isn't lost.
@@ -188,7 +258,10 @@ async function processMeeting({ configDir, config, meetingId, projectDocsDir, lo
       reason: String(e.message || e), out,
     });
     if (ok) return;
-    store.updateMeta(configDir, meetingId, { status: "failed", error: String(e.message || e) });
+    store.updateMeta(configDir, meetingId, {
+      status: "failed", error: String(e.message || e),
+      async_attempts: (meta.async_attempts || 0) + 1,
+    });
     out(`[meeting] ${meetingId} error: ${e.message || e}`);
   }
 }
@@ -221,20 +294,25 @@ async function fallbackToLiveTranscript({ configDir, config, meta, projectDocsDi
     const updated = store.updateMeta(configDir, meetingId, {
       status: "transcribed", phase: "fallback",
       transcript_doc: fallbackRel,
-      minutes_doc: minutesDocFor(fallbackRel),
+      minutes_doc: meta.minutes_doc || minutesDocFor(fallbackRel),
       docs_dir: projectDocsDir,
       error: `async 실패, 실시간 전사로 대체: ${reason}`,
+      // Count the failed precise attempt; the sweep retries while audio remains
+      // (capped) and this counter stops an endless retry loop.
+      async_attempts: (meta.async_attempts || 0) + 1,
     });
     out(`[meeting] ${meetingId} fallback to live transcript`);
     // Even when async failed, still hand the (live) transcript to the bot so
     // the meeting gets summarized — otherwise the project agent never hears
-    // about it and no minutes are produced.
-    const triggered = await triggerMinutes(config || {}, updated, fallbackRel);
+    // about it and no minutes are produced. Skip when minutes already went out
+    // (a retried fallback would spam the bot with the same content).
+    const already = !!meta.minutes_requested_at;
+    const triggered = already ? false : await triggerMinutes(config || {}, updated, fallbackRel);
     store.updateMeta(configDir, meetingId, {
-      status: triggered ? "minutes_pending" : "transcribed",
+      status: (triggered || already) ? "minutes_pending" : "transcribed",
       ...(triggered ? { minutes_requested_at: new Date().toISOString() } : {}),
     });
-    out(`[meeting] ${meetingId} fallback minutes ${triggered ? "triggered" : "NOT triggered"}`);
+    out(`[meeting] ${meetingId} fallback minutes ${already ? "already requested" : triggered ? "triggered" : "NOT triggered"}`);
     return true;
   } catch (e2) {
     out(`[meeting] ${meetingId} fallback write failed: ${e2.message}`);
@@ -247,11 +325,21 @@ async function fallbackToLiveTranscript({ configDir, config, meta, projectDocsDi
 // AutoUpdater restarts it whenever meeting code changes). transcribeFile emits
 // a heartbeat while polling, so an actively-processing meeting stays fresh.
 const STUCK_AFTER_MIN = 30;
+// Precise-retry policy for meetings that ended in fallback/failed while their
+// audio is still on disk: retry up to N times within the retention window,
+// then (and past the window) delete the residual audio. Audio of successfully
+// transcribed meetings is still deleted immediately — this only governs
+// leftovers from failures.
+const MAX_ASYNC_ATTEMPTS = 2;
+const AUDIO_RETENTION_MS = 48 * 60 * 60 * 1000;
 
 /**
  * Recover meetings orphaned in "processing". Run at Home Portal startup and
  * periodically. Audio still on disk → retry transcription; audio gone → fall
  * back to the live transcript; neither → mark failed (nothing to recover).
+ * Also: retry precise transcription for fallback/failed meetings whose audio
+ * survived (network blip during polling etc.), and clean up residual audio
+ * past the retention window.
  */
 async function sweepStuckMeetings({ configDir, config, log }) {
   const out = log || (() => {});
@@ -259,25 +347,81 @@ async function sweepStuckMeetings({ configDir, config, log }) {
   try { metas = store.listMeetings(configDir); } catch { return; }
   const cutoff = Date.now() - STUCK_AFTER_MIN * 60 * 1000;
   for (const meta of metas) {
-    if (meta.status !== "processing") continue;
-    const touched = Date.parse(meta.updated_at || meta.created_at || "") || 0;
-    if (touched > cutoff) continue; // still fresh — likely actively processing
     const id = meta.id;
     const audio = store.audioPath(configDir, id);
     const hasAudio = (() => { try { return fs.existsSync(audio); } catch { return false; } })();
-    if (hasAudio && meta.docs_dir) {
-      out(`[meeting] sweep: ${id} stuck in processing — retrying transcription`);
+
+    if (meta.status === "processing") {
+      const touched = Date.parse(meta.updated_at || meta.created_at || "") || 0;
+      if (touched > cutoff) continue; // still fresh — likely actively processing
+      if (hasAudio && meta.docs_dir) {
+        out(`[meeting] sweep: ${id} stuck in processing — retrying transcription`);
+        await processMeeting({ configDir, config, meetingId: id, projectDocsDir: meta.docs_dir, log: out })
+          .catch((e) => out(`[meeting] sweep retry failed: ${e.message}`));
+      } else if ((meta.live_transcript || "").trim() && meta.docs_dir) {
+        out(`[meeting] sweep: ${id} audio unavailable — falling back to live transcript`);
+        await fallbackToLiveTranscript({
+          configDir, config, meta, projectDocsDir: meta.docs_dir,
+          reason: "처리 중단(홈포탈 재시작 추정)", out,
+        });
+      } else {
+        out(`[meeting] sweep: ${id} unrecoverable — marking failed`);
+        store.updateMeta(configDir, id, { status: "failed", error: "처리 중단(복구 불가: 오디오·전사 없음)" });
+      }
+      continue;
+    }
+
+    // Fallback/failed but audio survived → the precise transcript is still
+    // attainable. Retry within the cap/window; on success processMeeting
+    // replaces the fallback doc and refreshes the minutes in place.
+    const attempts = meta.async_attempts || 0;
+    const ageMs = Date.now() - (Date.parse(meta.created_at || "") || 0);
+    const failedOrFallback = meta.status === "failed" || meta.phase === "fallback";
+    if (hasAudio && failedOrFallback && meta.docs_dir
+        && attempts < MAX_ASYNC_ATTEMPTS && ageMs < AUDIO_RETENTION_MS) {
+      out(`[meeting] sweep: ${id} retrying precise transcription (attempt ${attempts + 1}/${MAX_ASYNC_ATTEMPTS})`);
       await processMeeting({ configDir, config, meetingId: id, projectDocsDir: meta.docs_dir, log: out })
-        .catch((e) => out(`[meeting] sweep retry failed: ${e.message}`));
-    } else if ((meta.live_transcript || "").trim() && meta.docs_dir) {
-      out(`[meeting] sweep: ${id} audio unavailable — falling back to live transcript`);
-      await fallbackToLiveTranscript({
-        configDir, config, meta, projectDocsDir: meta.docs_dir,
-        reason: "처리 중단(홈포탈 재시작 추정)", out,
+        .catch((e) => out(`[meeting] sweep precise retry failed: ${e.message}`));
+      continue;
+    }
+
+    // Residual audio past the retention window (retries exhausted or too old).
+    if (hasAudio && ageMs > AUDIO_RETENTION_MS) {
+      store.deleteAudio(configDir, id);
+      out(`[meeting] sweep: ${id} residual audio removed (48h retention)`);
+    }
+  }
+}
+
+// Grace period for manual speaker labeling before minutes are auto-triggered.
+const AUTO_MINUTES_AFTER_MIN = 10;
+
+/**
+ * Auto-trigger minutes for transcribed meetings that were never labeled.
+ * The label UI triggers minutes on save — but if the user closed the tab (or
+ * the meeting auto-stopped at the cap while unattended), nothing would ever
+ * produce minutes. After the grace period, send the transcript to the bot
+ * with 화자N names; a later label save still renames everything in place via
+ * the relabel path. Run every few minutes from the Home Portal.
+ */
+async function autoTriggerPendingMinutes({ configDir, config, log }) {
+  const out = log || (() => {});
+  let metas = [];
+  try { metas = store.listMeetings(configDir); } catch { return; }
+  const cutoff = Date.now() - AUTO_MINUTES_AFTER_MIN * 60 * 1000;
+  for (const meta of metas) {
+    if (meta.status !== "transcribed" || meta.phase !== "done") continue;
+    if (meta.minutes_requested_at || !meta.transcript_doc) continue;
+    const t = Date.parse(meta.updated_at || meta.created_at || "") || 0;
+    if (t > cutoff) continue; // still within the labeling grace period
+    const triggered = await triggerMinutes(config || {}, meta, meta.transcript_doc);
+    if (triggered) {
+      store.updateMeta(configDir, meta.id, {
+        status: "minutes_pending",
+        minutes_requested_at: new Date().toISOString(),
+        minutes_auto: true,
       });
-    } else {
-      out(`[meeting] sweep: ${id} unrecoverable — marking failed`);
-      store.updateMeta(configDir, id, { status: "failed", error: "처리 중단(복구 불가: 오디오·전사 없음)" });
+      out(`[meeting] ${meta.id} auto-triggered minutes (unlabeled after ${AUTO_MINUTES_AFTER_MIN}m)`);
     }
   }
 }
@@ -324,4 +468,4 @@ async function labelMeeting({ configDir, config, meetingId, labels }) {
   return { speaker_map: speakerMap, rewritten: !!rewritten, minutes_triggered: triggered };
 }
 
-module.exports = { processMeeting, triggerMinutes, labelMeeting, sweepStuckMeetings };
+module.exports = { processMeeting, triggerMinutes, labelMeeting, sweepStuckMeetings, autoTriggerPendingMinutes };

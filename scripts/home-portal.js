@@ -14,11 +14,12 @@ const os = require("os");
 const { execSync, spawnSync, spawn } = require("child_process");
 
 // ─── Meeting mode (modular) ──────────────────────────
-let meetingStore = null, processMeeting = null, meetingLabel = null, meetingSweep = null;
+let meetingStore = null, processMeeting = null, meetingLabel = null, meetingSweep = null, meetingAutoMinutes = null;
 try {
   const MDIR = path.join(path.dirname(__filename), "meeting");
   meetingStore = require(path.join(MDIR, "meeting-store"));
-  ({ processMeeting, labelMeeting: meetingLabel, sweepStuckMeetings: meetingSweep } = require(path.join(MDIR, "processor")));
+  ({ processMeeting, labelMeeting: meetingLabel, sweepStuckMeetings: meetingSweep,
+    autoTriggerPendingMinutes: meetingAutoMinutes } = require(path.join(MDIR, "processor")));
 } catch (e) {
   console.warn("[meeting] module not available:", e.message);
 }
@@ -114,13 +115,50 @@ function loadConfig() {
 // A restart of this process (AutoUpdater does it whenever meeting code changes)
 // kills in-flight transcriptions, leaving meetings stuck in "processing".
 // Sweep shortly after boot and periodically to retry or fall back.
+// 중단된 업로드가 남긴 임시 청크(.part/.state) 청소 — 24h 지난 것만
+function cleanStaleMeetingParts() {
+  try {
+    const dir = path.join(os.tmpdir(), "pv-meeting-chunks");
+    if (!fs.existsSync(dir)) return;
+    const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+    for (const f of fs.readdirSync(dir)) {
+      const p = path.join(dir, f);
+      try { if (fs.statSync(p).mtimeMs < cutoff) fs.unlinkSync(p); } catch { /* ignore */ }
+    }
+  } catch { /* ignore */ }
+}
+
+// 스윕/자동회의록 공통 실행기: 셀프호스트는 CONFIG_DIR 1건, 클라우드는 유저별
+// (<usersRoot>/<uid>) 반복 — 회의록 트리거가 그 유저의 api_key 로 나가야 한다.
+async function forEachMeetingBase(fn) {
+  for (const t of meetingSweepTargets()) {
+    const config = t.uid
+      ? { api_url: cloudApiUrl(), api_key: await cloudUserApiKey(t.uid) }
+      : loadConfig();
+    await Promise.resolve(fn(t.configDir, config))
+      .catch((e) => console.warn(`[meeting] base ${t.uid || "local"} failed:`, e.message));
+  }
+}
+
 if (meetingSweep) {
   const runSweep = () => {
-    Promise.resolve(meetingSweep({ configDir: CONFIG_DIR, config: loadConfig(), log: (m) => console.log(m) }))
+    cleanStaleMeetingParts();
+    forEachMeetingBase((configDir, config) => meetingSweep({ configDir, config, log: (m) => console.log(m) }))
       .catch((e) => console.warn("[meeting] sweep failed:", e.message));
   };
   setTimeout(runSweep, 60 * 1000);
   setInterval(runSweep, 6 * 60 * 60 * 1000);
+}
+
+// 라벨 미입력 회의 자동 회의록: 전사 후 10분 내 이름 입력이 없으면 화자N으로라도
+// 회의록을 트리거한다 — 탭을 닫아버린 회의가 회의록 없이 방치되는 구멍 방지.
+if (meetingAutoMinutes) {
+  const runAutoMinutes = () => {
+    forEachMeetingBase((configDir, config) => meetingAutoMinutes({ configDir, config, log: (m) => console.log(m) }))
+      .catch((e) => console.warn("[meeting] auto-minutes failed:", e.message));
+  };
+  setTimeout(runAutoMinutes, 2 * 60 * 1000);
+  setInterval(runAutoMinutes, 5 * 60 * 1000);
 }
 
 function loadSites() {
@@ -1318,6 +1356,85 @@ const CLOUD_MODE = process.env.PV_CLOUD_MODE === "1";
 const CLOUD_HOST_KEY = process.env.PV_CLOUD_HOST_KEY || "";
 const CLOUD_USERS_ROOT = process.env.PV_USERS_ROOT || "/srv/pv/users";
 
+// ── 클라우드 회의 지원 ──
+// 회의 데이터(오디오/메타)는 유저별로 <usersRoot>/<uid>/meetings 에 격리 저장하고,
+// 회의록 트리거(봇 호출)는 로스터에서 받은 그 유저의 api_key 로 나간다.
+// 유저 식별은 프록시가 검증한 dir(본인 워크스페이스 강제)에서 uid 를 파싱 — 별도
+// 헤더 없이 기존 프록시 보안 모델에 편승한다.
+
+function cloudApiUrl() {
+  if (process.env.PV_API_URL) return process.env.PV_API_URL;
+  try {
+    const c = JSON.parse(fs.readFileSync(process.env.PV_CLOUD_CONFIG || "/etc/pv-cloud/config.json", "utf-8"));
+    if (c.api_url) return c.api_url;
+  } catch { /* fall through */ }
+  return "https://www.peter-voice.site";
+}
+
+// 로스터(userId→apiKey) 인메모리 캐시. 5분 TTL + 미스 시 갱신.
+let meetingRoster = { at: 0, users: new Map() };
+async function cloudUserApiKey(uid) {
+  if (!CLOUD_MODE || !CLOUD_HOST_KEY) return null;
+  const key = String(uid);
+  const stale = Date.now() - meetingRoster.at > 5 * 60 * 1000;
+  if (stale || !meetingRoster.users.has(key)) {
+    try {
+      const res = await fetch(`${cloudApiUrl()}/api/cloud/roster`, { headers: { "X-Host-Key": CLOUD_HOST_KEY } });
+      if (res.ok) {
+        const d = await res.json();
+        const m = new Map();
+        for (const u of d.users || []) if (u.userId != null && u.apiKey) m.set(String(u.userId), u.apiKey);
+        meetingRoster = { at: Date.now(), users: m };
+      }
+    } catch { /* 로스터 일시 장애 — 기존(스테일) 캐시 유지 */ }
+  }
+  return meetingRoster.users.get(key) || null;
+}
+
+/** 검증된 dir(유저 워크스페이스 하위)에서 uid 추출. 클라우드 모드 전용. */
+function cloudUidFromDir(validatedDir) {
+  const root = path.resolve(CLOUD_USERS_ROOT);
+  const rel = path.relative(root, path.resolve(validatedDir));
+  const uid = rel.split(path.sep)[0];
+  return uid && uid !== ".." && !uid.startsWith(".") ? uid : null;
+}
+
+/**
+ * 회의 엔드포인트용 컨텍스트: 회의 저장 베이스(configDir)와 봇 호출용 config.
+ * 셀프호스트: 기존 그대로 (CONFIG_DIR + config.json).
+ * 클라우드: dir 필수 → uid 파싱 → <usersRoot>/<uid> 베이스 + 유저 api_key.
+ * 실패 시 { error } 반환.
+ */
+async function meetingCtx(dirField) {
+  if (!CLOUD_MODE) {
+    return { configDir: CONFIG_DIR, config: loadConfig(), uid: null, docsDir: dirField ? validateDocsDir(dirField) : null };
+  }
+  if (!dirField) return { error: "dir 필요 (클라우드 회의는 프로젝트 경로 필수)" };
+  const validated = validateDocsDir(dirField);
+  if (!validated) return { error: "접근 불가 경로" };
+  const uid = cloudUidFromDir(validated);
+  if (!uid) return { error: "접근 불가 경로" };
+  const apiKey = await cloudUserApiKey(uid);
+  return {
+    configDir: path.join(path.resolve(CLOUD_USERS_ROOT), uid),
+    config: { api_url: cloudApiUrl(), api_key: apiKey },
+    uid,
+    docsDir: validated,
+  };
+}
+
+/** 스윕/자동회의록 대상: 셀프호스트 1건 or 클라우드 유저별(meetings 폴더 있는 것만). */
+function meetingSweepTargets() {
+  if (!CLOUD_MODE) return [{ configDir: CONFIG_DIR, uid: null }];
+  const root = path.resolve(CLOUD_USERS_ROOT);
+  try {
+    return fs.readdirSync(root, { withFileTypes: true })
+      .filter((e) => e.isDirectory() && !e.name.startsWith("."))
+      .filter((e) => fs.existsSync(path.join(root, e.name, "meetings")))
+      .map((e) => ({ configDir: path.join(root, e.name), uid: e.name }));
+  } catch { return []; }
+}
+
 // ── 브라우저 세션 인계 (CDP 브리지) ──
 // 유저 브라우저(chromium)의 CDP 에 붙어 화면 프레임과 입력을 중계한다.
 // 클라우드: 컨테이너 CDP 가 호스트 127.0.0.1:(19000+uid) 로 퍼블리시됨. 셀프호스팅: 9222.
@@ -1350,6 +1467,34 @@ function cdpHttpJson(port, pathName) {
 
 function cdpHostOf(u) {
   try { return new URL(u).host; } catch { return ""; }
+}
+
+// CDP 다운 시 브라우저 셀프힐 — 9222(맥 설치형/컨테이너 내부)에서만.
+// 클라우드 호스트 포탈(19000+uid)은 컨테이너 안에서 떠야 하므로 여기서 스폰하면 안 된다
+// (그쪽은 데몬 HandoffThread 가 keep-alive 담당).
+const browserStartAttempts = new Map(); // port → 마지막 시도 ts (30초 스로틀)
+function maybeStartBrowser(port) {
+  if (port !== 9222) return false;
+  const now = Date.now();
+  if (now - (browserStartAttempts.get(port) || 0) < 30000) return true; // 이미 기동 중
+  browserStartAttempts.set(port, now);
+  const script = [
+    path.join(os.homedir(), ".claude", "skills", "browser-handoff", "scripts", "start-browser.sh"),
+    "/srv/pv/shared/skills/browser-handoff/scripts/start-browser.sh",
+  ].find(p => { try { return fs.existsSync(p); } catch { return false; } });
+  if (!script) return false;
+  try {
+    const child = spawn("bash", [script], {
+      env: { ...process.env, PV_CDP_PORT: String(port) },
+      detached: true,
+      stdio: "ignore",
+    });
+    child.unref();
+    console.log(`[browser] CDP ${port} down — start-browser.sh spawned for self-heal`);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 async function cdpConnect(port, matchUrl) {
@@ -1492,6 +1637,24 @@ async function cdpDispatchEvent(session, ev) {
   }
 }
 
+// JWT scope 권한 검사. scope="share"(공유 링크, 7일)는 공유 뷰어 경로 +
+// (토큰에 dir 있으면) 그 docs 디렉토리만 허용 — 공유 링크 수신자가 토큰을 뽑아
+// 포탈 API 전체(회의 목록·라벨·문서 삭제 등)를 호출하던 구멍 차단.
+// scope="portal"(5분) 또는 scope 없음(구버전 토큰)은 전체 허용.
+// TODO(2026-08-19 이후): 구버전 공유 링크(7일 TTL)가 전부 만료되면 쿼리 토큰의
+// scope 부재를 거부로 전환 (docs/plans/meeting-weakness-fix-plan.md 2-A 3단계).
+const SHARE_SCOPE_PATHS = new Set(["/share", "/api/docs/file"]);
+function jwtScopeAllows(payload, req) {
+  if (!payload || payload.scope !== "share") return true;
+  const urlObj = new URL(req.url, "http://localhost");
+  if (!SHARE_SCOPE_PATHS.has(urlObj.pathname)) return false;
+  if (payload.dir) {
+    const qDir = urlObj.searchParams.get("dir");
+    if (!qDir || path.resolve(qDir) !== path.resolve(payload.dir)) return false;
+  }
+  return true;
+}
+
 function verifyAuth(req) {
   if (CLOUD_MODE) {
     // 클라우드: host_key 헤더만 인정 (웹 프록시 전용).
@@ -1528,14 +1691,16 @@ function verifyAuth(req) {
     const jwt = authHeader.slice(7);
     // raw api_key 일치도 허용 (하위 호환)
     if (jwt === apiKey) return true;
-    // JWT 검증
-    if (verifyJwt(jwt, apiKey)) return true;
+    // JWT 검증 + scope 권한 (share 토큰은 공유 뷰어 경로만)
+    const bearerPayload = verifyJwt(jwt, apiKey);
+    if (bearerPayload && jwtScopeAllows(bearerPayload, req)) return true;
   }
 
   // 4. Query parameter token (공유 링크용)
   const urlObj = new URL(req.url, `http://localhost`);
   const queryToken = urlObj.searchParams.get("token");
-  if (queryToken && verifyJwt(queryToken, apiKey)) return true;
+  const queryPayload = queryToken ? verifyJwt(queryToken, apiKey) : null;
+  if (queryPayload && jwtScopeAllows(queryPayload, req)) return true;
 
   return false;
 }
@@ -1723,8 +1888,10 @@ const server = http.createServer((req, res) => {
     return json({ error: "인증 필요" }, 401);
   }
 
-  // 클라우드 모드: docs API + 브라우저 인계만 노출 (공유/사이트/기타 로컬 기능 차단)
-  if (CLOUD_MODE && !pathname.startsWith("/api/docs") && !pathname.startsWith("/api/browser") && pathname !== "/api/graph") {
+  // 클라우드 모드: docs API + 브라우저 인계 + 회의 API만 노출 (공유/사이트/기타 로컬 기능 차단)
+  // 회의 API 는 핸들러 내부(meetingCtx)에서 dir 필수 + 유저별 격리를 강제한다.
+  if (CLOUD_MODE && !pathname.startsWith("/api/docs") && !pathname.startsWith("/api/browser")
+      && !pathname.startsWith("/api/meetings") && pathname !== "/api/graph") {
     return json({ error: "cloud mode: not available" }, 404);
   }
   // 클라우드 모드: 쿼리 dir 중앙 검증 (일부 핸들러가 개별 검증을 생략하므로 초크포인트 필수)
@@ -1896,30 +2063,76 @@ const server = http.createServer((req, res) => {
   else if (pathname === "/api/meetings/upload" && req.method === "POST") {
     if (!meetingStore || !processMeeting) return json({ error: "meeting 모듈 없음" }, 503);
     const MAX = 1024 * 1024 * 1024; // 1GB (긴 회의 대비)
-    parseMultipartStreaming(req, MAX).then(({ fields, file }) => {
+    parseMultipartStreaming(req, MAX).then(async ({ fields, file }) => {
+      const dropTemp = () => { if (file && file.tempPath) { try { fs.unlinkSync(file.tempPath); } catch {} } };
       const meetingId = (fields.meetingId || "").replace(/[^a-zA-Z0-9_-]/g, "");
-      if (!meetingId || !file) { if (file && file.tempPath) try { fs.unlinkSync(file.tempPath); } catch {} return json({ error: "meetingId, file 필요" }, 400); }
-      const docsDir = fields.dir ? validateDocsDir(fields.dir) : null;
+      if (!meetingId || !file) { dropTemp(); return json({ error: "meetingId, file 필요" }, 400); }
+
+      // 셀프호스트: dir 선택 / 클라우드: dir 필수 → 유저별 저장 격리 + 유저 api_key
+      const ctx = await meetingCtx(fields.dir);
+      if (ctx.error) { dropTemp(); return json({ error: ctx.error }, 403); }
+      const baseDir = ctx.configDir;
+      const docsDir = ctx.docsDir;
+
+      // 멱등성: 이미 조립 완료(메타 존재)된 회의면 어떤 청크가 재전송돼도 기존
+      // 메타를 돌려준다 — 마지막 청크의 응답 유실 → 재전송이 완성된 오디오를
+      // 마지막 조각 하나로 덮어쓰고 처리를 이중 시작하던 경로 차단.
+      const existingMeta = meetingStore.readMeta(baseDir, meetingId);
+      if (existingMeta) {
+        dropTemp();
+        return json({ ok: true, meeting: existingMeta, already: true });
+      }
 
       const chunkIdx = parseInt(fields.chunkIndex || "0");
       const totalChunks = parseInt(fields.totalChunks || "1");
       const chunkDir = path.join(os.tmpdir(), "pv-meeting-chunks");
       fs.mkdirSync(chunkDir, { recursive: true });
-      const chunkFile = path.join(chunkDir, `${meetingId}.part`);
+      // 클라우드: uid 프리픽스 — 다른 유저가 같은 meetingId 로 조립 파일을 건드리지 못하게
+      const chunkBase = `${ctx.uid ? ctx.uid + "-" : ""}${meetingId}`;
+      const chunkFile = path.join(chunkDir, `${chunkBase}.part`);
+      const stateFile = path.join(chunkDir, `${chunkBase}.part.state`);
+      const readChunkState = () => { try { return JSON.parse(fs.readFileSync(stateFile, "utf-8")); } catch { return null; } };
+      const clearParts = () => { try { fs.unlinkSync(chunkFile); } catch {} try { fs.unlinkSync(stateFile); } catch {} };
       try {
-        if (chunkIdx === 0) fs.copyFileSync(file.tempPath, chunkFile);
-        else fs.appendFileSync(chunkFile, fs.readFileSync(file.tempPath));
+        // 순서 강제 + 중복 무시(멱등): 응답만 유실된 청크가 재전송되어 두 번
+        // append 되면 오디오가 손상된다 — 이미 반영된 인덱스는 조용히 성공 처리.
+        const next = (readChunkState() || { next: 0 }).next;
+        let early = null;
+        if (chunkIdx === 0) {
+          fs.copyFileSync(file.tempPath, chunkFile); // 0번 = 항상 새 시작(재시작 포함)
+          fs.writeFileSync(stateFile, JSON.stringify({ next: 1 }));
+        } else if (chunkIdx < next) {
+          early = () => json({ ok: true, chunk: chunkIdx, duplicate: true });
+        } else if (chunkIdx === next && fs.existsSync(chunkFile)) {
+          fs.appendFileSync(chunkFile, fs.readFileSync(file.tempPath));
+          fs.writeFileSync(stateFile, JSON.stringify({ next: chunkIdx + 1 }));
+        } else {
+          // 순서 건너뜀 또는 조립 파일 유실(재시작 등) → 재개/재시작 지점 안내
+          const resumeFrom = fs.existsSync(chunkFile) ? next : 0;
+          if (resumeFrom === 0) clearParts();
+          early = () => json({ error: "청크 순서 불일치", resume_from: resumeFrom }, 409);
+        }
         fs.unlinkSync(file.tempPath);
+        if (early) return early();
       } catch (e) {
         try { fs.unlinkSync(file.tempPath); } catch {}
         return json({ error: "청크 저장 실패: " + e.message }, 500);
       }
       if (chunkIdx < totalChunks - 1) return json({ ok: true, chunk: chunkIdx });
 
-      // 마지막 청크 → 영구 저장 + 메타 생성 + 백그라운드 처리
+      // 마지막 청크 → 조립 크기 검증 → 영구 저장 + 메타 생성 + 백그라운드 처리
+      const expectedSize = parseInt(fields.totalSize || "0") || 0;
+      let assembledSize = 0;
+      try { assembledSize = fs.statSync(chunkFile).size; } catch { /* 검증에서 걸림 */ }
+      if (expectedSize > 0 && assembledSize !== expectedSize) {
+        clearParts();
+        return json({ error: `조립 크기 불일치 (${assembledSize} != ${expectedSize})`, restart: true }, 409);
+      }
+
       const now = new Date().toISOString();
-      meetingStore.storeAudio(CONFIG_DIR, meetingId, chunkFile);
-      const meta = meetingStore.writeMeta(CONFIG_DIR, meetingId, {
+      meetingStore.storeAudio(baseDir, meetingId, chunkFile);
+      try { fs.unlinkSync(stateFile); } catch {}
+      const meta = meetingStore.writeMeta(baseDir, meetingId, {
         id: meetingId,
         project: fields.project || null,
         title: fields.title || "제목 없는 회의",
@@ -1928,14 +2141,15 @@ const server = http.createServer((req, res) => {
         // Stored up front so the stuck-meeting sweep can retry processing after
         // a Home Portal restart (previously only recorded on success).
         docs_dir: docsDir || null,
+        ...(ctx.uid ? { cloud_uid: ctx.uid } : {}),
         status: "processing",
         created_at: now,
         updated_at: now,
       });
 
       processMeeting({
-        configDir: CONFIG_DIR,
-        config: loadConfig(),
+        configDir: baseDir,
+        config: ctx.config,
         meetingId,
         projectDocsDir: docsDir,
         log: (m) => console.log(m),
@@ -1945,33 +2159,40 @@ const server = http.createServer((req, res) => {
     }).catch(e => json({ error: "업로드 실패: " + e.message }, 400));
   }
   // GET /api/meetings/list — 회의 목록(메타). 큰 필드 제외.
+  // 클라우드: ?dir=(본인 워크스페이스) 필수 → 그 유저의 회의만 (크로스 테넌트 차단)
   else if (pathname === "/api/meetings/list" && req.method === "GET") {
     if (!meetingStore) return json({ error: "meeting 모듈 없음" }, 503);
-    try {
-      const meetings = meetingStore.listMeetings(CONFIG_DIR).map((m) => {
+    meetingCtx(url.searchParams.get("dir")).then((ctx) => {
+      if (ctx.error) return json({ error: ctx.error }, 403);
+      const meetings = meetingStore.listMeetings(ctx.configDir).map((m) => {
         const { segments, live_transcript, speaker_samples, ...slim } = m;
         return slim;
       });
       json({ meetings });
-    } catch (e) { json({ error: e.message }, 500); }
+    }).catch((e) => json({ error: e.message }, 500));
   }
-  // GET /api/meetings/get?id= — 단일 회의 메타 (큰 필드 제외)
+  // GET /api/meetings/get?id= — 단일 회의 메타 (큰 필드 제외). 클라우드: ?dir= 필수
   else if (pathname === "/api/meetings/get" && req.method === "GET") {
     if (!meetingStore) return json({ error: "meeting 모듈 없음" }, 503);
-    const id = url.searchParams.get("id");
-    const meta = id ? meetingStore.readMeta(CONFIG_DIR, id) : null;
-    if (!meta) return json({ error: "not found" }, 404);
-    const { segments, live_transcript, ...slim } = meta;
-    json({ meeting: slim });
+    meetingCtx(url.searchParams.get("dir")).then((ctx) => {
+      if (ctx.error) return json({ error: ctx.error }, 403);
+      const id = url.searchParams.get("id");
+      const meta = id ? meetingStore.readMeta(ctx.configDir, id) : null;
+      if (!meta) return json({ error: "not found" }, 404);
+      const { segments, live_transcript, ...slim } = meta;
+      json({ meeting: slim });
+    }).catch((e) => json({ error: e.message }, 500));
   }
-  // POST /api/meetings/label — 화자 이름 부여 + 문서 재작성 (등록 없음)
+  // POST /api/meetings/label — 화자 이름 부여 + 문서 재작성 (등록 없음). 클라우드: body.dir 필수
   else if (pathname === "/api/meetings/label" && req.method === "POST") {
     if (!meetingStore || !meetingLabel) return json({ error: "meeting 모듈 없음" }, 503);
     readBody().then(async (body) => {
-      const { meetingId, labels } = body;
+      const { meetingId, labels, dir } = body;
       if (!meetingId || !labels || typeof labels !== "object") return json({ error: "meetingId, labels 필요" }, 400);
+      const ctx = await meetingCtx(dir);
+      if (ctx.error) return json({ error: ctx.error }, 403);
       try {
-        const result = await meetingLabel({ configDir: CONFIG_DIR, config: loadConfig(), meetingId, labels });
+        const result = await meetingLabel({ configDir: ctx.configDir, config: ctx.config, meetingId, labels });
         json({ ok: true, ...result });
       } catch (e) {
         json({ error: e.message }, 500);
@@ -2406,7 +2627,39 @@ document.addEventListener('click', e => {
     (async () => {
       const port = cdpPortForDir(url.searchParams.get("dir"));
       if (!port) return json({ error: "잘못된 dir" }, 403);
-      const s = await cdpConnect(port, url.searchParams.get("url") || "");
+      let s;
+      try {
+        s = await cdpConnect(port, url.searchParams.get("url") || "");
+      } catch (e) {
+        // CDP 죽음 → 셀프힐: 인계 뷰어가 900ms~3s 로 폴링 중이므로 여기서 브라우저를
+        // 재기동해 두면 몇 초 안에 자동 복구된다 (2026-08-18 저녁 chromium 사망으로
+        // 유저가 '연결 중' 무한 대기한 실사고 — infohub 제보)
+        const starting = maybeStartBrowser(port);
+        return json({ error: "browser_unavailable", starting, detail: String((e && e.message) || e) }, 502);
+      }
+      // 인계 종료 시 뷰포트 오버라이드 원복 — 에이전트가 세션을 이어받을 때
+      // 폰 크기 뷰포트가 남아 스크래핑이 모바일 레이아웃을 보게 되는 것을 방지
+      if (url.searchParams.get("reset") === "1") {
+        try { await cdpSend(s, "Emulation.clearDeviceMetricsOverride", {}); } catch {}
+        s.appliedViewport = "";
+        return json({ ok: true });
+      }
+      // 유저 창 크기에 원격 뷰포트를 맞춘다 (2026-08-19 개선):
+      // 폰으로 열면 원격 브라우저가 폰 크기(모바일 레이아웃)가 되어 화면을 꽉 채우고,
+      // dpr(최대 2)로 캡처 해상도를 올려 클라이언트 확대 시에도 글자가 선명하다.
+      // 파라미터가 없으면(구버전 웹) 기존 동작 그대로.
+      const vw = Math.min(2560, parseInt(url.searchParams.get("vw")) || 0);
+      const vh = Math.min(2560, parseInt(url.searchParams.get("vh")) || 0);
+      const dpr = Math.max(1, Math.min(2, parseInt(url.searchParams.get("dpr")) || 1));
+      if (vw >= 320 && vh >= 320) {
+        const want = vw + "x" + vh + "@" + dpr;
+        if (s.appliedViewport !== want) {
+          await cdpSend(s, "Emulation.setDeviceMetricsOverride", {
+            width: vw, height: vh, deviceScaleFactor: dpr, mobile: vw < 768,
+          });
+          s.appliedViewport = want;
+        }
+      }
       const [shot, metrics] = await Promise.all([
         cdpSend(s, "Page.captureScreenshot", { format: "jpeg", quality: 60 }),
         cdpSend(s, "Page.getLayoutMetrics", {}),

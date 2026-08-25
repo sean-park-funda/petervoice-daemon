@@ -54,6 +54,25 @@ def _sanitize(s: str) -> str:
     return s.strip()
 
 
+# 로그인 트리거 — 공백·대소문자·문장부호를 무시하고 매칭 (처음 쓰는 유저가 "재로그인"을
+# 떠올리기 어려워 "로그인", "클로드 로그인", "클로드로그인" 등 자연스러운 표현을 모두 받는다)
+_LOGIN_TRIGGERS = {
+    "재로그인", "리로그인", "로그인", "relogin", "login", "/relogin", "/login",
+    "클로드로그인", "클로드재로그인", "클로드연결", "클로드계정연결", "계정연결", "연결",
+    "클로드로그인해줘", "로그인해줘", "재로그인해줘", "로그인하기", "클로드인증", "인증",
+    "claude로그인", "claudelogin",
+}
+
+
+def is_login_trigger(text: str) -> bool:
+    """유저 입력이 클로드 로그인 시작 요청인지. 공백/대소문자/끝문장부호 무시."""
+    if not text:
+        return False
+    s = re.sub(r"[\s​]+", "", text).strip().lower()
+    s = s.rstrip(".!?~,")
+    return s in _LOGIN_TRIGGERS
+
+
 def extract_code(text: str) -> str | None:
     """붙여넣은 텍스트에서 재로그인 코드(<code>#<state>)만 추출.
 
@@ -94,6 +113,7 @@ class ReloginSession:
         self._code_event = threading.Event()   # submit_code 가 set
         self._code_value = None                 # 주입할 코드 (일시 보관, 사용 후 즉시 소거)
         self._on_event = None                   # 설정 UI 모드 콜백 (None=채팅 모드)
+        self._config_dir = None                 # 로그인 대상 계정의 CLAUDE_CONFIG_DIR (default=None)
 
     # ── 채팅 안내 ────────────────────────────────────────────
     def _reply(self, text: str, project: str = None):
@@ -144,7 +164,7 @@ class ReloginSession:
         else:
             self._reply(
                 "✅ 재로그인 완료! 이제 정상적으로 사용하실 수 있어요." if ok else
-                "❌ 재로그인에 실패했어요. 코드가 정확한지 확인 후, '재로그인' 이라고 입력해 다시 시도해 주세요."
+                "❌ 재로그인에 실패했어요. 코드가 정확한지 확인 후, '클로드 로그인' 이라고 입력해 다시 시도해 주세요."
             )
 
     # ── 시작 ─────────────────────────────────────────────────
@@ -167,6 +187,7 @@ class ReloginSession:
             self.reset()
             self.state = "pending_url"
             self.project = project
+            self._config_dir = config_dir
             self._on_event = on_event
             self.started_at = time.time()
             self._thread = threading.Thread(
@@ -209,7 +230,7 @@ class ReloginSession:
             "1) 아래 링크를 눌러 본인 Claude 계정으로 로그인해 주세요:\n"
             f"{self.url}\n\n"
             "2) 로그인 후 나오는 코드를 이 채팅에 그대로 붙여넣어 주세요.\n"
-            "(10분 안에 붙여넣지 않으면 만료됩니다. 다시 하려면 '재로그인' 이라고 입력하세요.)"
+            "(10분 안에 붙여넣지 않으면 만료됩니다. 다시 하려면 '클로드 로그인' 이라고 입력하세요.)"
         )
 
     def _run_flow(self, config_dir: str = None):
@@ -376,6 +397,11 @@ class ReloginSession:
         import subprocess
         try:
             env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
+            # 로그인을 띄운 계정(config_dir)과 같은 곳을 확인해야 한다.
+            # (없으면 default 계정 상태를 보고 오판정 — 멀티계정 버그)
+            cfg = getattr(self, "_config_dir", None)
+            if cfg:
+                env["CLAUDE_CONFIG_DIR"] = os.path.expanduser(cfg)
             r = subprocess.run(
                 [CLAUDE_CMD, "auth", "status"],
                 capture_output=True, text=True, timeout=15, env=env,
