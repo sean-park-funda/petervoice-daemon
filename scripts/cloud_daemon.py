@@ -990,8 +990,17 @@ def reap_orphan_turns() -> None:
         unit = line.split()[0] if line.split() else ""
         if unit.startswith("pvturn-") and mine not in unit:
             logger.warning(f"stopping orphan turn unit from previous daemon: {unit}")
-            subprocess.run(["sudo", "-n", "systemctl", "stop", unit], capture_output=True, timeout=20)
-            subprocess.run(["sudo", "-n", "systemctl", "reset-failed", unit], capture_output=True, timeout=10)
+            # --no-block: stop 은 유닛이 실제로 내려갈 때까지 기다리는데 claude 가 SIGTERM 을 바로 안 받아
+            # 20초를 넘겼고, 그 TimeoutExpired 가 기동 루프를 통째로 죽였다 (2026-08-25 첫 배포에서 발생).
+            try:
+                subprocess.run(["sudo", "-n", "systemctl", "stop", "--no-block", unit],
+                               capture_output=True, timeout=10)
+                subprocess.run(["sudo", "-n", "systemctl", "kill", "-s", "SIGKILL", unit],
+                               capture_output=True, timeout=10)
+                subprocess.run(["sudo", "-n", "systemctl", "reset-failed", unit],
+                               capture_output=True, timeout=10)
+            except Exception as e:
+                logger.warning(f"orphan stop failed {unit}: {e}")
 
 
 def _unit_result(unit: str) -> str:
@@ -2459,7 +2468,10 @@ class CloudWorker:
 
     def run(self):
         logger.info("cloud daemon started")
-        reap_orphan_turns()
+        try:
+            reap_orphan_turns()
+        except Exception as e:  # 정리 실패가 기동을 막으면 안 된다
+            logger.error(f"orphan reap failed: {e}")
         # 재시작 시 지난 턴의 잔여 env 파일 정리 (600, 시크릿 잔존 방지)
         try:
             for f in _turnenv_dir().glob("*.env"):
