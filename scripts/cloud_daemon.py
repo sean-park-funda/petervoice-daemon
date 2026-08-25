@@ -1525,7 +1525,16 @@ login_lock = threading.Lock()
 
 USAGE_INTERVAL_SEC = 15 * 60
 USAGE_REFRESH_POLL_SEC = 30
-USAGE_PROBE_TIMEOUT_SEC = 60
+USAGE_PROBE_TIMEOUT_SEC = 180  # 기본값. config "usage_probe_timeout_sec" 로 호스트별 조정
+
+
+def usage_probe_timeout_sec() -> int:
+    # 뉴넥스 사내 서버에서 `claude -p /usage` 가 83초 걸려 60초 상한에 매번 잘렸다 (2026-08-25).
+    # 프로브는 실패한 게 아니라 제한시간을 못 맞춘 것 → 넉넉히 잡고 호스트별로 조정 가능하게.
+    try:
+        return int(config.get("usage_probe_timeout_sec") or USAGE_PROBE_TIMEOUT_SEC)
+    except (TypeError, ValueError):
+        return USAGE_PROBE_TIMEOUT_SEC
 
 
 def _parse_usage_output(out: str) -> dict | None:
@@ -1569,7 +1578,7 @@ def probe_usage(user_id: int, allow_wake: bool = False) -> dict | None:
                 return None
             ctr.ensure_running(user_id)
         rc, out, err = ctr.exec_claude_cmd(user_id, ["-p", "/usage"],
-                                           timeout=USAGE_PROBE_TIMEOUT_SEC)
+                                           timeout=usage_probe_timeout_sec())
         if rc != 0 and not (out or "").strip():
             return None
         return _parse_usage_output((out or "") + "\n" + (err or ""))
@@ -1583,11 +1592,11 @@ def probe_usage(user_id: int, allow_wake: bool = False) -> dict | None:
         if isolation_enabled():
             wrapped = wrap_isolated(user_id, cmd, isolated_env_overrides(user_id), cwd)
             r = subprocess.run(wrapped, capture_output=True, text=True,
-                               timeout=USAGE_PROBE_TIMEOUT_SEC)
+                               timeout=usage_probe_timeout_sec())
         else:
             r = subprocess.run(cmd, cwd=cwd, env=claude_env(user_id),
                                capture_output=True, text=True,
-                               timeout=USAGE_PROBE_TIMEOUT_SEC)
+                               timeout=usage_probe_timeout_sec())
     except Exception as e:
         logger.warning(f"[usage] probe failed user={user_id}: {e}")
         return None
