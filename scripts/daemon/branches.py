@@ -49,6 +49,13 @@ for p in json.load(sys.stdin).get('projects', []):
 curl -s "$API_URL/api/branches?project_id=대상_프로젝트_ID" -H "X-Api-Key: $API_KEY"
 ```
 
+### 이 브랜치 아래 서브 브랜치 만들기 (깊이 제한 없음)
+```bash
+curl -X POST "$API_URL/api/branches" -H "X-Api-Key: $API_KEY" -H "Content-Type: application/json" \
+  -d '{{"project_id": "{project_id}", "parent_branch_id": {branch_id}, "title": "하위 작업 제목", "auto_context": true}}'
+```
+- `auto_context: true` 면 이 브랜치의 최근 대화가 요약 첨부된다. 응답 `branch.id` 로 릴레이·안내 링크 사용.
+
 ### [relay] 메시지 수신 시
 - `[relay from:프로젝트명 branch:N]` 형식으로 수신됨
 - 📎 첨부 문서가 있으면 **반드시 Read로 읽고** 응답
@@ -63,6 +70,21 @@ def fetch_branch(branch_id: int) -> dict | None:
         return None
     result = api_request(api_key, "GET", f"/api/bot/branch?id={branch_id}", timeout=5)
     return result if result and "error" not in result else None
+
+
+def fetch_branch_ancestors(branch: dict, max_depth: int = 50) -> list:
+    """루트 브랜치 → 부모 순서의 조상 목록 (자기 자신 제외). parent_branch_id 체인을 API 로 따라간다."""
+    chain = []
+    seen = {branch.get("id")}
+    parent_id = branch.get("parent_branch_id")
+    while parent_id and parent_id not in seen and len(chain) < max_depth:
+        parent = fetch_branch(int(parent_id))
+        if not parent:
+            break
+        seen.add(parent.get("id"))
+        chain.insert(0, parent)
+        parent_id = parent.get("parent_branch_id")
+    return chain
 
 
 def update_branch_session(branch_id: int, session_id: str):
@@ -149,29 +171,46 @@ def build_branch_prompt(branch: dict) -> str:
         # 순수 브랜치 → 간결한 브랜치 규칙
         branch_num = branch.get("branch_number", branch.get("id"))
         branch_id = branch.get("id")
-        # 브랜치 추가 프롬프트 (유저가 웹 UI에서 설정)
-        branch_prompt = branch.get("prompt") or ""
+        # 브랜치 추가 프롬프트 (유저가 웹 UI에서 설정) + 조상 브랜치 프롬프트 상속(루트→부모 순, 합산 8000자 상한)
+        ancestors = fetch_branch_ancestors(branch) if branch.get("parent_branch_id") else []
+        inherited_parts = []
+        budget = 8000
+        for anc in reversed(ancestors):  # 가까운 부모부터 예산 배정, 넘치면 먼 조상부터 탈락
+            ap = (anc.get("prompt") or "").strip()
+            if not ap:
+                continue
+            if len(ap) > budget:
+                inherited_parts.insert(0, f"## (상속) 브랜치 #{anc.get('branch_number')} {anc.get('title','')} 프롬프트\n[…생략 — 조상 프롬프트 합산 상한(8000자) 초과]")
+                break
+            inherited_parts.insert(0, f"## (상속) 브랜치 #{anc.get('branch_number')} {anc.get('title','')} 프롬프트\n{ap}")
+            budget -= len(ap)
+        branch_prompt = "\n\n".join(inherited_parts + ([branch.get("prompt")] if branch.get("prompt") else []))
+        path_parts = [project_id] + [f"#{a.get('branch_number')} {a.get('title','')}" for a in ancestors] + [f"#{branch_num} {branch.get('title','')}"]
+        parent_line = (
+            f"부모 브랜치: #{ancestors[-1].get('branch_number')} {ancestors[-1].get('title','')} (내부ID: {ancestors[-1].get('id')}, 릴레이 to_branch_id)\n"
+            if ancestors else ""
+        )
         branch_rules = f"""# 브랜치 #{branch_num}: {branch.get('title', '')} (내부ID: {branch_id})
 소속 프로젝트: {project_id}
-
+경로: {' › '.join(path_parts)}
+{parent_line}
 ## 규칙
 - 이 브랜치의 작업에 집중하세요.
 - 커밋 메시지 앞에 [branch-{branch_id}]를 붙이세요.
 - 작업 범위를 임의로 넓히지 마세요.
 - **대화 상대는 비개발자일 수 있습니다.** 기술 용어를 최소화하고 쉽게 설명하세요.
 
-## 작업 종료
+## 작업 종료 (보관 개념 없음 — 삭제만, 반드시 확인)
 유저가 "다 됐어", "끝" 등을 말하면:
 1. 변경 요약을 유저에게 보고
-2. 브랜치 상태를 archived로 변경:
+2. **"이 브랜치를 삭제할까요? (하위 브랜치·대화 기록도 함께 지워지고 되돌릴 수 없습니다)"** 라고 명시적으로 묻는다
+3. 유저가 분명히 동의했을 때만 삭제:
 ```bash
 API_URL=$(python3 -c "import json; c=json.load(open('$HOME/.claude-daemon/config.json')); print(c.get('api_url', 'https://www.peter-voice.site'))")
 API_KEY=$(python3 -c "import json; print(json.load(open('$HOME/.claude-daemon/config.json'))['api_key'])")
-curl -X PATCH "$API_URL/api/branches/{branch_id}" \\
-  -H "X-Api-Key: $API_KEY" \\
-  -H "Content-Type: application/json" \\
-  -d '{{"status": "archived"}}'
+curl -X DELETE "$API_URL/api/branches/{branch_id}" -H "X-Api-Key: $API_KEY"
 ```
+동의가 없으면 그대로 둔다. 삭제 후에는 이 세션에 더 응답할 수 없으므로 삭제 직전 메시지가 마지막 보고여야 한다.
 """
         connected_services = build_connected_services_note()
         combined = "\n\n".join(p for p in [system_prompt_pv, common_prompt, connected_services, project_prompt, branch_prompt, branch_rules, lead_patch, relay_guide, conversation_hint, heartbeat_hint] if p)
@@ -191,7 +230,7 @@ def build_branch_context(branch: dict) -> str:
         parts.append(f"\n{description}")
 
     if parent_context:
-        parts.append(f"\n## 이 브랜치의 배경 (부모 프로젝트 대화에서 캡처)\n{parent_context}")
+        parts.append(f"\n## 이 브랜치의 배경 (부모 프로젝트/브랜치 대화에서 캡처)\n{parent_context}")
 
     parts.append("\n위 맥락을 바탕으로 작업을 시작하세요.\n맥락이 부족하면 먼저 질문하세요.")
 
