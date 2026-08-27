@@ -147,6 +147,15 @@ def build_branch_prompt(branch: dict) -> str:
         f"3. 하트비트 수신 시 그 파일을 읽고 다음 미완료 항목을 처리 → 완료 시 `[x]` 마킹\n"
     )
 
+    # 내 칸반 보드 (브랜치 단위 보드, 2026-08-27)
+    board_hint = (
+        f"\n## 내 칸반 보드\n"
+        f"이 브랜치의 보드: `/kanban?project={project_id}&branch={branch_id}` (하위 브랜치 카드까지 보려면 `&subtree=1`).\n"
+        f"카드 API(`POST /api/kanban`, `/api/kanban/ideas`)에 `\"scope_branch_id\": {branch_id}` 를 넣으면 이 보드에 생긴다"
+        f"(`from_branch_id` 를 넣어도 기본으로 이 보드). 조회는 `GET /api/kanban?project={project_id}&branch={branch_id}`.\n"
+        f"보드 카드의 댓글·메시지는 `[카드 #N …]` 로 이 세션에 도착한다 — 카드 상태 갱신으로 응답하고 릴레이 회신은 하지 않는다.\n"
+    )
+
     # 릴레이 가이드 (모든 브랜치 공통)
     relay_guide = _build_branch_relay_guide(project_id, branch_id)
 
@@ -165,7 +174,7 @@ def build_branch_prompt(branch: dict) -> str:
         # 칸반 카드가 연결된 브랜치 → 기존 카드 규칙 사용
         from daemon.kanban import build_kanban_prompt
         kanban_combined = build_kanban_prompt(kanban_card_full)
-        combined = "\n\n".join(p for p in [system_prompt_pv, kanban_combined, lead_patch, relay_guide, conversation_hint, heartbeat_hint] if p)
+        combined = "\n\n".join(p for p in [system_prompt_pv, kanban_combined, lead_patch, relay_guide, conversation_hint, heartbeat_hint, board_hint] if p)
         return apply_roster_placeholder(combined)
     else:
         # 순수 브랜치 → 간결한 브랜치 규칙
@@ -213,7 +222,7 @@ curl -X DELETE "$API_URL/api/branches/{branch_id}" -H "X-Api-Key: $API_KEY"
 동의가 없으면 그대로 둔다. 삭제 후에는 이 세션에 더 응답할 수 없으므로 삭제 직전 메시지가 마지막 보고여야 한다.
 """
         connected_services = build_connected_services_note()
-        combined = "\n\n".join(p for p in [system_prompt_pv, common_prompt, connected_services, project_prompt, branch_prompt, branch_rules, lead_patch, relay_guide, conversation_hint, heartbeat_hint] if p)
+        combined = "\n\n".join(p for p in [system_prompt_pv, common_prompt, connected_services, project_prompt, branch_prompt, branch_rules, lead_patch, relay_guide, conversation_hint, heartbeat_hint, board_hint] if p)
         return apply_roster_placeholder(combined)
 
 
