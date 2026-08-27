@@ -61,7 +61,9 @@ Authorization: Bearer <api_key>
   ↓ 이메일 정보도 extra 필드에 저장
 ```
 
-- 스코프: `calendar.readonly`, `userinfo.email`
+- 기본 스코프(`lib/google-scopes.ts` GOOGLE_BASE_SCOPES): `userinfo.email`, `calendar`, `gmail.readonly/send/modify/labels`, `documents`, `spreadsheets`, `drive.readonly`
+- **YouTube 는 기본 연결에 없다.** 설정 > 외부 서비스 연동의 계정별 **"YouTube 연결"** 버튼이 `GET /api/auth/google?scopes=youtube&account_email=…` 로 증분 동의(`include_granted_scopes=true`)를 받아 `youtube`, `youtube.upload`, `youtube.force-ssl`, `yt-analytics.readonly` 를 추가한다(2026-08-27). 콜백은 기존 스코프와 합집합으로 `oauth_tokens.scope` 에 기록.
+- 에이전트는 `GOOGLE_YOUTUBE_ACCOUNTS`(유튜브 동의된 계정 목록) 로 가능 여부를 판단하고, 토큰 갱신 시 scope 파라미터를 보내지 않는다(부여된 범위 그대로 사용 — 요청 스코프가 부여 범위를 넘으면 invalid_scope).
 - refresh_token으로 access_token 자동 갱신
 - Vercel 환경변수: `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`
 
