@@ -2008,7 +2008,7 @@ const server = http.createServer((req, res) => {
   }
   // Docs API: /api/docs/upload — 파일 업로드 (스트리밍 + 청크 지원)
   else if (pathname === "/api/docs/upload" && req.method === "POST") {
-    const MAX_FILE_SIZE = 500 * 1024 * 1024;
+    const MAX_FILE_SIZE = 1024 * 1024 * 1024; // 1GB (2026-08-27 Sean: 본인 환경이라 상한 완화, 500MB→1GB)
     parseMultipartStreaming(req, MAX_FILE_SIZE).then(({ fields, file }) => {
       if (!fields.dir || !file) return json({ error: "dir, file 필요" }, 400);
       const validated = validateDocsDir(fields.dir);
@@ -2029,7 +2029,7 @@ const server = http.createServer((req, res) => {
           if (chunkIdx < totalChunks - 1) return json({ ok: true, chunk: chunkIdx });
           // 마지막 청크 — 최종 위치로 이동
           const stat = fs.statSync(chunkFile);
-          if (stat.size > MAX_FILE_SIZE) { fs.unlinkSync(chunkFile); return json({ error: "500MB 초과" }, 413); }
+          if (stat.size > MAX_FILE_SIZE) { fs.unlinkSync(chunkFile); return json({ error: "1GB 초과" }, 413); }
           const targetDir = subpath ? path.join(validated, path.dirname(subpath)) : validated;
           const fileName = subpath ? path.basename(subpath) : file.filename;
           const targetPath = path.resolve(targetDir, fileName);
