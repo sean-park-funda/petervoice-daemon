@@ -113,9 +113,13 @@ polyline **문자열**로 넣는다.
 
   "routes": [{
     "key": "A", "label": "중부내륙 · 충주 코스",
-    "color": "#e53935", "weight": 6, "dash": "6,8",   // dash = 점선(밀린 후보)
+    "color": "#e53935", "weight": 6, "dash": "6,8",   // dash = 점선(밀린 후보). color 는 segments 없을 때·정체값 없는 구간의 색
     "min": 261, "km": 283,
-    "path": [[36.1, 128.3], [36.2, 128.4]],           // 또는 encoded polyline 문자열
+    "path": [[36.1, 128.3], [36.2, 128.4]],           // 또는 encoded polyline 문자열 (segments 가 있으면 생략 가능)
+    "segments": [                                      // ★ 정체 단계별 구간 — 내비처럼 원활=초록 · 서행=주황 · 정체=빨강
+      { "path": "encoded…", "congestion": 1 },         //   congestion: 0/1 원활, 2 서행, 3 정체
+      { "path": "encoded…", "congestion": 3 }          //   네이버 Directions 응답 route.*[].section[].congestion 을 그대로 넘기면 된다
+    ],                                                 //   (경로를 색별로 여러 routes 로 쪼개지 말 것)
     "markStep": 60,                                    // 시간 눈금 간격(분), 기본 60
     "marks": [{ "min": 60, "lat": 36.11, "lng": 128.37, "name": "김천 아포" }],
     "visible": false                                   // 숨김
@@ -123,12 +127,34 @@ polyline **문자열**로 넣는다.
 
   "pins": [{                 // "pois" 도 같은 뜻으로 받는다
     "name": "거송갈비찜 청주점", "lat": 36.68486, "lng": 127.50611,
+    "eta": "14:55",          // ★ 도착 예정 시각 — 라벨에 "14:55 거송갈비찜 청주점" 으로 자동 표시
     "color": "#1e88e5",
     "desc": "★4.78 리뷰1,518<br/>소갈비찜 24,000",   // b/strong/em/i/small/br 만 허용
     "link": "https://m.place.naver.com/restaurant/1575131397/home"
   }]
 }
 ```
+
+#### 추천 코스 지도의 기본 구성 (2026-08-30 Sean 확정)
+
+이동 중 "가는 길에 뭐 먹을까" 류 요청에 띄우는 지도는 **항상 아래 세 가지를 갖춘다.**
+
+1. **현재위치 → 목적지 경로선** — `routes[0]` 에 `segments` 로 정체 색 포함 (`mylocation: true`)
+2. **경로 위 추천 핀** — 각 핀에 `eta` (그 지점 도착 예정 시각). 라벨은 "14:55 경남식당" 으로 자동
+3. 같은 `id` 로 갱신 — 유저 위치가 바뀌거나 후보를 바꿀 때 새 지도를 띄우지 않고 갱신한다
+
+```jsonc
+{
+  "id": "route-food", "title": "죽도 → 경북대병원 · 점심", "mylocation": true,
+  "routes": [{ "key": "A", "label": "영동→중앙고속도로", "min": 244, "km": 329,
+               "segments": [{ "path": "…", "congestion": 1 }, { "path": "…", "congestion": 2 }] }],
+  "pins": [{ "name": "봉화산설렁탕 (원주)", "lat": 37.345, "lng": 127.945, "eta": "14:01", "desc": "갈비탕 17,000" },
+           { "name": "경북대병원 장례식장", "lat": 35.866, "lng": 128.605, "eta": "17:18", "desc": "목적지" }]
+}
+```
+
+경로가 있으면 URL 참조로 올린다(위 "URL 참조" 참고). 라벨이 겹치면 뒤 순서 핀은 점으로 축약되고
+탭하면 이름이 뜨므로, **중요한 핀을 pins 앞쪽에** 둔다.
 
 #### GPS
 

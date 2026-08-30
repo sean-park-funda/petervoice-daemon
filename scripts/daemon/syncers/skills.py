@@ -13,6 +13,14 @@ CLEANUP_FLAG = SKILLS_DIR / ".cleanup-v1-done"
 BUNDLE_INSTALLED_FLAG = SKILLS_DIR / ".bundle-v1-done"
 
 
+def _pv_version_of_text(text: str) -> tuple:
+    """SKILL.md 본문의 frontmatter pv_version → (major, minor, patch). 없으면 (0,0,0)."""
+    m = re.search(r'^pv_version:\s*"?(\d+)\.(\d+)\.(\d+)"?', text or "", re.MULTILINE)
+    if not m:
+        return (0, 0, 0)
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+
+
 def _skill_pv_version(skill_md: Path) -> tuple:
     """SKILL.md frontmatter의 pv_version을 (major, minor, patch)로 파싱. 없으면 (0,0,0)."""
     try:
@@ -135,9 +143,16 @@ class SkillsSyncer(threading.Thread):
             if not skill_file.exists():
                 continue
 
-            if skill_file.read_text(encoding="utf-8") != content:
-                skill_file.write_text(content, encoding="utf-8")
-                synced.append(skill_id)
+            local_text = skill_file.read_text(encoding="utf-8")
+            if local_text == content:
+                continue
+            # 로컬 pv_version 이 마켓보다 높으면 덮지 않는다 — 로컬에서 고친 스킬(스크립트 동반)이
+            # 5분 뒤 옛 마켓 본문으로 퇴행하던 사고 방지 (2026-08-21 슬랙, 2026-08-30 route-search).
+            # 로컬 수정본을 지키려면 frontmatter 에 마켓보다 높은 pv_version 을 적으면 된다.
+            if _pv_version_of_text(local_text) > _pv_version_of_text(content):
+                continue
+            skill_file.write_text(content, encoding="utf-8")
+            synced.append(skill_id)
 
         if synced:
             logger.info(f"[skills] Synced: {', '.join(synced)}")
