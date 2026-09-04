@@ -168,8 +168,17 @@ print("   registry updated:", list(reg.keys()))
 EOF
 
 echo "== [6/6] 소유자(${OWNER}) 읽기 ACL — 홈포탈 docs 서빙용"
+# 주의: +a 상속(file_inherit)은 '이후 생성' 파일에만 적용 — 기존 파일엔 -R 로 직접 붙여야 한다
+# (2026-09-04 실사고: config.json 에 ACL 이 없어 포탈이 api_key 를 못 읽고 전부 401)
 chmod +a "user:${OWNER} allow list,search,read,readattr,readextattr,file_inherit,directory_inherit" "$HOME_DIR" 2>/dev/null || true
-chmod -R +a "user:${OWNER} allow list,search,read,readattr,readextattr,file_inherit,directory_inherit" "$DAEMON_DIR/projects" 2>/dev/null || true
+chmod -R +a "user:${OWNER} allow list,search,read,readattr,readextattr,file_inherit,directory_inherit" "$DAEMON_DIR" 2>/dev/null || true
+
+# 레지스트리 디렉토리 잠금: /Users/Shared 는 기본이 전원 쓰기 가능 — 그대로 두면
+# 아무 로컬 프로세스나 레지스트리를 조작해 타 유저 홈을 자기 이름에 매핑할 수 있다
+chown root:wheel "$SHARED_DIR" 2>/dev/null || true
+chmod 755 "$SHARED_DIR" 2>/dev/null || true
+chown root:wheel "$REGISTRY" 2>/dev/null || true
+chmod 644 "$REGISTRY" 2>/dev/null || true
 
 echo ""
 echo "✓ ${USERNAME} 프로비저닝 완료"
