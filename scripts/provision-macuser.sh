@@ -71,11 +71,28 @@ else
   chown -R "$OSUSER:staff" "$HOME_DIR"
   chmod 750 "$HOME_DIR"
 fi
-# 재부팅 자동 마운트(fstab)는 마운트 여부와 무관하게 항상 보장 (부분 실패 재실행 대비)
-VOL_UUID=$(diskutil info "PV-${USERNAME}" 2>/dev/null | awk -F': *' '/Volume UUID/{print $2}' | tr -d ' ')
-if [ -n "$VOL_UUID" ] && ! grep -q "$VOL_UUID" /etc/fstab 2>/dev/null; then
-  # EINTR 로 셸 리다이렉트가 끊기는 사례가 있어 python 으로 기록 (2026-09-04 실사고)
-  python3 -c "open('/etc/fstab','a').write('UUID=${VOL_UUID} ${HOME_DIR} apfs rw\n')"
+# 재부팅 자동 마운트: /etc/fstab 은 일부 머신에서 보안 에이전트가 접근을 가로채
+# 무한 대기하므로(2026-09-04 실사고) 사용 금지. 대신 부팅 시 PV-* 볼륨 전체를
+# 마운트하는 LaunchDaemon 하나로 처리한다 (전 테넌트 공용, 멱등).
+SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+mkdir -p /usr/local/lib/petervoice
+[ -f /usr/local/lib/petervoice/pv-mount-homes.sh ] || \
+  install -m 755 "$SELF_DIR/pv-mount-homes.sh" /usr/local/lib/petervoice/pv-mount-homes.sh
+MOUNTD="/Library/LaunchDaemons/com.petervoice.mount-homes.plist"
+if [ ! -f "$MOUNTD" ]; then
+  cat > "$MOUNTD" << 'MEOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.petervoice.mount-homes</string>
+    <key>ProgramArguments</key>
+    <array><string>/usr/local/lib/petervoice/pv-mount-homes.sh</string></array>
+    <key>RunAtLoad</key><true/>
+</dict>
+</plist>
+MEOF
+  launchctl bootstrap system "$MOUNTD" 2>/dev/null || true
 fi
 
 echo "== [3/6] 데몬 설정"
