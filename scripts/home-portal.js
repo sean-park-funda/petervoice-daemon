@@ -13,6 +13,16 @@ const path = require("path");
 const os = require("os");
 const { execSync, spawnSync, spawn } = require("child_process");
 
+// 전역 안전망 — 요청 하나의 미처리 예외가 포탈 전체(멀티테넌트 공용)를 죽이지 않게 한다.
+// 2026-09-04 실측: 디렉토리 경로 요청의 ReadStream EISDIR 크래시로 전 유저 문서탭·인라인
+// 미디어가 중단됐다. launchd가 되살려도 크래시 창마다 요청이 전멸하므로 생존이 우선.
+process.on("uncaughtException", (e) => {
+  console.error(`[fatal-survived] ${new Date().toISOString()} uncaughtException:`, e && e.stack || e);
+});
+process.on("unhandledRejection", (e) => {
+  console.error(`[fatal-survived] ${new Date().toISOString()} unhandledRejection:`, e && e.stack || e);
+});
+
 // ─── Meeting mode (modular) ──────────────────────────
 let meetingStore = null, processMeeting = null, meetingLabel = null, meetingSweep = null, meetingAutoMinutes = null;
 try {
@@ -1108,12 +1118,19 @@ function serveDocsFile(res, docsDir, filePath) {
     const ext = path.extname(fullPath).toLowerCase();
     const mime = MIME_TYPES[ext] || "application/octet-stream";
     const stat = fs.statSync(fullPath);
+    // 디렉토리에 createReadStream을 걸면 비동기 EISDIR로 프로세스가 죽는다 (2026-09-04 실측)
+    if (!stat.isFile()) { res.writeHead(404); res.end("Not found"); return; }
     res.writeHead(200, {
       "Content-Type": mime,
       "Content-Length": stat.size,
       "Cache-Control": "private, max-age=300",
     });
-    fs.createReadStream(fullPath).pipe(res);
+    const stream = fs.createReadStream(fullPath);
+    stream.on("error", (e) => {
+      console.error(`[docs-file] stream error ${fullPath}:`, e.message);
+      res.destroy();
+    });
+    stream.pipe(res);
   } catch {
     res.writeHead(500); res.end("Read error");
   }
