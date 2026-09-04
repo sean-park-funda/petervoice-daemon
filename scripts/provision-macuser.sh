@@ -115,12 +115,27 @@ if [ ! -f "$DAEMON_DIR/config.json" ]; then
   "session_ttl_hours": 24,
   "rewriter_enabled": false,
   "portal_shared": true,
-  "shared_tunnel_id": "${OWNER_TUNNEL}"
+  "shared_tunnel_id": "${OWNER_TUNNEL}",
+  "auto_update_enabled": false
 }
 EOF
   chown "$OSUSER:staff" "$DAEMON_DIR/config.json"
   chmod 600 "$DAEMON_DIR/config.json"
 fi
+# 기존 config 에도 공유맥 필수 키를 보정 (멱등) — 테넌트는 공유 체크아웃을 직접
+# git pull 하지 않는다 (소유권 불일치 + 동시 pull 충돌; 갱신은 관리자 1곳에서만)
+python3 - << PYEOF
+import json
+p = "$DAEMON_DIR/config.json"
+c = json.load(open(p))
+changed = False
+for k, v in {"portal_shared": True, "shared_tunnel_id": "$OWNER_TUNNEL", "auto_update_enabled": False}.items():
+    if c.get(k) != v:
+        c[k] = v; changed = True
+if changed:
+    json.dump(c, open(p, "w"), indent=2, ensure_ascii=False)
+    print("   config patched")
+PYEOF
 
 echo "== [4/6] LaunchDaemon ${LABEL} (로그인 없이 부팅 기동)"
 PLIST="/Library/LaunchDaemons/${LABEL}.plist"
