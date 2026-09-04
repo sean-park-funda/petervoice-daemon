@@ -18,6 +18,9 @@
 #   sudo -u pv-<username> -H claude  →  /login (또는 웹 재로그인 플로우)
 
 set -euo pipefail
+# sudo 는 호출자 PATH 를 물려받는다(macOS 기본 sudoers에 secure_path 없음) —
+# 데몬/launchd 환경엔 /usr/sbin 이 빠져 있어 sysadminctl/diskutil 이 127 나므로 고정
+export PATH=/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin
 
 USERNAME="${1:?usage: sudo ./provision-macuser.sh <username> <api_key> [quota_gb]}"
 API_KEY="${2:?api_key required}"
@@ -48,7 +51,9 @@ fi
 
 echo "== [2/6] APFS 쿼터 볼륨 (${QUOTA_GB}GB) → ${HOME_DIR}"
 if mount | grep -q " on ${HOME_DIR} "; then
-  echo "   already mounted — skip"
+  echo "   already mounted — 소유권만 보정"
+  chown "$OSUSER:staff" "$HOME_DIR"
+  chmod 750 "$HOME_DIR"
 else
   # 시스템 볼륨이 속한 APFS 컨테이너 자동 감지
   CONTAINER=$(diskutil info / | awk -F': *' '/APFS Container/{print $2}' | tr -d ' ')
@@ -62,12 +67,15 @@ else
   mkdir -p "$HOME_DIR"
   diskutil apfs addVolume "$CONTAINER" APFS "PV-${USERNAME}" -quota "${QUOTA_GB}g" -mountpoint "$HOME_DIR" >/dev/null
   # 재부팅 후에도 같은 위치에 마운트 (synthetic fstab)
-  VOL_UUID=$(diskutil info "PV-${USERNAME}" | awk -F': *' '/Volume UUID/{print $2}' | tr -d ' ')
-  grep -q "$VOL_UUID" /etc/fstab 2>/dev/null || \
-    echo "UUID=${VOL_UUID} ${HOME_DIR} apfs rw" >> /etc/fstab
   if [ -n "$TMP_BAK" ]; then cp -a "$TMP_BAK/." "$HOME_DIR/"; rm -rf "$TMP_BAK"; fi
   chown -R "$OSUSER:staff" "$HOME_DIR"
   chmod 750 "$HOME_DIR"
+fi
+# 재부팅 자동 마운트(fstab)는 마운트 여부와 무관하게 항상 보장 (부분 실패 재실행 대비)
+VOL_UUID=$(diskutil info "PV-${USERNAME}" 2>/dev/null | awk -F': *' '/Volume UUID/{print $2}' | tr -d ' ')
+if [ -n "$VOL_UUID" ] && ! grep -q "$VOL_UUID" /etc/fstab 2>/dev/null; then
+  # EINTR 로 셸 리다이렉트가 끊기는 사례가 있어 python 으로 기록 (2026-09-04 실사고)
+  python3 -c "open('/etc/fstab','a').write('UUID=${VOL_UUID} ${HOME_DIR} apfs rw\n')"
 fi
 
 echo "== [3/6] 데몬 설정"
