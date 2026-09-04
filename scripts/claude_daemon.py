@@ -491,6 +491,8 @@ def _check_cloudflared_health():
 
     if not config.get("home_portal_enabled", True):
         return
+    if config.get("portal_shared"):
+        return  # 공유 맥: 터널·포탈은 소유자 데몬이 관리 — 테넌트는 헬스체크/복구 안 함
     if sys.platform != "darwin":  # macOS 전용 (Windows 등 제외)
         return
 
@@ -651,6 +653,28 @@ def _ensure_home_portal():
 
     api_key = config.get("api_key", "")
     if not api_key:
+        return
+
+    # 공유 맥 모드: 이 머신의 포탈·터널은 소유자(관리) 데몬이 소유한다.
+    # 테넌트 데몬은 포탈/cloudflared 를 띄우지 않고, 소유자 터널(shared_tunnel_id)에
+    # 자기 호스트명 ingress + DNS 만 등록하고 tunnel_url 을 서버에 알린다.
+    # (포탈은 PV_MULTI_USER=1 레지스트리로 이 유저를 서빙 — home-portal.js MULTI_MODE)
+    if config.get("portal_shared"):
+        try:
+            me = api_request(api_key, "GET", "/api/bot/me")
+            if not me or not me.get("username"):
+                logger.warning("[home-portal] (shared) Could not resolve username")
+                return
+            username = me["username"]
+            shared_tunnel_id = config.get("shared_tunnel_id", "")
+            if not shared_tunnel_id:
+                logger.error("[home-portal] (shared) portal_shared=true 인데 shared_tunnel_id 가 없음")
+                return
+            tunnel_url = _ensure_dns_route(api_key, username, shared_tunnel_id)
+            api_request(api_key, "PATCH", "/api/bot/status", body={"tunnel_url": tunnel_url})
+            logger.info(f"[home-portal] (shared) Registered tunnel_url: {tunnel_url}")
+        except Exception as e:
+            logger.error(f"[home-portal] (shared) Error: {e}")
         return
 
     try:

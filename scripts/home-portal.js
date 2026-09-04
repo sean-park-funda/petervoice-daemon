@@ -917,21 +917,26 @@ function validateDocsDir(dir) {
     return resolved.startsWith(path.resolve(CLOUD_USERS_ROOT) + path.sep) ? resolved : null;
   }
   // path traversal 방지: 홈 디렉토리 하위만 허용
+  // (공유 맥 모드에선 레지스트리의 테넌트 홈도 허용 — 테넌트별 격리는 서버 진입부
+  // 초크포인트가 강제하고, 여긴 머신 경계 방어)
   const homeDir = os.homedir();
-  if (!resolved.startsWith(homeDir)) return null;
-  return resolved;
+  if (resolved.startsWith(homeDir)) return resolved;
+  for (const u of Object.values(multiUsers())) {
+    if (u.home && resolved.startsWith(path.resolve(u.home) + path.sep)) return resolved;
+  }
+  return null;
 }
 
-function apiDocsAll() {
+function apiDocsAll(baseConfigDir, baseHome) {
   const projectsMap = {};
-  const daemonProjects = path.join(CONFIG_DIR, "projects");
+  const daemonProjects = path.join(baseConfigDir || CONFIG_DIR, "projects");
   if (fs.existsSync(daemonProjects)) {
     for (const e of fs.readdirSync(daemonProjects, { withFileTypes: true })) {
       if (!e.isDirectory() || e.name.startsWith(".")) continue;
       projectsMap[e.name] = { name: e.name, dir: path.join(daemonProjects, e.name) };
     }
   }
-  const homeProjects = path.join(os.homedir(), "Projects");
+  const homeProjects = path.join(baseHome || os.homedir(), "Projects");
   if (fs.existsSync(homeProjects)) {
     for (const e of fs.readdirSync(homeProjects, { withFileTypes: true })) {
       if (!e.isDirectory() || e.name.startsWith(".")) continue;
@@ -1356,6 +1361,44 @@ const CLOUD_MODE = process.env.PV_CLOUD_MODE === "1";
 const CLOUD_HOST_KEY = process.env.PV_CLOUD_HOST_KEY || "";
 const CLOUD_USERS_ROOT = process.env.PV_USERS_ROOT || "/srv/pv/users";
 
+// ── 공유 맥 멀티유저 모드 (한 머신에 여러 셀프호스트 유저) ──
+// PV_MULTI_USER=1 + 레지스트리 파일이 있을 때만 활성. 기존 1맥 1유저 설치는 완전 무변화.
+// 유저 판별: Host 서브도메인(beak.peter-voice.site → beak). 레지스트리에 없으면 소유자 스코프(기존 동작).
+// 테넌트 요청은 localhost 라도 인증 필수 — 같은 머신의 타 OS 계정 프로세스 접근 차단 (클라우드와 동일 원칙).
+const MULTI_REGISTRY = process.env.PV_PORTAL_REGISTRY || "/Users/Shared/petervoice/portal-users.json";
+// env 없이도 레지스트리 파일이 있으면 활성 — 소유자 데몬이 띄우는 기존 plist 를 안 고쳐도 됨.
+// 일반 고객 맥엔 이 파일이 없어 완전 무변화.
+const MULTI_MODE = process.env.PV_MULTI_USER === "1" || fs.existsSync(MULTI_REGISTRY);
+let multiRegistryCache = { at: 0, users: {} };
+function multiUsers() {
+  if (!MULTI_MODE) return {};
+  if (Date.now() - multiRegistryCache.at > 30000) {
+    try {
+      multiRegistryCache = { at: Date.now(), users: JSON.parse(fs.readFileSync(MULTI_REGISTRY, "utf-8")) };
+    } catch { multiRegistryCache = { at: Date.now(), users: {} }; }
+  }
+  return multiRegistryCache.users;
+}
+function tenantFromReq(req) {
+  if (!MULTI_MODE) return null;
+  const host = (req.headers.host || "").split(":")[0];
+  const sub = host.endsWith(".peter-voice.site") ? host.split(".")[0] : null;
+  const users = multiUsers();
+  if (sub && users[sub] && users[sub].home) {
+    return {
+      name: sub,
+      home: users[sub].home,
+      configDir: users[sub].config_dir || path.join(users[sub].home, ".claude-daemon"),
+    };
+  }
+  return null;
+}
+function tenantApiKey(tenant) {
+  try {
+    return JSON.parse(fs.readFileSync(path.join(tenant.configDir, "config.json"), "utf-8")).api_key || null;
+  } catch { return null; }
+}
+
 // ── 클라우드 회의 지원 ──
 // 회의 데이터(오디오/메타)는 유저별로 <usersRoot>/<uid>/meetings 에 격리 저장하고,
 // 회의록 트리거(봇 호출)는 로스터에서 받은 그 유저의 api_key 로 나간다.
@@ -1661,6 +1704,37 @@ function verifyAuth(req) {
     // 로컬호스트 바이패스 금지 — 호스트 위 pv유저 프로세스의 타 유저 접근 차단.
     return !!CLOUD_HOST_KEY && req.headers["x-host-key"] === CLOUD_HOST_KEY;
   }
+  // 공유 맥 모드 테넌트 스코프: localhost 바이패스 없음, 그 유저의 api_key 로만 인증
+  const tenant = tenantFromReq(req);
+  if (tenant) {
+    const tKey = tenantApiKey(tenant);
+    if (!tKey) return false;
+    const tCookies = parseCookies(req);
+    const tSession = tCookies["pv_session"];
+    if (tSession && sessions.has(tSession)) {
+      const s = sessions.get(tSession);
+      if (s.expiresAt > Date.now() && s.tenant === tenant.name) {
+        s.expiresAt = Date.now() + SESSION_MAX_AGE * 1000;
+        saveSessions();
+        return true;
+      }
+    }
+    const tHeaderKey = req.headers["x-api-key"];
+    if (tHeaderKey && tHeaderKey === tKey) return true;
+    const tAuth = req.headers["authorization"];
+    if (tAuth && tAuth.startsWith("Bearer ")) {
+      const jwt = tAuth.slice(7);
+      if (jwt === tKey) return true;
+      const p = verifyJwt(jwt, tKey);
+      if (p && jwtScopeAllows(p, req)) return true;
+    }
+    const tUrl = new URL(req.url, "http://localhost");
+    const tToken = tUrl.searchParams.get("token");
+    const tPayload = tToken ? verifyJwt(tToken, tKey) : null;
+    if (tPayload && jwtScopeAllows(tPayload, req)) return true;
+    return false;
+  }
+
   // 로컬 요청은 인증 불필요
   if (!isTunnelRequest(req)) return true;
 
@@ -1673,12 +1747,15 @@ function verifyAuth(req) {
   const sessionToken = cookies["pv_session"];
   if (sessionToken && sessions.has(sessionToken)) {
     const session = sessions.get(sessionToken);
-    if (session.expiresAt > Date.now()) {
-      session.expiresAt = Date.now() + SESSION_MAX_AGE * 1000;
-      saveSessions();
-      return true;
+    // 테넌트 세션은 소유자 스코프에서 무효 (공유 맥 크로스유저 차단) — 삭제하지 않고 무시만
+    if (!session.tenant) {
+      if (session.expiresAt > Date.now()) {
+        session.expiresAt = Date.now() + SESSION_MAX_AGE * 1000;
+        saveSessions();
+        return true;
+      }
+      sessions.delete(sessionToken); // 만료된 세션 정리
     }
-    sessions.delete(sessionToken); // 만료된 세션 정리
   }
 
   // 2. X-Api-Key 헤더 (데몬 호출용)
@@ -1710,8 +1787,9 @@ function handleAuthCallback(req, res, url) {
   const authToken = url.searchParams.get("auth");
   if (!authToken) return false;
 
-  const config = loadConfig();
-  const apiKey = config.api_key;
+  // 공유 맥 모드: 테넌트 호스트면 그 유저의 api_key 로 검증하고 테넌트 세션 발급
+  const cbTenant = tenantFromReq(req);
+  const apiKey = cbTenant ? tenantApiKey(cbTenant) : loadConfig().api_key;
   if (!apiKey) {
     res.writeHead(401, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ error: "API key not configured" }));
@@ -1725,11 +1803,12 @@ function handleAuthCallback(req, res, url) {
     return true;
   }
 
-  // 세션 생성
+  // 세션 생성 (테넌트 세션은 tenant 표시 — 소유자/타 테넌트 스코프에서 무효)
   const sessionToken = generateSessionToken();
   sessions.set(sessionToken, {
     createdAt: Date.now(),
     expiresAt: Date.now() + SESSION_MAX_AGE * 1000,
+    ...(cbTenant ? { tenant: cbTenant.name } : {}),
   });
   saveSessions();
 
@@ -1902,6 +1981,19 @@ const server = http.createServer((req, res) => {
     }
   }
 
+  // 공유 맥 모드 테넌트 요청: docs API 만 노출 + dir 을 그 유저 홈 하위로 강제 (초크포인트)
+  const reqTenant = tenantFromReq(req);
+  const tenantRoot = reqTenant ? path.resolve(reqTenant.home) + path.sep : null;
+  if (reqTenant) {
+    if (!pathname.startsWith("/api/docs") && pathname !== "/share") {
+      return json({ error: "shared portal: not available" }, 404);
+    }
+    const qDir = url.searchParams.get("dir");
+    if (qDir && !path.resolve(qDir).startsWith(tenantRoot)) {
+      return json({ error: "접근 불가 경로" }, 403);
+    }
+  }
+
   // Read body helper
   const readBody = () => new Promise((resolve) => {
     let body = "";
@@ -1911,6 +2003,10 @@ const server = http.createServer((req, res) => {
         const parsed = JSON.parse(body);
         // 클라우드 모드: body.dir 도 중앙 검증 — 무효면 dir 제거 (핸들러가 400 처리)
         if (CLOUD_MODE && parsed && parsed.dir && !validateDocsDir(parsed.dir)) {
+          delete parsed.dir;
+        }
+        // 공유 맥 모드: body.dir 도 테넌트 홈 하위 강제
+        if (reqTenant && parsed && parsed.dir && !path.resolve(parsed.dir).startsWith(tenantRoot)) {
           delete parsed.dir;
         }
         resolve(parsed);
@@ -1966,9 +2062,9 @@ const server = http.createServer((req, res) => {
     const id = pathname.split("/api/logs/")[1];
     json(apiLogs(decodeURIComponent(id)));
   }
-  // Docs API: /api/docs/all — 전체 프로젝트 docs 트리
+  // Docs API: /api/docs/all — 전체 프로젝트 docs 트리 (테넌트면 그 유저 베이스로)
   else if (pathname === "/api/docs/all" && req.method === "GET") {
-    json(apiDocsAll());
+    json(reqTenant ? apiDocsAll(reqTenant.configDir, reqTenant.home) : apiDocsAll());
   }
   // Docs API: /api/docs/search — 문서 검색 (dir + q 쿼리 파라미터)
   else if (pathname === "/api/docs/search" && req.method === "GET") {
