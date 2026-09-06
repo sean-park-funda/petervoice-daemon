@@ -91,29 +91,50 @@ class SkillsSyncer(threading.Thread):
 
         SKILLS_DIR.mkdir(parents=True, exist_ok=True)
         installed = []
-
         updated = []
-        for skill_dir in bundle_dir.iterdir():
+        skipped = []
+
+        # 스킬 하나가 실패해도 나머지는 계속 설치한다.
+        # 2026-08-26~09-06: agent-browser(심링크)에서 FileExistsError 가 루프를 탈출시켜
+        # 그 뒤 순번의 번들 스킬이 통째로 미설치됐다 (commons-lookup 11일간 누락).
+        for skill_dir in sorted(bundle_dir.iterdir()):
             if not skill_dir.is_dir() or skill_dir.name.startswith("."):
                 continue
             local_dir = SKILLS_DIR / skill_dir.name
-            if not local_dir.exists():
-                # 신규: 복사
-                shutil.copytree(skill_dir, local_dir)
-                installed.append(skill_dir.name)
-                continue
-            # 기존: 번들 pv_version이 더 높으면 덮어쓰기 (스크립트 패치 전파)
-            bundle_v = _skill_pv_version(skill_dir / "SKILL.md")
-            local_v = _skill_pv_version(local_dir / "SKILL.md")
-            if bundle_v > local_v:
-                shutil.rmtree(local_dir, ignore_errors=True)
-                shutil.copytree(skill_dir, local_dir)
-                updated.append(f"{skill_dir.name}({'.'.join(map(str, local_v))}→{'.'.join(map(str, bundle_v))})")
+            try:
+                # 유저가 직접 건 심링크(로컬 개발본)는 건드리지 않는다.
+                # rmtree 는 심링크를 지우지 못하고 ignore_errors 로 삼켜지므로,
+                # 이어지는 copytree 가 반드시 FileExistsError 를 낸다.
+                if local_dir.is_symlink():
+                    skipped.append(skill_dir.name)
+                    continue
+
+                if not local_dir.exists():
+                    # 신규: 복사
+                    shutil.copytree(skill_dir, local_dir)
+                    installed.append(skill_dir.name)
+                    continue
+
+                # 기존: 번들 pv_version이 더 높으면 덮어쓰기 (스크립트 패치 전파)
+                bundle_v = _skill_pv_version(skill_dir / "SKILL.md")
+                local_v = _skill_pv_version(local_dir / "SKILL.md")
+                if bundle_v > local_v:
+                    shutil.rmtree(local_dir, ignore_errors=True)
+                    if local_dir.exists():
+                        # 제거 실패 — 덮어쓰면 copytree 가 예외를 낸다. 원본을 남긴다.
+                        logger.warning(f"[skills] Bundle update skipped (제거 실패): {skill_dir.name}")
+                        continue
+                    shutil.copytree(skill_dir, local_dir)
+                    updated.append(f"{skill_dir.name}({'.'.join(map(str, local_v))}→{'.'.join(map(str, bundle_v))})")
+            except Exception as e:
+                logger.error(f"[skills] Bundle install failed for {skill_dir.name}: {e}")
 
         if installed:
             logger.info(f"[skills] Bundled skills installed: {', '.join(installed)}")
         if updated:
             logger.info(f"[skills] Bundled skills updated: {', '.join(updated)}")
+        if skipped:
+            logger.info(f"[skills] Bundled skills skipped (심링크, 로컬 관리): {', '.join(skipped)}")
 
     def sync_once(self):
         api_key = config.get("api_key", "")
