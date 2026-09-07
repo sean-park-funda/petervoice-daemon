@@ -955,6 +955,46 @@ def rewrite_for_voice(text: str) -> str:
 
 # ─── Codex CLI execution ───────────────────────────────────────
 
+# Codex 모델별 지원 effort — 웹 lib/modelCatalog.ts 의 동일 표와 맞춘다.
+# (코덱스 CLI 가 서버에서 받아오는 ~/.codex/models_cache.json 기준)
+_CODEX_EFFORT_ORDER = ["low", "medium", "high", "xhigh", "max", "ultra"]
+_CODEX_FULL = ["low", "medium", "high", "xhigh", "max", "ultra"]
+_CODEX_NO_ULTRA = ["low", "medium", "high", "xhigh", "max"]
+_CODEX_BASIC = ["low", "medium", "high", "xhigh"]
+CODEX_MODEL_EFFORTS = {
+    "gpt-6-astra": _CODEX_FULL,
+    "gpt-5.6-sol": _CODEX_FULL,
+    "gpt-5.6-terra": _CODEX_FULL,
+    "gpt-5.6-luna": _CODEX_NO_ULTRA,
+    "gpt-5.5": _CODEX_BASIC,
+    "gpt-5.4-mini": _CODEX_BASIC,
+}
+
+
+def _resolve_codex_effort(effort: str | None, model: str | None) -> str | None:
+    """UI effort 값을 해당 Codex 모델이 실제 지원하는 값으로 보정. 넘길 값이 없으면 None.
+
+    미지원 값이면 지원되는 값 중 한 단계씩 낮춰 가장 가까운 값을 쓴다
+    (예: GPT-5.5 에 ultra 요청 → xhigh). 표에 없는 신규 모델은 그대로 통과시킨다.
+    """
+    if not effort:
+        return None
+    e = str(effort).strip().lower()
+    if e == "minimal":  # 예전 UI 잔재 — 현재 어떤 Codex 모델도 지원하지 않음
+        e = "low"
+    if e not in _CODEX_EFFORT_ORDER:
+        return None
+    supported = CODEX_MODEL_EFFORTS.get(model or "")
+    if not supported:
+        return e
+    if e in supported:
+        return e
+    for cand in reversed(_CODEX_EFFORT_ORDER[:_CODEX_EFFORT_ORDER.index(e)]):
+        if cand in supported:
+            return cand
+    return supported[0]
+
+
 _AGENTS_MD_MARKER_START = "<!-- PETERVOICE-DAEMON-PROMPT-START -->"
 _AGENTS_MD_MARKER_END = "<!-- PETERVOICE-DAEMON-PROMPT-END -->"
 
@@ -1065,6 +1105,18 @@ def run_codex(prompt: str, project: str, _retry_count: int = 0) -> tuple[str, st
     if model and (model.startswith("claude") or model in ("opus", "sonnet", "haiku")):
         model = config.get("codex_default_model")
     use_model_flag = bool(model)
+    # effort: 브랜치 > 프로젝트 > 전역 config 순 (run_claude 와 동일 우선순위).
+    # Codex 는 --effort 플래그가 없어 `-c model_reasoning_effort=<값>` 으로 넘긴다.
+    branch_effort = branch_data.get("effort") if is_branch and branch_data else None
+    effort = _resolve_codex_effort(
+        branch_effort or proj_settings.get("effort") or config.get("codex_effort"),
+        model,
+    )
+    common_flags: list[str] = []
+    if use_model_flag:
+        common_flags.extend(["-m", model])
+    if effort:
+        common_flags.extend(["-c", f"model_reasoning_effort={effort}"])
     bot_name = config.get("bot_name", "bot")
 
     if sid:
@@ -1074,8 +1126,7 @@ def run_codex(prompt: str, project: str, _retry_count: int = 0) -> tuple[str, st
             "--dangerously-bypass-approvals-and-sandbox",
             "--skip-git-repo-check",
         ]
-        if use_model_flag:
-            cmd.extend(["-m", model])
+        cmd.extend(common_flags)
         cmd.extend(["resume", sid, prompt])
     else:
         cmd = [
@@ -1085,11 +1136,10 @@ def run_codex(prompt: str, project: str, _retry_count: int = 0) -> tuple[str, st
             "--skip-git-repo-check",
             "-C", project_dir,
         ]
-        if use_model_flag:
-            cmd.extend(["-m", model])
+        cmd.extend(common_flags)
         cmd.append(prompt)
 
-    logger.info(f"[{bot_name}] Codex: project={project}, dir={project_dir}, session={sid or 'new'}, model={model or 'default'}")
+    logger.info(f"[{bot_name}] Codex: project={project}, dir={project_dir}, session={sid or 'new'}, model={model or 'default'}, effort={effort or '(model default)'}")
 
     # run_claude 와 동일한 이유로 한 번만 반납한다 (세션 오류 재시도 시 이중 release → 동시성 누수)
     _sem_held = False
