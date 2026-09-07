@@ -2,8 +2,11 @@
 
 import os
 import sys
+import glob
 import json
 import time
+import base64
+from datetime import datetime, timezone
 import select
 import subprocess
 from pathlib import Path
@@ -971,6 +974,110 @@ CODEX_MODEL_EFFORTS = {
 }
 
 
+def _codex_home() -> str:
+    return os.environ.get("CODEX_HOME") or os.path.join(os.path.expanduser("~"), ".codex")
+
+
+def _read_codex_usage(session_id: str | None) -> tuple[dict | None, dict | None]:
+    """코덱스 세션 기록(rollout)에서 한도·토큰 사용량을 읽어 (limits, tokens) 반환.
+
+    `codex exec --json` 스트림에는 한도 정보가 실려오지 않는다. 대신 코덱스가 남기는
+    rollout JSONL 안에 `token_count` 이벤트로 rate_limits 와 누적 토큰이 들어 있어,
+    턴이 끝난 뒤 그 파일의 마지막 값을 읽는다. (추가 API 호출 없음)
+
+    한도에 막혀 턴이 실패한 경우 primary/secondary 가 null 이고
+    rate_limit_reached_type 만 채워져 오므로, 그 값을 blocked_reason 으로 넘긴다.
+    """
+    if not session_id:
+        return None, None
+    try:
+        pattern = os.path.join(_codex_home(), "sessions", "**", f"*{session_id}*.jsonl")
+        paths = glob.glob(pattern, recursive=True)
+        if not paths:
+            return None, None
+        path = max(paths, key=os.path.getmtime)
+        last = None
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                if '"rate_limits"' in line:
+                    last = line
+        if not last:
+            return None, None
+        payload = json.loads(last).get("payload", {})
+        rl = payload.get("rate_limits") or {}
+        info = payload.get("info") or {}
+    except Exception as e:
+        logger.warning(f"[codex] usage read failed: {e}")
+        return None, None
+
+    def _pct(window):
+        if not isinstance(window, dict):
+            return None, None
+        pct = window.get("used_percent")
+        resets = window.get("resets_at")
+        reset_iso = None
+        if isinstance(resets, (int, float)):
+            reset_iso = datetime.fromtimestamp(resets, tz=timezone.utc).isoformat()
+        return (round(pct) if isinstance(pct, (int, float)) else None), reset_iso
+
+    session_pct, session_reset = _pct(rl.get("primary"))
+    week_pct, week_reset = _pct(rl.get("secondary"))
+    limits = {
+        "session_pct": session_pct,
+        "week_pct": week_pct,
+        "session_reset": session_reset,
+        "week_reset": week_reset,
+        "plan_type": rl.get("plan_type"),
+        "blocked_reason": rl.get("rate_limit_reached_type"),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    return limits, (info.get("total_token_usage") or None)
+
+
+def _report_codex_usage(api_key: str, project: str, model: str | None, session_id: str | None):
+    """코덱스 한도를 배너용으로, 토큰 사용량을 사용량 집계로 보고. 실패해도 턴에 영향 없음."""
+    limits, tokens = _read_codex_usage(session_id)
+    if limits:
+        limits["model"] = model
+        limits["account"] = _codex_account_email()
+        try:
+            api_request(api_key, "PATCH", "/api/bot/status",
+                        body={"codex_usage_limits": limits}, timeout=10)
+        except Exception as e:
+            logger.warning(f"[codex] usage report failed: {e}")
+    if tokens:
+        try:
+            api_request(api_key, "POST", "/api/usage", body={
+                "project": project,
+                "model": model or "codex",
+                "input_tokens": tokens.get("input_tokens", 0),
+                "output_tokens": tokens.get("output_tokens", 0),
+                "cache_read_tokens": tokens.get("cached_input_tokens", 0),
+                "cache_write_tokens": tokens.get("cache_write_input_tokens", 0),
+            })
+        except Exception as e:
+            logger.warning(f"[codex] token report failed: {e}")
+    if limits:
+        logger.info(
+            f"[codex] usage: 5h={limits.get('session_pct')}% week={limits.get('week_pct')}%"
+            + (f" BLOCKED={limits['blocked_reason']}" if limits.get("blocked_reason") else "")
+        )
+
+
+def _codex_account_email() -> str | None:
+    """코덱스가 로그인한 ChatGPT 계정 이메일 (배너 표시용). 토큰 값은 다루지 않는다."""
+    try:
+        with open(os.path.join(_codex_home(), "auth.json"), "r", encoding="utf-8") as f:
+            tok = (json.load(f).get("tokens") or {}).get("id_token")
+        if not tok:
+            return None
+        payload = tok.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        return json.loads(base64.urlsafe_b64decode(payload)).get("email")
+    except Exception:
+        return None
+
+
 def _resolve_codex_effort(effort: str | None, model: str | None) -> str | None:
     """UI effort 값을 해당 Codex 모델이 실제 지원하는 값으로 보정. 넘길 값이 없으면 None.
 
@@ -1143,6 +1250,9 @@ def run_codex(prompt: str, project: str, _retry_count: int = 0) -> tuple[str, st
 
     # run_claude 와 동일한 이유로 한 번만 반납한다 (세션 오류 재시도 시 이중 release → 동시성 누수)
     _sem_held = False
+    # 실패로 빠져나가도 finally 에서 사용량을 읽어야 하므로 미리 바인딩해 둔다.
+    # (한도·크레딧 소진으로 턴이 실패한 경우야말로 배너에 꼭 떠야 하는 상태다)
+    new_session_id = sid
 
     def _release_semaphore():
         nonlocal _sem_held
@@ -1334,6 +1444,8 @@ def run_codex(prompt: str, project: str, _retry_count: int = 0) -> tuple[str, st
         logger.error(f"[{bot_name}] Codex error: {e}")
         return (f"(Codex 실행 오류: {e})", sid, [], False)
     finally:
+        # 성공·실패 어느 쪽으로 끝나든 한도를 갱신한다.
+        _report_codex_usage(api_key, project, model, new_session_id)
         try:
             _release_semaphore()
         except ValueError:
