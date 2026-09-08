@@ -1106,7 +1106,9 @@ const MIME_TYPES = {
   ".html": "text/html", ".htm": "text/html",
 };
 
-function serveDocsFile(res, docsDir, filePath) {
+// opts.range: 요청의 Range 헤더 (부분 전송 → PDF 첫 페이지·비디오 시크가 즉시 뜬다)
+// opts.download: true 면 Content-Disposition: attachment (브라우저가 곧장 디스크로 저장)
+function serveDocsFile(res, docsDir, filePath, opts = {}) {
   const validated = validateDocsDir(docsDir);
   if (!validated) { res.writeHead(403); res.end("Forbidden"); return; }
 
@@ -1120,17 +1122,56 @@ function serveDocsFile(res, docsDir, filePath) {
     const stat = fs.statSync(fullPath);
     // 디렉토리에 createReadStream을 걸면 비동기 EISDIR로 프로세스가 죽는다 (2026-09-04 실측)
     if (!stat.isFile()) { res.writeHead(404); res.end("Not found"); return; }
-    res.writeHead(200, {
+
+    const headers = {
       "Content-Type": mime,
-      "Content-Length": stat.size,
       "Cache-Control": "private, max-age=300",
-    });
-    const stream = fs.createReadStream(fullPath);
-    stream.on("error", (e) => {
-      console.error(`[docs-file] stream error ${fullPath}:`, e.message);
-      res.destroy();
-    });
-    stream.pipe(res);
+      "Accept-Ranges": "bytes",
+    };
+    if (opts.download) {
+      // 한글 파일명: ASCII 폴백 + RFC 5987 filename* 병기
+      const name = path.basename(fullPath);
+      const ascii = name.replace(/[^\x20-\x7e]/g, "_").replace(/["\\]/g, "_");
+      headers["Content-Disposition"] = `attachment; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(name)}`;
+    }
+
+    const pipeRange = (start, end) => {
+      const stream = fs.createReadStream(fullPath, { start, end });
+      stream.on("error", (e) => {
+        console.error(`[docs-file] stream error ${fullPath}:`, e.message);
+        res.destroy();
+      });
+      stream.pipe(res);
+    };
+
+    // Range 요청 (bytes=start-end / bytes=start- / bytes=-suffix)
+    const m = /^bytes=(\d*)-(\d*)$/.exec(String(opts.range || "").trim());
+    if (m && stat.size > 0 && (m[1] || m[2])) {
+      let start, end;
+      if (m[1] === "") { // 마지막 N 바이트
+        const suffix = parseInt(m[2], 10);
+        start = Math.max(0, stat.size - suffix);
+        end = stat.size - 1;
+      } else {
+        start = parseInt(m[1], 10);
+        end = m[2] === "" ? stat.size - 1 : Math.min(parseInt(m[2], 10), stat.size - 1);
+      }
+      if (!Number.isFinite(start) || !Number.isFinite(end) || start > end || start >= stat.size) {
+        res.writeHead(416, { "Content-Range": `bytes */${stat.size}`, "Accept-Ranges": "bytes" });
+        res.end();
+        return;
+      }
+      res.writeHead(206, {
+        ...headers,
+        "Content-Range": `bytes ${start}-${end}/${stat.size}`,
+        "Content-Length": end - start + 1,
+      });
+      pipeRange(start, end);
+      return;
+    }
+
+    res.writeHead(200, { ...headers, "Content-Length": stat.size });
+    pipeRange(0, undefined);
   } catch {
     res.writeHead(500); res.end("Read error");
   }
@@ -1964,7 +2005,8 @@ const server = http.createServer((req, res) => {
     res.setHeader("Access-Control-Allow-Origin", "*");
   }
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-Api-Key, Authorization");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-Api-Key, Authorization, Range");
+  res.setHeader("Access-Control-Expose-Headers", "Content-Length, Content-Range, Accept-Ranges, Content-Disposition");
   res.setHeader("Access-Control-Allow-Private-Network", "true");
   if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
 
@@ -2109,7 +2151,10 @@ const server = http.createServer((req, res) => {
     const dir = url.searchParams.get("dir");
     const filePath = url.searchParams.get("path");
     if (!dir || !filePath) return json({ error: "dir, path 파라미터 필요" }, 400);
-    serveDocsFile(res, dir, filePath);
+    serveDocsFile(res, dir, filePath, {
+      range: req.headers.range,
+      download: url.searchParams.get("download") === "1",
+    });
   }
   // Docs API: /api/docs/mkdir — 폴더 생성
   else if (pathname === "/api/docs/mkdir" && req.method === "POST") {
