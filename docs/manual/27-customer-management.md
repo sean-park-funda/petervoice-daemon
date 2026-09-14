@@ -116,19 +116,11 @@ ssh -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519_migration user@{TAILSCALE_IP}
 ```
 
 예시:
-| 고객 | IP | OS | 서비스명 | 레포 경로 |
-|------|----|----|----------|-----------|
-| willy | 100.125.150.24 | Mac | com.petervoice.daemon | ~/peter-voice |
-| jennc | 100.119.200.43 | Windows | ClaudeDaemon | C:/PeterVoice/peter-voice |
+> 🔒 고객별 접속 정보(타넷 IP·OS 유저·SSH 방식·연락처)는 **이 매뉴얼에 적지 않는다.** 이 문서는 데몬 레포로
+> **전 고객 맥미니에 배포**되므로, 여기 있던 고객 표는 2026-09-15 에 걷어냈다(평문 SSH 비밀번호 1건 포함).
+> 본사 내부 런북 `peter-voice/docs/plans/stuck-customer-ssh-recovery.md` §3 표를 볼 것 (Sean 머신 전용).
 
-### 알려진 고객 정보
-
-| 고객명 | 이름 | Tailscale IP | OS 유저 | SSH 방식 | Claude 계정 | 비고 |
-|--------|------|-------------|---------|----------|-------------|------|
-| karl | user 21 | 100.86.21.105 | karl | sshpass -p "$(security find-generic-password -s karl-macmini-ssh -a karl -w)" (비밀번호는 Sean 키체인) | dev.ceo@ptjcomics.com | user 22 와 계정 공유 |
-| — | user 22 | 100.76.237.77 | 777inked777 | SSH 키 인증 (기본 id_ed25519) | dev.ceo@ptjcomics.com | user 21 과 계정 공유; sudo 없음 |
-
-> **주의**: `dev.ceo@ptjcomics.com` 계정을 두 사람이 공유한다. Claude CLI 재로그인 시 이 계정으로 로그인해야 하며, Sean 계정(`sungjunpark@ptjcomics.com`)으로 덮어쓰지 말 것.
+> **주의**: 고객 두 명(user 21·22)이 하나의 Claude 계정을 공유한다(계정은 내부 런북 표). Claude CLI 재로그인 시 이 계정으로 로그인해야 하며, Sean 계정(`sungjunpark@ptjcomics.com`)으로 덮어쓰지 말 것.
 
 ### 연결 확인
 

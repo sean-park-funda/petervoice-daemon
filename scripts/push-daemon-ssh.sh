@@ -14,11 +14,20 @@ DRY_RUN="${1:-}"
 #   service_name: launchd/nssm service name
 #   repo_path: remote path to peter-voice repo root
 #   ssh_opts: extra SSH options (use - for none)
-CUSTOMERS=(
-    "a111@192.168.100.124:mac:com.petervoice.claude-daemon:/Users/a111/Projects/peter-voice:-o IdentitiesOnly=yes -i ~/.ssh/id_ed25519_migration"
-    "willy@100.125.150.24:mac:com.petervoice.daemon:~/peter-voice:-"
-    "jennc@100.119.200.43:windows:ClaudeDaemon:C:/PeterVoice/peter-voice:-"
-)
+# 🔒 고객 목록은 레포에 두지 않는다 — 이 스크립트는 데몬 레포로 **전 고객 맥미니에 배포**되므로
+#    여기 적힌 타넷 IP·계정은 다른 고객 전원에게 간다 (2026-09-15 걷어냄).
+#    Sean 머신의 ~/.claude-daemon/push-customers.txt (chmod 600, 한 줄에 한 항목, # 주석 허용) 에서 읽는다.
+CUSTOMERS_FILE="${PUSH_CUSTOMERS_FILE:-$HOME/.claude-daemon/push-customers.txt}"
+if [ ! -f "$CUSTOMERS_FILE" ]; then
+    echo "❌ 고객 목록 파일이 없습니다: $CUSTOMERS_FILE" >&2
+    echo "   형식: user@host:os:service_name:repo_path:ssh_opts  (ssh_opts 없으면 -)" >&2
+    exit 1
+fi
+CUSTOMERS=()
+while IFS= read -r line; do
+    [[ -z "$line" || "$line" =~ ^# ]] && continue
+    CUSTOMERS+=("$line")
+done < "$CUSTOMERS_FILE"
 
 echo "🚀 Pushing updates to ${#CUSTOMERS[@]} customer(s) via git pull"
 echo ""
