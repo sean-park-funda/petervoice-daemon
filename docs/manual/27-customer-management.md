@@ -1,3 +1,4 @@
+<!-- 2026-09-15: 이 매뉴얼은 데몬 레포에 있어 **전 고객 맥미니에 배포**된다. 여기 있던 고객 SSH 평문 비밀번호·실명을 키체인 참조·user_id 로 치환했다. 비밀번호 값은 어떤 문서에도 적지 말 것(자격증명 위생 규칙). -->
 # 27. 고객 매니지먼트
 
 고객 계정 관리, 채팅 기록 조회, 원격 장애 복구 등 운영 업무 가이드.
@@ -124,8 +125,8 @@ ssh -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519_migration user@{TAILSCALE_IP}
 
 | 고객명 | 이름 | Tailscale IP | OS 유저 | SSH 방식 | Claude 계정 | 비고 |
 |--------|------|-------------|---------|----------|-------------|------|
-| karl | 안영수 | 100.86.21.105 | karl | sshpass -p 'karl1234' (password auth) | dev.ceo@ptjcomics.com | 박태준과 계정 공유 |
-| — | 박태준 | 100.76.237.77 | 777inked777 | SSH 키 인증 (기본 id_ed25519) | dev.ceo@ptjcomics.com | 안영수와 계정 공유; sudo 없음 |
+| karl | user 21 | 100.86.21.105 | karl | sshpass -p "$(security find-generic-password -s karl-macmini-ssh -a karl -w)" (비밀번호는 Sean 키체인) | dev.ceo@ptjcomics.com | user 22 와 계정 공유 |
+| — | user 22 | 100.76.237.77 | 777inked777 | SSH 키 인증 (기본 id_ed25519) | dev.ceo@ptjcomics.com | user 21 과 계정 공유; sudo 없음 |
 
 > **주의**: `dev.ceo@ptjcomics.com` 계정을 두 사람이 공유한다. Claude CLI 재로그인 시 이 계정으로 로그인해야 하며, Sean 계정(`sungjunpark@ptjcomics.com`)으로 덮어쓰지 말 것.
 

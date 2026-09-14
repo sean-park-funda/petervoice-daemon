@@ -1,8 +1,9 @@
-# 2026-06-15 박태준 피터보이스 먹통 (TCP 포트 고갈)
+<!-- 2026-09-15: 이 폴더는 데몬 레포에 있어 **전 고객 맥미니에 배포**된다. 고객 실명·타넷IP·OS유저를 식별자로 치환했다. 사고 기록에 사람을 적을 때는 user_id 만 쓸 것. -->
+# 2026-06-15 user 22 피터보이스 먹통 (TCP 포트 고갈)
 
 **발생**: 2026-06-15 04:44 UTC (마지막 heartbeat 기준)  
 **복구**: 2026-06-15 18:34 KST  
-**고객**: 박태준 (user_id=22, Tailscale IP: 100.76.237.77, OS 유저: 777inked777)  
+**고객**: user 22 (Tailscale IP·OS 유저는 본사 런북 docs/plans/stuck-customer-ssh-recovery.md 표 참조)  
 **증상**: 피터보이스 응답 없음, 웹 UI에서 메시지 전송해도 답 없음
 
 ---
@@ -12,12 +13,12 @@
 | 시각 (KST) | 사건 |
 |-----------|------|
 | ~04:44 UTC | 마지막 heartbeat 기록됨 |
-| 오후 | 박태준이 Sean에게 "피터보이스 먹통"이라고 연락 |
+| 오후 | user 22이 Sean에게 "피터보이스 먹통"이라고 연락 |
 | 18:03 | 데몬 로그: `Poll error #519, wait 30s` — 이미 519번 연속 실패 중 |
 | 18:17 | `launchctl stop`으로 데몬 중단 시도 (문제 발생, 아래 참고) |
 | 18:22 | git pull + 데몬 재기동 (PATH 문제로 claude not found) |
 | 18:23 | 올바른 PATH로 재기동, 네트워크 복구 확인 |
-| 18:34 | 박태준 맥미니 직접 로그인 → Keychain 복구 → 완전 정상화 |
+| 18:34 | user 22 맥미니 직접 로그인 → Keychain 복구 → 완전 정상화 |
 
 ---
 
@@ -48,7 +49,7 @@ WiFi 껐다 켜서 IP가 .168 → .100으로 바뀌었지만,
 
 ### SSH 비번을 몰라서 한참 헤맨 것
 **실제**: 비번 불필요. 기본 `~/.ssh/id_ed25519` 키로 passwordless 접속 가능.  
-`ssh -o StrictHostKeyChecking=no 777inked777@100.76.237.77`  
+`ssh -o StrictHostKeyChecking=no <OS유저>@<타넷IP>` (값은 본사 런북 표)  
 → 4월 대화 기록에 이 형태로 나와있었음. 다음부터는 먼저 키 인증 시도할 것.
 
 ### `launchctl stop`을 SSH에서 실행 → 데몬 미복구
@@ -69,10 +70,10 @@ PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin nohup .venv/bin/python scrip
 ### "Not logged in" 오류
 SSH에서 nohup으로 띄운 데몬은 macOS Keychain 접근 불가.  
 Claude CLI OAuth 토큰이 Keychain에 저장되어 있어 GUI 세션 없이는 읽지 못함.  
-→ 박태준이 맥미니에 직접 로그인하자 `seeded ~/.claude/.credentials.json from Keychain` 로그 출력되며 자동 복구.
+→ user 22이 맥미니에 직접 로그인하자 `seeded ~/.claude/.credentials.json from Keychain` 로그 출력되며 자동 복구.
 
 ### sudo 없음
-`777inked777` 계정은 sudo 권한 없음.  
+해당 OS 계정은 sudo 권한 없음.  
 `sysctl`, `pfctl`, `route delete`, `ifconfig down` 등 커널 수준 작업 불가.
 
 ---
@@ -117,13 +118,13 @@ IP 변경 시 (DHCP 갱신 등) 자동으로 세션 재빌드.
 | TCP 포트 고갈 | requests.Session 연결 재사용으로 TIME_WAIT 최소화 |
 | 소스 IP 선택 버그 | source_address 명시 바인딩 |
 | SSH launchctl 제한 | 프롬프트에 주의사항 기록 완료 |
-| 박태준 SSH 방법 | 프롬프트에 기록 완료 (키 인증, PATH 필수) |
+| user 22 SSH 방법 | 프롬프트에 기록 완료 (키 인증, PATH 필수) |
 
 ---
 
 ## 참고: 고객 Supabase 조회 방법
 
-박태준(user_id=22) 메시지 조회 또는 직접 삽입:
+user 22 메시지 조회 또는 직접 삽입:
 
 ```python
 SB_URL = 'https://gfzprzvynxixekmsadqe.supabase.co'
