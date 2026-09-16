@@ -8,16 +8,18 @@
 ## 온보딩 흐름
 
 ```
-1. 고객이 웹에서 가입 (role: pending)
-2. 관리자가 승인 (role: user, onboarding_queue: active)
-3. onboarding_daemon.py가 감지
-4. SSH로 고객 맥미니 접속
-5. Tailscale 설치 + 네트워크 연결
-6. 데몬 설치 (git clone petervoice-daemon)
-7. launchd 등록 + 초기 설정
-8. 프로젝트 생성 + 스킬 배포
-9. 상태: completed
+[Phase 0] 고객이 웹에서 가입 (role: pending) → 관리자가 /admin 에서 승인 (role: user, onboarding_queue: active)
+          승인 시 자동 생성: api_key · provisioning_configs(Tailscale 키) · 온보딩/일반 프롬프트 · 설치 명령
+[Phase 1] 고객 맥미니 터미널에 설치 명령 1줄 실행 (사람 손 필요, 15~25분)
+          curl …/api/install?key=… | bash → Xcode CLT · Homebrew · Tailscale · SSH 원격로그인 ON · 서버에 보고
+          (install-config 는 재실행 안전 — "1회용" 이라는 옛 설명은 폐기)
+[Phase 2] onboarding_daemon.py 가 큐를 감지하고 SSH 로 들어가 전부 자동 (~10분)
+          node · python · git · claude CLI → 데몬 git clone → 로그인 → config → launchd → 프로젝트·스킬 배포
+[Phase 3] 상태 completed → 고객이 '일반' 프로젝트에서 대화 시작
 ```
+
+**반자동이다.** 사람이 반드시 개입하는 지점은 Phase 0 의 승인 클릭과 Phase 1 의 설치 명령 실행뿐이고, 그 뒤는 데몬이 한다.
+(2026-09-17 정정: 이전 판은 데몬이 Tailscale 설치까지 하는 것으로 적었고, 하단 표에는 "미구현"으로 적혀 있었다 — 둘 다 사실과 달랐다. 실제 운영 중이며 2026-07-06 고객 건이 이 경로로 `install_progress 10/10 completed` 처리됐다.)
 
 ## 온보딩 데몬 (onboarding_daemon.py)
 
@@ -78,7 +80,7 @@ PATCH /api/admin/approve-user
 
 | 레포 | 파일 | 설명 |
 |------|------|------|
-| 데몬 | `scripts/onboarding_daemon.py` | 온보딩 자동화 데몬 **(미구현 — 설계만 완료)** |
+| 온보딩 데몬 (Sean 맥, 별도) | 실행본 `~/.claude-daemon-onboarding/onboarding_daemon.py` · launchd `com.petervoice.onboarding-daemon` · 소스 petervoice-biz 레포 `scripts/onboarding_daemon.py` | 온보딩 자동화 데몬 — **운영 중** (2026-09-17 정정. 이 데몬 레포에는 들어 있지 않다. 실행본과 레포 소스가 다를 수 있으니 실행본이 기준) |
 | 웹 (sonolbot_web) | `app/api/admin/approve-user/route.ts` | 승인 API |
 | 데몬 (petervoice-daemon) | `scripts/daemon/syncers/auto_updater.py` | 데몬/스킬 자동 업데이트 |
 | 웹 | `lib/expert-presets.ts` | 전문가 프리셋 정의 |
