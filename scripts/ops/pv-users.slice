@@ -1,0 +1,15 @@
+# 클라우드 유저 컨테이너 합계 메모리 가드 (config container.cgroup_parent = "pv-users.slice")
+#
+# 유저별 한도(티어 containerMemoryMb)는 천장일 뿐 합계를 보장하지 않는다. 상시 서비스는 동시 턴 5개 제한 밖이라
+# 여러 유저가 동시에 한도 근처를 쓰면 호스트 전체가 OOM 으로 데몬까지 죽을 수 있다 → 컨테이너 전체를 한 슬라이스로 묶어 상한.
+# 한도에 닿으면 슬라이스 안에서 가장 큰 프로세스가 OOM 종료된다 (데몬·OS·포탈은 보호).
+#
+# 설치: sudo cp scripts/ops/pv-users.slice /etc/systemd/system/ && sudo systemctl daemon-reload
+# 값: 공용 xlarge(15.4GB) → 12G (데몬·OS·포탈 몫 약 2.5GB). 2026-09-17 Sean 결정(안 C)
+[Unit]
+Description=PeterVoice cloud user containers (aggregate memory guard)
+Before=slices.target
+
+[Slice]
+MemoryAccounting=yes
+MemoryMax=12G

@@ -560,7 +560,7 @@ def _container_system_prompt(user_id: int | None = None) -> str:
     c = config.get("container", {}) or {}
     lim = user_limits(user_id) if user_id is not None else None
     if lim:
-        mem_mb = min(int(lim.get("turnMemoryMb") or 3072), int(c.get("max_memory_mb", 6144)))
+        mem_mb = ctr.target_mem_mb(lim) or 3072
         mem = f"{mem_mb / 1024:g}GB"
         mins = int(lim.get("turnTimeoutMin") or 30)
         disk = int(lim.get("diskGb") or 0)
@@ -595,7 +595,7 @@ def _container_system_prompt(user_id: int | None = None) -> str:
 - 서버/포트도 컨테이너 내부라 자유롭게 사용 가능 (다른 사용자와 격리됨).
 {always_on_txt}
 ## 이 환경의 실제 사양 (추측하지 말고 이 값을 그대로 안내할 것)
-- 메모리 {mem} / CPU {cpus}코어 / 한 턴 최대 {mins}분 / {disk_txt}
+- 메모리 {mem}(동시 작업·상시 서버·브라우저 합계) / CPU {cpus}코어 / 한 턴 최대 {mins}분 / {disk_txt}
 
 ## 함께 쓰는 사람들
 이 프로젝트는 여러 사람이 함께 쓸 수 있습니다. 메시지가
@@ -985,6 +985,25 @@ def build_systemd_run(user_id: int, cmd: list[str], env: dict, cwd: str, unit: s
         "--property=PrivateTmp=yes", "--property=NoNewPrivileges=yes",
         *cmd,
     ]
+
+
+def check_container_slice() -> None:
+    """유저 컨테이너 합계 메모리 가드(config container.cgroup_parent)가 실제로 걸려 있는지 확인.
+    슬라이스 유닛 파일이 없으면 systemd 가 한도 없는 임시 슬라이스를 만들어 **조용히 무방비**가 된다."""
+    parent = (config.get("container", {}) or {}).get("cgroup_parent")
+    if not parent:
+        return
+    try:
+        r = subprocess.run(["systemctl", "show", parent, "-p", "MemoryMax", "--value"],
+                           capture_output=True, text=True, timeout=10)
+        val = (r.stdout or "").strip()
+        if not val or val == "infinity":
+            logger.error(f"container slice {parent} has NO MemoryMax — 합계 메모리 가드 미적용 "
+                         f"(scripts/ops/pv-users.slice 설치 필요)")
+        else:
+            logger.info(f"container slice {parent} MemoryMax={int(val) >> 20}M")
+    except Exception as e:
+        logger.error(f"container slice check failed: {e}")
 
 
 def ensure_inter_container_block() -> None:
@@ -2564,6 +2583,7 @@ class CloudWorker:
             except Exception as e:
                 logger.error(f"container orphan reap failed: {e}")
             ensure_inter_container_block()
+            check_container_slice()
         # 재시작 시 지난 턴의 잔여 env 파일 정리 (600, 시크릿 잔존 방지)
         try:
             for f in _turnenv_dir().glob("*.env"):

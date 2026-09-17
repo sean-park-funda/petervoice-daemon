@@ -198,16 +198,26 @@ def _swap_total(target_mem: str, limits: dict | None) -> str:
     return f"{base_mb + swap_mb}m"
 
 
-def _target_mem(limits: dict | None) -> str:
-    """티어 한도 → 이 컨테이너의 메모리 스펙. limits 없음(전용 호스트·구 웹) = 호스트 config.
+def target_mem_mb(limits: dict | None) -> int | None:
+    """티어 한도 → 이 컨테이너의 메모리(MB). limits 없음(전용 호스트·구 웹) = None(호스트 config).
 
-    max_memory_mb: 호스트 물리 한계 보호 캡 (공용 large 7GB → 기본 6144).
-    MAX(8GB) 유저도 첫 전용 풀 증설 전까지는 이 캡으로 태운다 (2026-08-04 Sean 승인)."""
+    containerMemoryMb(유저 합계 한도, 2026-09-17 안 C: 2/6/8GB)가 오면 그 값을 쓰고
+    max_container_memory_mb 로 캡. 구 웹(필드 없음)은 예전처럼 turnMemoryMb 를 max_memory_mb
+    (공용 large 7GB 시절 기본 6144, 2026-08-04 Sean 승인) 로 캡."""
     c = _cfg()
-    if not limits or not limits.get("turnMemoryMb"):
-        return str(c.get("memory", "3g"))
-    cap = int(c.get("max_memory_mb", 6144))
-    return f"{min(int(limits['turnMemoryMb']), cap)}m"
+    if not limits:
+        return None
+    if limits.get("containerMemoryMb"):
+        cap = int(c.get("max_container_memory_mb", c.get("max_memory_mb", 6144)))
+        return min(int(limits["containerMemoryMb"]), cap)
+    if limits.get("turnMemoryMb"):
+        return min(int(limits["turnMemoryMb"]), int(c.get("max_memory_mb", 6144)))
+    return None
+
+
+def _target_mem(limits: dict | None) -> str:
+    mb = target_mem_mb(limits)
+    return f"{mb}m" if mb else str(_cfg().get("memory", "3g"))
 
 
 def _spec_mismatch(user_id: int) -> str | None:
@@ -227,6 +237,9 @@ def _spec_mismatch(user_id: int) -> str | None:
         return "init"
     if same_path() and img and img != image():  # 새 방식 호스트만 — 뉴넥스 기존 컨테이너는 건드리지 않는다
         return f"image {img}"
+    parent = _cfg().get("cgroup_parent")
+    if parent and labels.get("pv.cgroup_parent") != parent:
+        return f"cgroup_parent {parent}"
     return None
 
 
@@ -249,6 +262,11 @@ def ensure_running(user_id: int, limits: dict | None = None) -> bool:
         st = container_state(user_id)
         if st != "none":
             why = _spec_mismatch(user_id)
+            if not why and always_on() and st == "running":
+                # 상시 유지 컨테이너는 정지하지 않으므로 티어(메모리) 변경도 떠 있는 채로 반영해야 한다
+                cur, want = _current_mem_bytes(user_id), _mem_to_bytes(target_mem)
+                if want and cur and cur != want:
+                    why = f"memory {cur >> 20}M → {want >> 20}M"
             if why and not (st == "running" and _turn_running(user_id)):
                 if _logger:
                     _logger.info(f"container spec changed ({why}), recreating user={user_id}")
@@ -316,6 +334,9 @@ def ensure_running(user_id: int, limits: dict | None = None) -> bool:
         ]
         if same_path():
             args += ["-v", f"{h}:{h}:rw", "--label", "pv.same_path=1"]
+        if c.get("cgroup_parent"):
+            # 유저 컨테이너 전체를 한 슬라이스에 묶어 합계 메모리 상한(예: 12GB)을 건다 — 데몬·OS 몫 보호
+            args += ["--cgroup-parent", c["cgroup_parent"], "--label", f"pv.cgroup_parent={c['cgroup_parent']}"]
         if c.get("init"):
             # PID 1 이 sleep 이면 상시 서비스의 좀비를 아무도 거두지 않는다
             args += ["--init", "--label", "pv.init=1"]
