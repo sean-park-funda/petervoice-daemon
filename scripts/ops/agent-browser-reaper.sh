@@ -46,7 +46,8 @@ etime_hours() {
   local e="$1" days=0 rest="$1" h=0
   case "$e" in *-*) days="${e%%-*}"; rest="${e#*-}";; esac
   if [ "$(echo "$rest" | awk -F: '{print NF}')" -eq 3 ]; then h=$(echo "$rest" | cut -d: -f1); fi
-  echo $(( 10#$days * 24 + 10#${h#0} ))
+  # 1시간 미만("MM:SS")이면 h=0 — 예전 `10#${h#0}` 는 "0" 을 빈 값으로 만들어 산술 오류가 났다
+  echo $(( 10#${days:-0} * 24 + 10#${h:-0} ))
 }
 
 # 세션을 만든 프로젝트를 찾는다 — 정리 로그에 남겨야 반복되는 누수의 주인을 추적할 수 있다.
