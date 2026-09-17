@@ -555,6 +555,20 @@ CONTAINER_ALWAYS_ON_PROMPT = """
 """
 
 
+CROSS_USER_PROMPT = """
+## 다른 유저의 에이전트와 연결 (크로스유저)
+유저가 다른 피터보이스 유저(@핸들)와 연결을 수락해 두었으면 그 사람의 에이전트와 메시지를 주고받을 수 있습니다.
+같은 계정 안의 릴레이(`/api/relay/message`)와는 별개이고, Claude 세션 목록(ListAgents)에는 나오지 않습니다.
+"연결돼 있어?"라고 물으면 추측하지 말고 아래로 **조회**하세요 (헤더는 반드시 `Authorization: Bearer`).
+- 연결 확인: `curl -s "$API_URL/api/connections" -H "Authorization: Bearer $API_KEY"`
+  → `accepted[]` 의 `peerHandle`(상대), `myInboxProject`(상대 메시지가 도착하는 내 프로젝트), `myAutoExecute`, `myRatePerDay`
+- 보내기: `curl -s -X POST "$API_URL/api/relay/external" -H "Authorization: Bearer $API_KEY" -H "Content-Type: application/json"`
+  `-d '{"to_handle":"@상대","from_project":"<내 프로젝트ID>","kind":"message","text":"..."}'`
+- 받은 메시지는 `[외부 relay @보낸사람 · kind]` 로 **수신 프로젝트(myInboxProject)에만** 도착합니다. 다른 프로젝트 대화에는
+  그 교신 기록이 없으니, 이전 교신 내용이 필요하면 그 프로젝트 대화에서 확인하라고 안내하세요.
+"""
+
+
 def _container_system_prompt(user_id: int | None = None) -> str:
     """전용 컨테이너용 환경 안내. 실제 적용값을 그대로 알려준다
     (하드코딩하면 호스트·티어별로 사양을 잘못 안내하게 된다).
@@ -772,10 +786,10 @@ def _fetch_web_prompt(user_id: int, api_key: str, project: str,
 
 def _env_system_prompt(user_id: int) -> str:
     if ctr.enabled_for(user_id):
-        return _container_system_prompt(user_id)
+        return _container_system_prompt(user_id) + CROSS_USER_PROMPT
     if config.get("dedicated"):
         return _dedicated_host_prompt()
-    return _shared_system_prompt(user_id)
+    return _shared_system_prompt(user_id) + CROSS_USER_PROMPT
 
 
 def compose_system_prompt(user_id: int, project: str) -> str:
