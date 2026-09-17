@@ -3,6 +3,11 @@
 맥미니에서 프로젝트를 빌드하고 인터넷에 직접 공개하는 기능.
 GitHub/Vercel 없이, 맥미니 자체가 웹서버가 되어 Cloudflare Tunnel로 HTTPS 제공.
 
+> **피터보이스 클라우드도 된다 (2026-09-17~)** — 상시 컨테이너로 전환된 클라우드 계정은 대화가 끝나도 서버가 계속 돈다.
+> 맥 절차(brew·launchd·publish.py) 대신 `pv-service add <이름> --cwd <폴더> -- <명령>` 으로 서버를 상시 등록하고
+> `pv-tunnel route <이름> <포트>` 로 `https://<아이디>-<이름>.peter-voice.site` 에 공개한다. 판별: `command -v pv-tunnel`.
+> 상세: 34장 "상시 운영" 절, `local-publish` 스킬 0단계.
+
 ## 개요
 
 ```

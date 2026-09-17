@@ -68,6 +68,21 @@
 - 클라우드 유저 `projects.directory` = `/srv/pv/users/<id>/workspace/<project>`
 - 방화벽: 8899는 웹 박스 IP(54.116.190.85)만 허용
 
+## 상시 운영 (2026-09-17~, 유저별 순차 전환)
+
+클라우드는 요금제와 무관하게 **상시 서버 운영이 기본**이다 (Sean 결정). 옛 방식(턴마다 systemd 임시 유닛)은 턴이 끝나면
+프로세스를 전부 정리해 서버·터널을 둘 수 없었다. 전환된 유저는 유저당 podman 컨테이너가 상시 유지된다.
+
+- 전환 대상: 호스트 config `container.users` (공용 호스트 순차 전환 중)
+- 세션 보존: 홈을 컨테이너 안에서도 호스트와 같은 경로(`/srv/pv/users/<id>`)로 본다(`same_path`) — 옛 방식에서 쓰던 대화 세션이 그대로 이어진다
+- 메모리: 동시 턴 + 상시 서버 + 브라우저 **합계** 한도 = 티어 `containerMemoryMb` (베이직 2GB / 프로 6GB / MAX 8GB),
+  유저 컨테이너 전체는 12GB 가드(`pv-users.slice`)
+- 유저 도구 (컨테이너 안):
+  - `pv-service add <이름> --cwd <폴더> -- <명령>` — 상시 서비스. 데몬이 기동 시와 5분마다 `pv-service up` 으로 되살린다
+  - `pv-tunnel route <이름> <포트>` — 유저 터널 `pv-<아이디>` 를 만들고 연결기를 서비스로 등록, `<아이디>-<이름>.peter-voice.site` 공개
+- 격리: 컨테이너 간 트래픽 차단(브리지 iptables DROP), 방치된 agent-browser 크롬은 리퍼가 매시간 정리
+- 설계·검증: `docs/plans/2026-09-17-cloud-always-on-containers.md`
+
 ## 운영
 
 - 상태 확인: /admin → 프로비저닝 탭 → "클라우드 데몬" 카드 (heartbeat 기반 생존 판정)

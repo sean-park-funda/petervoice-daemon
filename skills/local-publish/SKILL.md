@@ -1,13 +1,34 @@
 ---
 name: local-publish
-description: 현재 프로젝트를 맥미니에서 로컬 빌드 후 인터넷에 퍼블리싱. "퍼블리싱해줘", "사이트 올려줘", "publish this", "사이트 내려줘", "재빌드" 등에 반응. Cloudflare Tunnel + launchd 기반.
-pv_version: "1.1.0"
+description: 현재 프로젝트를 맥미니 또는 피터보이스 클라우드(상시 컨테이너)에서 빌드·실행하고 인터넷에 퍼블리싱. "퍼블리싱해줘", "사이트 올려줘", "로컬호스팅", "publish this", "사이트 내려줘", "재빌드" 등에 반응. Cloudflare Tunnel 기반 (맥=launchd, 클라우드=pv-service/pv-tunnel).
+pv_version: "1.2.0"
 ---
 
-# Local Publish — 맥미니 로컬 퍼블리싱
+# Local Publish — 로컬 퍼블리싱 (맥미니 · 피터보이스 클라우드)
 
-프로젝트를 맥미니에서 빌드하고, Cloudflare Tunnel을 통해 인터넷에 공개합니다.
+프로젝트를 빌드하고, Cloudflare Tunnel을 통해 인터넷에 공개합니다.
 URL 형식: `https://{username}-{project}.peter-voice.site`
+
+## ⚡ 0단계: 환경 판별 — 먼저 실행
+
+```bash
+command -v pv-tunnel >/dev/null && echo CLOUD_CONTAINER || echo MAC_OR_SELFHOST
+```
+
+### CLOUD_CONTAINER 이면 → 아래 맥 절차(brew·launchd·publish.py)를 쓰지 말고 이것만 한다
+피터보이스 클라우드의 상시 컨테이너다. 대화가 끝나도 서버가 계속 돈다 (2026-09-17 부터).
+1. **서버를 상시 서비스로 등록** — 재기동·점검 뒤에도 자동으로 다시 뜬다. 반드시 `127.0.0.1` 에 바인딩
+   - 정적 사이트(빌드 결과 폴더): `pv-service add <이름> --cwd <폴더> -- python3 -m http.server <포트> --bind 127.0.0.1`
+   - Next.js: `npm run build` 후 `pv-service add <이름> --cwd <프로젝트> -- npx next start -H 127.0.0.1 -p <포트>`
+   - Vite: `npm run build` 후 정적 사이트 방식으로 `dist/` 서빙
+2. **공개**: `pv-tunnel route <이름> <포트>` → `https://<피터보이스아이디>-<이름>.peter-voice.site` (DNS 1~2분)
+   - 누구나 접속 가능한 주소가 된다 — **공개 전에 유저에게 확인**
+3. 확인·관리: `pv-tunnel status` · `pv-service list` · `pv-service logs <이름>` · `pv-service restart <이름>`
+4. 내리기: `pv-tunnel unroute <이름>` 후 `pv-service rm <이름>`
+
+`pv-tunnel` 이 없는 리눅스 클라우드 계정이면 아직 상시 컨테이너로 전환되지 않은 것이다 — 상시 서버가 불가하니 운영자 전환 대기라고 안내한다.
+
+### MAC_OR_SELFHOST 이면 → 아래 절차
 
 ## 퍼블리시 전 사전 체크 (반드시 순서대로 실행)
 
