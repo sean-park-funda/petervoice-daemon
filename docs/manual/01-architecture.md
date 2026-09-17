@@ -96,7 +96,6 @@ peter-voice/                       # 작업 디렉토리
 │   │   ├── claude_daemon.py       # 메인 데몬 엔트리포인트
 │   │   ├── home-portal.js         # Home Portal (맥미니 대시보드)
 │   │   ├── publish.py             # 로컬 퍼블리싱 CLI
-│   │   ├── web_reply.py           # 웹 API 통신 유틸
 │   │   └── daemon/                # 데몬 모듈
 │   │       ├── worker.py          # 메시지 폴링 + Claude Code CLI 실행
 │   │       ├── health.py          # SessionHealthChecker (세션 수명 + Stall 감지)
