@@ -1,7 +1,7 @@
 ---
 name: local-publish
 description: 현재 프로젝트를 맥미니 또는 피터보이스 클라우드(상시 컨테이너)에서 빌드·실행하고 인터넷에 퍼블리싱. "퍼블리싱해줘", "사이트 올려줘", "로컬호스팅", "publish this", "사이트 내려줘", "재빌드" 등에 반응. Cloudflare Tunnel 기반 (맥=launchd, 클라우드=pv-service/pv-tunnel).
-pv_version: "1.2.0"
+pv_version: "1.2.1"
 ---
 
 # Local Publish — 로컬 퍼블리싱 (맥미니 · 피터보이스 클라우드)
@@ -69,7 +69,7 @@ c = json.loads(config_path.read_text())
 if c.get("cloudflare_tunnel_id"):
     print(f"이미 설정됨: {c['cloudflare_tunnel_id']}")
 else:
-    api_url = c.get("api_url", "https://peter-voice.vercel.app")
+    api_url = c.get("api_url", "https://www.peter-voice.site")  # 구 Vercel 주소는 은퇴(2026-07-08 박스 이전)
     api_key = c["api_key"]
     username = c.get("username") or c.get("customer") or "user"
 

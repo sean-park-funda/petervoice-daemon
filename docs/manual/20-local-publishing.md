@@ -52,7 +52,7 @@ https://{username}-{project}.peter-voice.site
 | `cloudflared` | 맥미니 (brew) | Cloudflare Tunnel 커넥터 |
 | `site_manager.py` | `scripts/daemon/` | 빌드, 포트 할당, launchd 관리 |
 | `publish.py` | `scripts/` | CLI 래퍼 (에이전트가 bash로 호출) |
-| `/api/tunnel/*` | Vercel | Cloudflare API 대행 (DNS, ingress) |
+| `/api/tunnel/*` | 피터보이스 웹 서버 (AWS 박스, www.peter-voice.site) | Cloudflare API 대행 (DNS, ingress) |
 | `cloudflare-tunnel.ts` | `lib/` | Cloudflare API 헬퍼 |
 | `local-publish` 스킬 | DB → 자동 싱크 | 에이전트 사용 가이드 |
 
@@ -126,7 +126,9 @@ python3 ~/Projects/peter-voice/scripts/publish.py status
    - Tunnel ingress 규칙 제거
 3. 상태를 `stopped`로 업데이트
 
-## 서버 API (Vercel)
+## 서버 API (피터보이스 웹 서버)
+
+> 웹은 2026-07-08 Vercel 에서 AWS 박스(`www.peter-voice.site`)로 이전됐다. 옛 `peter-voice.vercel.app` 은 `/migrating` 점검 페이지만 남아 있고 `/api/*` 는 503 을 돌려주므로 어디에도 기본값으로 쓰지 말 것.
 
 ### POST /api/tunnel/create
 
@@ -171,9 +173,9 @@ python3 ~/Projects/peter-voice/scripts/publish.py status
 | 항목 | 저장 위치 |
 |------|-----------|
 | 도메인: `peter-voice.site` | Cloudflare DNS |
-| `CLOUDFLARE_API_TOKEN` | Vercel 환경변수 + 피터보이스 시크릿 |
-| `CLOUDFLARE_ACCOUNT_ID` | Vercel 환경변수 |
-| `CLOUDFLARE_ZONE_ID` | Vercel 환경변수 |
+| `CLOUDFLARE_API_TOKEN` | 박스 `~/peter-voice-web/.env.local` + 피터보이스 시크릿 |
+| `CLOUDFLARE_ACCOUNT_ID` | 박스 `~/peter-voice-web/.env.local` |
+| `CLOUDFLARE_ZONE_ID` | 박스 `~/peter-voice-web/.env.local` |
 | `cloudflare_tunnel_id` | 맥미니 `config.json` |
 | `cloudflare_tunnel_token` | 맥미니 `config.json` |
 
