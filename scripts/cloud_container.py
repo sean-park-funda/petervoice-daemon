@@ -367,12 +367,41 @@ def start_services(user_id: int) -> None:
         _logger.warning(f"pv-service up failed user={user_id}: {(r.stderr or '')[:200]}")
 
 
+_last_browser_reap = 0.0
+BROWSER_REAPER = Path(__file__).resolve().parent / "ops" / "agent-browser-reaper.sh"
+
+
+def reap_browsers(user_id: int) -> None:
+    """상시 컨테이너 안의 방치된 agent-browser 크롬·고아 세션 서버 정리.
+    옛 방식은 턴이 끝나면 cgroup 째 정리됐지만, 상시 컨테이너에선 닫지 않은 크롬이 계속 쌓인다
+    (맥 2026-08-20 사고: 방치 크롬 14개 CPU 575%). 맥용 리퍼를 컨테이너 안에서 그대로 돌린다."""
+    try:
+        script = BROWSER_REAPER.read_text()
+    except OSError:
+        return
+    try:
+        r = subprocess.run(["sudo", "-n", "podman", "exec", "-i", "--user=agent", name(user_id), "bash", "-s"],
+                           input=script, capture_output=True, text=True, timeout=300)
+    except subprocess.TimeoutExpired:
+        if _logger:
+            _logger.warning(f"browser reaper timeout user={user_id}")
+        return
+    out = (r.stdout or "").strip()
+    if out and _logger:
+        for line in out.splitlines()[-10:]:
+            _logger.info(f"[browser-reaper] user={user_id} {line}")
+
+
 def keep_services(roster_ids, limits_for=None) -> None:
     """상시 유지 점검 (주기 호출): 이 호스트 담당 컨테이너 유저 중 컨테이너가 이미 있는 유저는
     떠 있게 하고 등록 서비스를 되살린다. 한 번도 쓰지 않은 유저의 컨테이너는 만들지 않는다.
     limits_for(uid): 재생성이 필요할 때 티어 메모리를 적용하기 위한 한도 조회."""
+    global _last_browser_reap
     if not always_on():
         return
+    reap_due = time.time() - _last_browser_reap >= 3600
+    if reap_due:
+        _last_browser_reap = time.time()
     r = _podman("ps", "-a", "--format", "{{.Names}}", timeout=15)
     if r.returncode != 0:
         return
@@ -388,6 +417,8 @@ def keep_services(roster_ids, limits_for=None) -> None:
                 start_services(uid)
             else:
                 ensure_running(uid, limits_for(uid) if limits_for else None)  # 기동 시 start_services 포함
+            if reap_due:
+                reap_browsers(uid)
         except Exception as e:  # 한 유저 실패가 점검 전체를 막으면 안 된다
             if _logger:
                 _logger.warning(f"keep_services user={uid}: {e}")

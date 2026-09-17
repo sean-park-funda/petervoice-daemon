@@ -29,7 +29,10 @@ TAB_WARN="${AGENT_BROWSER_TAB_WARN:-15}"        # 이 이상 쌓이면 경고
 DRY_RUN="${DRY_RUN:-0}"
 PATTERN="agent-browser-chrome-"
 AB_DIR="$HOME/.agent-browser"
-CLAUDE_PROJECTS="$HOME/.claude/projects"
+CLAUDE_PROJECTS="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects"
+# 크롬 프로세스 판별 — 맥은 "Google Chrome", 리눅스 클라우드 컨테이너는 playwright 의
+# chrome-linux64/chrome (+ chrome_crashpad_handler). 둘 다 임시 프로필 경로가 인자에 들어 있다.
+CHROME_RE="Google Chrome|${PATTERN}|/chrome( |$)|chrome_crashpad_handler"
 
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $*"; }
 act() {  # DRY_RUN 이면 실행하지 않고 표시만
@@ -54,9 +57,10 @@ owner_of() {
   # 실제로 이 리퍼를 만들며 세션명을 조회한 대화가 매칭됐다). **가장 먼저 언급한 파일**
   # = 만든 쪽으로 본다. 그래서 mtime 오름차순 첫 번째를 고른다.
   hit=$(grep -rl --include='*.jsonl' -m1 -- "--session $name" "$CLAUDE_PROJECTS" 2>/dev/null \
-        | xargs -I{} stat -f '%m {}' {} 2>/dev/null | sort -n | head -1 | cut -d' ' -f2-)
+        | xargs -I{} sh -c "stat -f '%m {}' {} 2>/dev/null || stat -c '%Y {}' {}" 2>/dev/null \
+        | sort -n | head -1 | cut -d' ' -f2-)
   if [ -n "$hit" ]; then
-    basename "$(dirname "$hit")" | sed -E 's/^-Users-sean-(-claude-daemon-)?[Pp]rojects-+//'
+    basename "$(dirname "$hit")" | sed -E 's/^-Users-sean-(-claude-daemon-)?[Pp]rojects-+//; s/^-srv-pv-users-[0-9]+-workspace-?//'
   else
     echo "unknown"
   fi
@@ -65,9 +69,9 @@ owner_of() {
 killed_chrome=0; killed_srv=0; cleaned=0
 
 # ── ① 오래된 크롬 인스턴스 ────────────────────────────────────
-for prof in $(ps -Ao command | grep "Google Chrome" | grep -o "${PATTERN}[a-f0-9-]\{36\}" | sort -u); do
+for prof in $(ps -Ao command | grep -E "$CHROME_RE" | grep -o "${PATTERN}[a-f0-9-]\{36\}" | sort -u); do
   oldest=0
-  for e in $(ps -Ao etime,command | grep "$prof" | grep "Google Chrome" | grep -v grep | awk '{print $1}'); do
+  for e in $(ps -Ao etime,command | grep "$prof" | grep -v grep | awk '{print $1}'); do
     h=$(etime_hours "$e"); [ "$h" -gt "$oldest" ] && oldest=$h
   done
   if [ "$oldest" -ge "$MAX_AGE_HOURS" ]; then
@@ -87,7 +91,7 @@ for pidfile in "$AB_DIR"/*.pid; do
   et=$(ps -p "$pid" -o etime= 2>/dev/null | tr -d ' ')
   [ -n "$et" ] || continue                       # 이미 죽음 → ③에서 파일 정리
   # 크롬 자식이 있으면 사용 중 — 나이와 무관하게 살려둔다
-  if pgrep -P "$pid" 2>/dev/null | xargs -I{} ps -o command= -p {} 2>/dev/null | grep -q "Google Chrome"; then
+  if pgrep -P "$pid" 2>/dev/null | xargs -I{} ps -o command= -p {} 2>/dev/null | grep -qE "$CHROME_RE"; then
     continue
   fi
   # 최근에 restore 쿠키가 저장된 세션은 사용 중으로 본다. agent-browser 는 세션이 살아 있는
@@ -137,7 +141,7 @@ for pidfile in "$AB_DIR"/*.pid; do
   # 크롬을 물고 있는 세션만 센다 — 크롬이 없으면 쌓일 탭도 없고, 괜히 세션 소켓을
   # 두드릴 이유도 없다. (tab list 자체가 브라우저를 띄우지는 않는 것은 실측 확인)
   pgrep -P "$pid" 2>/dev/null | xargs -I{} ps -o command= -p {} 2>/dev/null \
-    | grep -q "Google Chrome" || continue
+    | grep -qE "$CHROME_RE" || continue
   tabs=$(count_tabs "$name")
   if [ -n "$tabs" ] && [ "$tabs" -ge "$TAB_WARN" ]; then
     log "WARN session '$name' has $tabs tabs — 닫지 않은 탭이 쌓이는 중 (owner=$(owner_of "$name"))"
