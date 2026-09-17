@@ -205,6 +205,74 @@ def _fetch_tunnel_token_from_cf(tunnel_id: str) -> str | None:
     return None
 
 
+# 연결기 launchd 라벨: 데몬 설치(_ensure_tunnel) / 온보딩 데몬 설치(portal_start)
+_CLOUDFLARED_LABELS = ("com.cloudflare.cloudflared", "com.petervoice.cloudflared")
+
+
+def _tunnel_id_from_token(token: str) -> str | None:
+    """터널 토큰(base64 JSON {"a","t","s"})에서 터널 ID(t)를 꺼낸다. 실패 시 None."""
+    import base64
+    try:
+        raw = token.replace("-", "+").replace("_", "/")  # URL-safe 인코딩도 허용
+        data = json.loads(base64.b64decode(raw + "=" * (-len(raw) % 4)))
+        return data.get("t") if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def _cloudflared_args_target_tunnel(args: list[str], tunnel_id: str, tunnel_token: str) -> bool:
+    """cloudflared 인자 목록이 이 터널(config 의 id/token)의 연결기인지."""
+    if tunnel_token and tunnel_token in args:
+        return True
+    if tunnel_id and any(tunnel_id in a for a in args):
+        return True
+    for i, a in enumerate(args):
+        tok = None
+        if a == "--token" and i + 1 < len(args):
+            tok = args[i + 1]
+        elif a.startswith("--token="):
+            tok = a.split("=", 1)[1]
+        if tok and tunnel_id and _tunnel_id_from_token(tok) == tunnel_id:
+            return True
+    return False
+
+
+def _tunnel_connector_running(tunnel_id: str, tunnel_token: str) -> bool:
+    """이 터널의 cloudflared 연결기가 떠 있는지.
+
+    `pgrep -f "cloudflared.*tunnel.*run"` 은 (1) 다른 터널의 연결기 (2) 그 문구를 인자로
+    가진 아무 프로세스(프롬프트에 코드가 담긴 claude 세션 등)까지 잡아, 우리 터널에 연결기가
+    없는데도 "already running" 으로 오판했다 (2026-09-17 user 94: 온보딩이 띄운 터널 A 연결기를
+    보고 데몬이 만든 터널 B 를 방치 → 530). 실행 파일이 cloudflared 이고 인자가 이 터널을
+    가리키는 프로세스만 센다. config 에 터널이 없으면 아무 cloudflared 연결기나 인정한다.
+    """
+    import subprocess
+    try:
+        r = subprocess.run(["ps", "-axww", "-o", "command="],
+                           capture_output=True, text=True, timeout=10)
+        ok = r.returncode == 0
+    except Exception:
+        ok = False
+    if not ok:  # ps 불가 — 예전 방식으로 (다른 터널·문구만 담은 프로세스도 잡는 부정확한 판별)
+        logger.warning("[tunnel] ps failed, falling back to legacy pgrep connector check (imprecise)")
+        try:
+            return subprocess.run(["pgrep", "-f", "cloudflared.*tunnel.*run"],
+                                  capture_output=True, text=True).returncode == 0
+        except Exception:
+            return False
+    for line in r.stdout.splitlines():
+        args = line.split()
+        if not args or os.path.basename(args[0]) != "cloudflared":
+            continue
+        if "tunnel" not in args or "run" not in args:
+            continue
+        if not tunnel_id and not tunnel_token:
+            return True
+        if _cloudflared_args_target_tunnel(args, tunnel_id, tunnel_token):
+            return True
+    return False
+
+
 def _ensure_tunnel(api_key: str, username: str, cloudflared_path: str) -> str | None:
     """Cloudflare Tunnel이 설정되어 있는지 확인하고, 없으면 자동 생성.
     tunnel_id를 반환. 실패 시 None."""
@@ -237,19 +305,11 @@ def _ensure_tunnel(api_key: str, username: str, cloudflared_path: str) -> str | 
             )
             logger.info(f"[tunnel] Created tunnel: pv-{username} ({tunnel_id[:8]}...)")
 
-    # --- 2. cloudflared 프로세스 확인/시작 ---
-    cf_running = False
-    try:
-        result = subprocess.run(
-            ["pgrep", "-f", "cloudflared.*tunnel.*run"],
-            capture_output=True, text=True
-        )
-        cf_running = result.returncode == 0
-    except Exception:
-        pass
+    # --- 2. 이 터널의 cloudflared 연결기 확인/시작 ---
+    cf_running = _tunnel_connector_running(tunnel_id, tunnel_token)
 
     if not cf_running:
-        logger.info("[tunnel] cloudflared not running, starting as launchd service...")
+        logger.info(f"[tunnel] cloudflared connector for {tunnel_id[:8]}... not running, starting as launchd service...")
         plist_label = "com.cloudflare.cloudflared"
         plist_path = Path.home() / "Library" / "LaunchAgents" / f"{plist_label}.plist"
 
@@ -423,11 +483,32 @@ def _tunnel_reachable(status: int | None) -> bool:
     return True
 
 
+def _cloudflared_label() -> str:
+    """이 터널의 연결기를 띄우는 launchd 라벨. 온보딩 설치분은 라벨이 달라
+    com.cloudflare.cloudflared 만 kickstart 하면 "Could not find service" 로 복구가 실패했다.
+    plist 인자가 이 터널을 가리키는 라벨을 고르고, 없으면 데몬 기본 라벨."""
+    import plistlib
+    from pathlib import Path
+    tunnel_id = config.get("cloudflare_tunnel_id", "")
+    tunnel_token = config.get("cloudflare_tunnel_token", "")
+    if tunnel_id or tunnel_token:
+        for label in _CLOUDFLARED_LABELS:
+            path = Path.home() / "Library" / "LaunchAgents" / f"{label}.plist"
+            try:
+                with open(path, "rb") as f:
+                    args = plistlib.load(f).get("ProgramArguments") or []
+            except Exception:
+                continue
+            if _cloudflared_args_target_tunnel([str(a) for a in args], tunnel_id, tunnel_token):
+                return label
+    return _CLOUDFLARED_LABELS[0]
+
+
 def _kickstart_cloudflared() -> bool:
     """launchctl kickstart로 cloudflared(우리 label만) 재시작. 성공 여부 반환."""
     import subprocess
     uid = os.getuid()
-    target = f"gui/{uid}/com.cloudflare.cloudflared"
+    target = f"gui/{uid}/{_cloudflared_label()}"
     try:
         result = subprocess.run(
             ["launchctl", "kickstart", "-k", target],
@@ -482,7 +563,7 @@ def _report_tunnel_health(state: str, note: str = ""):
 def _check_cloudflared_health():
     """2단계 헬스체크로 cloudflared 좀비 터널을 감지·자가치유.
 
-    1) pgrep: 프로세스가 죽었으면 _ensure_home_portal()로 복구(기존 동작).
+    1) 이 터널의 연결기 프로세스가 없으면 _ensure_home_portal()로 복구.
     2) 프로세스는 살아있지만 엣지 미연결('좀비')이면 launchctl kickstart로 재시작.
        - 연속 실패 임계치/시간당 backoff로 플래핑·무한루프 방지.
     """
@@ -496,18 +577,10 @@ def _check_cloudflared_health():
     if sys.platform != "darwin":  # macOS 전용 (Windows 등 제외)
         return
 
-    import subprocess
-
-    # --- 1단계: 프로세스 생존 ---
-    try:
-        result = subprocess.run(
-            ["pgrep", "-f", "cloudflared.*tunnel.*run"],
-            capture_output=True, text=True
-        )
-    except Exception:
-        return
-    if result.returncode != 0:
-        logger.warning("[tunnel] cloudflared not running, recovering...")
+    # --- 1단계: 이 터널의 연결기 생존 ---
+    if not _tunnel_connector_running(config.get("cloudflare_tunnel_id", ""),
+                                     config.get("cloudflare_tunnel_token", "")):
+        logger.warning("[tunnel] cloudflared connector for this tunnel not running, recovering...")
         _tunnel_unreachable_streak = 0
         _recover_home_portal("cloudflared process dead")
         return
