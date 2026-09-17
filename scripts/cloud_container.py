@@ -56,6 +56,27 @@ def home(user_id: int) -> Path:
     return home_root() / str(user_id)
 
 
+def same_path() -> bool:
+    """홈을 컨테이너 안에서도 호스트와 같은 경로로 보게 한다 (config container.same_path).
+
+    클로드는 대화 기록을 **작업 폴더 경로 이름**으로 찾는다(claude/projects/<경로>/<세션>.jsonl).
+    옛 systemd 방식(/srv/pv/users/<id>/workspace/…)에서 쓰던 유저를 /home/agent 로 옮기면
+    기록을 못 찾아 데몬이 조용히 새 세션으로 시작한다 (2026-07-26 sean3 에서 실제 발생).
+    뉴넥스 전용 호스트는 처음부터 /home/agent 기준 세션이라 끄고 둔다."""
+    return bool(_cfg().get("same_path"))
+
+
+def always_on() -> bool:
+    """유휴 정지 없이 컨테이너와 유저 서비스(pv-service)를 상시 유지 (config container.always_on)."""
+    return bool(_cfg().get("always_on"))
+
+
+def cpath(user_id: int, rel: str = "") -> str:
+    """컨테이너 안에서 보이는 홈(또는 그 하위) 경로."""
+    base = str(home(user_id)) if same_path() else "/home/agent"
+    return f"{base}/{rel}" if rel else base
+
+
 def name(user_id: int) -> str:
     return f"pv-u{user_id}"
 
@@ -189,16 +210,51 @@ def _target_mem(limits: dict | None) -> str:
     return f"{min(int(limits['turnMemoryMb']), cap)}m"
 
 
+def _spec_mismatch(user_id: int) -> str | None:
+    """떠 있는 컨테이너가 현재 설정(같은 경로 마운트·--init·이미지)과 다르면 그 사유."""
+    r = _podman("inspect", name(user_id), "--format",
+                '{{json .Config.Labels}}|{{.ImageName}}', timeout=15)
+    if r.returncode != 0:
+        return None
+    raw_labels, _, img = (r.stdout or "").strip().partition("|")
+    try:
+        labels = json.loads(raw_labels) or {}
+    except ValueError:
+        labels = {}
+    if same_path() and labels.get("pv.same_path") != "1":
+        return "same_path"
+    if _cfg().get("init") and labels.get("pv.init") != "1":
+        return "init"
+    if same_path() and img and img != image():  # 새 방식 호스트만 — 뉴넥스 기존 컨테이너는 건드리지 않는다
+        return f"image {img}"
+    return None
+
+
+def _turn_running(user_id: int) -> bool:
+    r = _podman("exec", name(user_id), "pgrep", "-f", "^claude ", timeout=15)
+    return r.returncode == 0
+
+
 def ensure_running(user_id: int, limits: dict | None = None) -> bool:
     """컨테이너가 없으면 run, 멈춰있으면 start. idempotent.
 
     limits(로스터 티어 한도)가 오면 메모리를 티어값으로 적용한다. 이미 다른 상한으로
     떠 있으면: 정지 상태면 재생성(레이어 apt 설치물은 날아감 — 티어 변경 때 1회 비용),
-    실행 중이면 다음 정지 후 기동 때 반영한다 (podman 3.x 에는 update 가 없다)."""
+    실행 중이면 다음 정지 후 기동 때 반영한다 (podman 3.x 에는 update 가 없다).
+    설정(같은 경로·--init·이미지)이 바뀐 컨테이너는 턴이 없을 때 재생성한다 — 상시 유지라
+    정지를 기다리면 영영 반영되지 않는다."""
     with _lock(user_id):
         _last_used[user_id] = time.time()
         target_mem = _target_mem(limits)
         st = container_state(user_id)
+        if st != "none":
+            why = _spec_mismatch(user_id)
+            if why and not (st == "running" and _turn_running(user_id)):
+                if _logger:
+                    _logger.info(f"container spec changed ({why}), recreating user={user_id}")
+                _podman("stop", "-t", "5", name(user_id), timeout=45)
+                _podman("rm", "-f", name(user_id), timeout=45)
+                st = "none"
         if st == "running":
             return True
         ensure_home(user_id)
@@ -234,6 +290,8 @@ def ensure_running(user_id: int, limits: dict | None = None) -> bool:
             if r.returncode != 0 and _logger:
                 _logger.error(f"container start failed user={user_id} state={st}: "
                               f"{(r.stderr or '')[:200]}")
+            if r.returncode == 0:
+                start_services(user_id)
             return r.returncode == 0
         # 신규 생성
         c = _cfg()
@@ -253,9 +311,17 @@ def ensure_running(user_id: int, limits: dict | None = None) -> bool:
             "-p", f"127.0.0.1:{cdp_port(user_id)}:9222",
             "-v", f"{h}:/home/agent:rw",
             "-v", f"{shared_skills}:{shared_skills}:ro",
-            "-e", "HOME=/home/agent",
-            "-e", "CLAUDE_CONFIG_DIR=/home/agent/claude",
+            "-e", f"HOME={cpath(user_id)}",
+            "-e", f"CLAUDE_CONFIG_DIR={cpath(user_id, 'claude')}",
         ]
+        if same_path():
+            args += ["-v", f"{h}:{h}:rw", "--label", "pv.same_path=1"]
+        if c.get("init"):
+            # PID 1 이 sleep 이면 상시 서비스의 좀비를 아무도 거두지 않는다
+            args += ["--init", "--label", "pv.init=1"]
+        if c.get("bin_dir"):
+            # pv-service / pv-tunnel — 레포 체크아웃을 그대로 마운트해 배포(git pull)만으로 갱신
+            args += ["-v", f"{c['bin_dir']}:/opt/pv/bin:ro"]
         net = _ensure_network()
         if net:
             args += ["--network", net]
@@ -265,7 +331,45 @@ def ensure_running(user_id: int, limits: dict | None = None) -> bool:
             if _logger:
                 _logger.error(f"container run failed user={user_id}: {r.stderr[:200]}")
             return False
+        start_services(user_id)
         return True
+
+
+def start_services(user_id: int) -> None:
+    """상시 유지 호스트: 유저가 pv-service 로 등록한 서비스(웹서버·터널 연결기)를 되살린다.
+    컨테이너 기동·재생성·호스트 재부팅 뒤와 주기 점검에서 호출 (이미 떠 있으면 no-op)."""
+    if not always_on():
+        return
+    r = _podman("exec", "--user=agent", name(user_id), "bash", "-c",
+                "command -v pv-service >/dev/null 2>&1 && pv-service up || true", timeout=60)
+    if r.returncode != 0 and _logger:
+        _logger.warning(f"pv-service up failed user={user_id}: {(r.stderr or '')[:200]}")
+
+
+def keep_services(roster_ids, limits_for=None) -> None:
+    """상시 유지 점검 (주기 호출): 이 호스트 담당 컨테이너 유저 중 컨테이너가 이미 있는 유저는
+    떠 있게 하고 등록 서비스를 되살린다. 한 번도 쓰지 않은 유저의 컨테이너는 만들지 않는다.
+    limits_for(uid): 재생성이 필요할 때 티어 메모리를 적용하기 위한 한도 조회."""
+    if not always_on():
+        return
+    r = _podman("ps", "-a", "--format", "{{.Names}}", timeout=15)
+    if r.returncode != 0:
+        return
+    for nm in (r.stdout or "").split():
+        m = re.fullmatch(r"pv-u(\d+)", nm.strip())
+        if not m:
+            continue
+        uid = int(m.group(1))
+        if uid not in roster_ids or not enabled_for(uid):
+            continue
+        try:
+            if container_state(uid) == "running":
+                start_services(uid)
+            else:
+                ensure_running(uid, limits_for(uid) if limits_for else None)  # 기동 시 start_services 포함
+        except Exception as e:  # 한 유저 실패가 점검 전체를 막으면 안 된다
+            if _logger:
+                _logger.warning(f"keep_services user={uid}: {e}")
 
 
 def _has_cdp_publish(user_id: int) -> bool:
@@ -337,7 +441,7 @@ def has_credentials(user_id: int) -> bool:
     컨테이너는 실제 턴(exec_claude_turn)이나 로그인(login_start) 때만 뜬다."""
     if container_state(user_id) != "running":
         return _home_has_credentials(user_id)
-    r = _podman("exec", name(user_id), "test", "-f", "/home/agent/claude/.credentials.json",
+    r = _podman("exec", name(user_id), "test", "-f", cpath(user_id, "claude/.credentials.json"),
                 timeout=15)
     return r.returncode == 0
 
@@ -369,6 +473,22 @@ def ensure_skills(user_id: int) -> None:
         _logger.warning(f"skills link failed user={user_id}: {(r.stderr or '')[:200]}")
 
 
+def reap_orphan_turns() -> None:
+    """데몬 기동 시 1회: 떠 있는 컨테이너 안에 남은 claude 턴을 정리한다.
+    배포 재시작의 드레인을 넘긴 턴은 exec 클라이언트만 죽고 안쪽 claude 가 계속 돈다 —
+    새 데몬이 같은 메시지를 재처리하면 같은 작업이 두 번 실행된다 (2026-08-25 jenn 사고와 같은 유형).
+    상시 서비스는 claude 가 아니라 건드리지 않는다."""
+    r = _podman("ps", "--format", "{{.Names}}", timeout=15)
+    if r.returncode != 0:
+        return
+    for nm in (r.stdout or "").split():
+        m = re.fullmatch(r"pv-u(\d+)", nm.strip())
+        if m and enabled_for(int(m.group(1))):
+            if _turn_running(int(m.group(1))) and _logger:
+                _logger.warning(f"stopping orphan claude turn in container {nm}")
+            kill_turns(int(m.group(1)))
+
+
 def kill_turns(user_id: int) -> None:
     """컨테이너 안에서 도는 claude 턴을 정리한다.
 
@@ -391,23 +511,33 @@ def _envfile(user_id: int, env: dict) -> str:
     return str(p)
 
 
-def exec_claude_turn(user_id: int, project: str, prompt: str,
-                     session_id: str | None, secrets: dict,
-                     system_prompt_path: str | None,
-                     limits: dict | None = None,
-                     model: str | None = None,
-                     effort: str | None = None) -> tuple[int, str, str]:
-    """컨테이너 안에서 claude 한 턴. returns (rc, stdout, stderr).
+def turn_argv(user_id: int, project: str, prompt: str,
+              session_id: str | None, secrets: dict,
+              system_prompt_path: str | None,
+              limits: dict | None = None,
+              model: str | None = None,
+              effort: str | None = None) -> tuple[list[str] | None, str | None, int]:
+    """컨테이너 안 claude 한 턴의 실행 argv. returns (argv, env 파일, 턴 한도 초).
+    argv 가 None 이면 컨테이너 기동 실패. 호출자가 스트리밍으로 실행하고 env 파일을 지운다.
+
+    턴 시간 한도는 **컨테이너 안 `timeout`** 으로 건다. 예전처럼 한도 초과 시 컨테이너를
+    재시작하면 같은 컨테이너의 다른 턴과 상시 서비스까지 전부 죽는다.
     limits: 로스터 티어 한도 (메모리·턴 시간). None = 호스트 config 일괄값.
     model/effort: 웹 프로젝트·브랜치 설정 (None = CLI 기본값)."""
+    if limits and limits.get("turnTimeoutMin"):
+        timeout = int(limits["turnTimeoutMin"]) * 60
+    else:
+        timeout = int(_cfg().get("turn_timeout_sec", 1800))
     if not ensure_running(user_id, limits):
-        return (1, "", "container start failed")
+        return (None, None, timeout)
     ensure_skills(user_id)  # 번들 스킬 심링크 (프로세스당 1회)
     _last_used[user_id] = time.time()
-    ws = f"/home/agent/workspace/{project if re.fullmatch(r'[a-z0-9_-]{1,60}', project or '') else 'general'}"
+    proj = project if re.fullmatch(r'[a-z0-9_-]{1,60}', project or '') else 'general'
+    ws = cpath(user_id, f"workspace/{proj}")
     _podman("exec", name(user_id), "mkdir", "-p", f"{ws}/docs", timeout=15)
 
-    cmd = ["claude", "-p", "--output-format", "stream-json", "--verbose", "--dangerously-skip-permissions"]
+    cmd = ["timeout", "-k", "10", str(timeout),
+           "claude", "-p", "--output-format", "stream-json", "--verbose", "--dangerously-skip-permissions"]
     if model:
         cmd += ["--model", model]
     if effort:
@@ -418,28 +548,17 @@ def exec_claude_turn(user_id: int, project: str, prompt: str,
         cmd += ["--resume", session_id]
     cmd += ["--", prompt]
 
-    env = dict(secrets)
-    ef = _envfile(user_id, env) if env else None
-    exec_args = ["exec", "-w", ws]
+    ef = _envfile(user_id, dict(secrets)) if secrets else None
+    exec_args = ["sudo", "-n", "podman", "exec", "-w", ws]
     if ef:
         exec_args += ["--env-file", ef]
     exec_args += [name(user_id), *cmd]
+    return (exec_args, ef, timeout)
 
-    if limits and limits.get("turnTimeoutMin"):
-        timeout = int(limits["turnTimeoutMin"]) * 60
-    else:
-        timeout = int(_cfg().get("turn_timeout_sec", 1800))
-    try:
-        r = _podman(*exec_args, timeout=timeout + 30)
-        rc, out, err = r.returncode, r.stdout, r.stderr
-    except subprocess.TimeoutExpired:
-        # 하드 타임아웃: 컨테이너 재시작으로 내부 프로세스 전부 종료
-        _podman("restart", name(user_id), timeout=30)
-        rc, out, err = 124, "", "timeout"
-    finally:
-        if ef:
-            subprocess.run(["sudo", "-n", "rm", "-f", ef], capture_output=True)
-    return rc, out, err
+
+def remove_envfile(path: str | None) -> None:
+    if path:
+        subprocess.run(["sudo", "-n", "rm", "-f", path], capture_output=True)
 
 
 def exec_claude_cmd(user_id: int, args: list[str], timeout: int = 60) -> tuple[int, str, str]:
@@ -448,7 +567,7 @@ def exec_claude_cmd(user_id: int, args: list[str], timeout: int = 60) -> tuple[i
     if container_state(user_id) != "running":
         return (1, "", "container not running")
     try:
-        r = _podman("exec", "-w", "/home/agent/workspace", name(user_id),
+        r = _podman("exec", "-w", cpath(user_id, "workspace"), name(user_id),
                     "claude", *args, timeout=timeout + 10)
     except subprocess.TimeoutExpired:
         return (124, "", "timeout")
@@ -517,7 +636,7 @@ def sysprompt_path_in_home(user_id: int, content: str,
         # 컨테이너 내 claude(agent 10000)가 읽어야 함
         subprocess.run(["sudo", "-n", "chown", f"{AGENT_UID}:{AGENT_UID}", str(host_p)],
                        capture_output=True)
-        return f"/home/agent/workspace/{name}"
+        return cpath(user_id, f"workspace/{name}")
     except Exception:
         return None
 
@@ -610,12 +729,12 @@ def layer_size_bytes(user_id: int) -> int:
 def reap_idle(skip=None):
     """유휴(마지막 사용 후 idle_stop_sec 경과) 컨테이너 정지.
 
-    idle_stop_sec <= 0 이면 유휴 정지를 하지 않는다(상시 유지).
+    idle_stop_sec <= 0 이거나 always_on 이면 유휴 정지를 하지 않는다(상시 유지).
     전용 호스트에서 cron 배치·스크래핑 데몬을 상시 돌릴 때 필요.
     skip(uid) -> bool: True 인 유저는 정지하지 않는다 (MAX 티어 상시 유지).
     """
     idle = int(_cfg().get("idle_stop_sec", 900))
-    if idle <= 0:
+    if idle <= 0 or always_on():
         return
     now = time.time()
     r = _podman("ps", "--format", "{{.Names}}", timeout=15)

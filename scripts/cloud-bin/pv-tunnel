@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+# pv-tunnel — 클라우드 컨테이너의 서버를 https://<아이디>-<이름>.peter-voice.site 로 공개
+#
+# 맥미니 local-publish 와 같은 구조(유저별 Cloudflare 터널 + 호스트명 ingress)를 컨테이너용으로 옮긴 것.
+# 연결기(cloudflared)는 같은 컨테이너 안에서 pv-service 로 상시 실행되고, ingress 는 localhost:<포트>.
+# API 호출에는 턴 환경의 API_URL / API_KEY 가 필요하다 (대화 중에 실행).
+#
+# 상태: ~/.pv/tunnel.json (600: tunnelId·tunnelToken·username)
+set -uo pipefail
+
+STATE="${HOME}/.pv/tunnel.json"
+SERVICE=pv-tunnel
+mkdir -p "${HOME}/.pv" && chmod 700 "${HOME}/.pv"
+
+usage() {
+  cat <<'EOF'
+pv-tunnel route <이름> <포트>   https://<아이디>-<이름>.peter-voice.site → 이 컨테이너 localhost:<포트>
+pv-tunnel unroute <이름>        공개 해제
+pv-tunnel status               터널·연결기·공개 주소 상태
+EOF
+}
+
+die() { echo "$*" >&2; exit 2; }
+need_api() { [ -n "${API_URL:-}" ] && [ -n "${API_KEY:-}" ] || die "API_URL/API_KEY 가 없습니다 — 대화 턴 안에서 실행하세요"; }
+jget() { python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get(sys.argv[2],""))' "$STATE" "$1" 2>/dev/null; }
+
+api() {  # api METHOD PATH [JSON]
+  local out code
+  out=$(curl -sS -m 60 -w $'\n%{http_code}' -X "$1" "${API_URL%/}$2" \
+        -H "X-Api-Key: $API_KEY" -H "Content-Type: application/json" ${3:+-d "$3"}) || return 1
+  code="${out##*$'\n'}"; out="${out%$'\n'*}"
+  if [ "${code:0:1}" != "2" ]; then echo "API $1 $2 → HTTP $code: $out" >&2; return 1; fi
+  printf '%s' "$out"
+}
+
+ensure_tunnel() {
+  need_api
+  if [ ! -s "$STATE" ]; then
+    local me user res
+    me=$(api GET /api/bot/me) || die "내 계정 조회 실패"
+    user=$(printf '%s' "$me" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("username",""))')
+    [ -n "$user" ] || die "username 을 알 수 없습니다"
+    res=$(api POST /api/tunnel/create "$(python3 -c 'import json,sys; print(json.dumps({"username":sys.argv[1]}))' "$user")") \
+      || die "터널 생성 실패"
+    ( umask 077
+      printf '%s' "$res" | python3 -c '
+import json, sys
+r = json.load(sys.stdin)
+if not r.get("tunnelId") or not r.get("tunnelToken"):
+    sys.exit("터널 응답에 id/token 없음")
+json.dump({"tunnelId": r["tunnelId"], "tunnelToken": r["tunnelToken"], "username": sys.argv[1]}, open(sys.argv[2], "w"))
+' "$user" "$STATE" ) || die "터널 정보 저장 실패"
+    echo "터널 생성: pv-$user"
+  fi
+  command -v cloudflared >/dev/null || die "cloudflared 가 없습니다 (이미지 갱신 필요)"
+  if ! pv-service list 2>/dev/null | grep -q "^$SERVICE .*실행 중"; then
+    pv-service add "$SERVICE" --cwd "$HOME" -- pv-tunnel connector >/dev/null || die "연결기 시작 실패 — pv-service logs $SERVICE"
+    echo "연결기 시작"
+  fi
+}
+
+valid_name() { [[ "${1:-}" =~ ^[a-z0-9][a-z0-9-]{0,39}$ ]] || die "이름은 영문 소문자·숫자·- (최대 40자): '${1:-}'"; }
+
+case "${1:-}" in
+  connector)
+    # pv-service 가 실행하는 연결기 본체. 토큰은 인자가 아니라 환경변수로 넘긴다(ps 노출 방지).
+    [ -s "$STATE" ] || die "터널이 없습니다 — pv-tunnel route 를 먼저 실행하세요"
+    TUNNEL_TOKEN=$(jget tunnelToken) exec cloudflared tunnel --no-autoupdate --protocol http2 run
+    ;;
+  route)
+    valid_name "${2:-}"; port="${3:-}"
+    [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || die "포트가 올바르지 않습니다: '$port'"
+    ensure_tunnel
+    body=$(python3 -c 'import json,sys; print(json.dumps({"username":sys.argv[1],"project":sys.argv[2],"port":int(sys.argv[3]),"tunnelId":sys.argv[4]}))' \
+           "$(jget username)" "$2" "$port" "$(jget tunnelId)")
+    res=$(api POST /api/tunnel/add-route "$body") || die "공개 주소 등록 실패"
+    url=$(printf '%s' "$res" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("url",""))')
+    echo "공개 주소: $url → localhost:$port"
+    curl -s -o /dev/null -m 5 "http://127.0.0.1:$port/" || echo "⚠️ 지금 localhost:$port 에 응답하는 서버가 없습니다 (pv-service 로 먼저 띄우세요)"
+    echo "DNS 반영까지 1~2분 걸릴 수 있습니다."
+    ;;
+  unroute)
+    valid_name "${2:-}"; need_api
+    [ -s "$STATE" ] || die "터널이 없습니다"
+    body=$(python3 -c 'import json,sys; print(json.dumps({"username":sys.argv[1],"project":sys.argv[2],"tunnelId":sys.argv[3]}))' \
+           "$(jget username)" "$2" "$(jget tunnelId)")
+    api DELETE /api/tunnel/remove-route "$body" >/dev/null || die "공개 해제 실패"
+    echo "공개 해제: $(jget username)-$2"
+    ;;
+  status)
+    if [ ! -s "$STATE" ]; then echo "터널 없음 (pv-tunnel route 로 처음 공개할 때 만들어집니다)"; exit 0; fi
+    echo "터널: pv-$(jget username) ($(jget tunnelId | cut -c1-8)…)"
+    pv-service list 2>/dev/null | grep -A1 "^$SERVICE " || echo "연결기: 등록 안 됨"
+    ;;
+  ""|-h|--help|help) usage ;;
+  *) usage; exit 2 ;;
+esac

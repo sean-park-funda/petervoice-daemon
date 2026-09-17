@@ -6,7 +6,7 @@
 // node 표준 라이브러리만 쓰는 이 브리지가 eth0:9222 를 열어 루프백으로 넘긴다.
 // (127.0.0.1:9222 는 크롬이 점유 중이므로 eth0 IP 에 명시 바인딩 — 충돌 없음)
 //
-// 컨테이너 전용 — start-browser.sh 가 $HOME=/home/agent 일 때만 띄운다.
+// 컨테이너 전용 — start-browser.sh 가 컨테이너 안($HOME=/home/agent 또는 /run/.containerenv)일 때만 띄운다.
 const net = require("net");
 const os = require("os");
 

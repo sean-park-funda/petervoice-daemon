@@ -582,7 +582,7 @@ class Runner:
         self.push(b, rec, retry_on_fail=False)
 
         logger.info(f"실행 시작 {b.user_id}/{b.project}/{b.name}: {b.command[:80]}")
-        wd = f"/home/agent/workspace/{b.project}"
+        wd = ctr.cpath(b.user_id, f"workspace/{b.project}")
         if b.workdir not in (".", ""):
             wd = f"{wd}/{b.workdir.strip('/')}"
         env = user_secrets(b.user_id)

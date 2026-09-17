@@ -86,8 +86,10 @@ LANDING
   started="chromium"
 fi
 
-# ── CDP 브리지 (컨테이너 전용 — 홈이 /home/agent 일 때만) ──
-if [ "$HOME" = "/home/agent" ] && ! pgrep -f "node .*cdp-proxy.js" >/dev/null 2>&1; then
+# ── CDP 브리지 (컨테이너 전용) ──
+# 컨테이너 판정: 홈이 /home/agent 이거나 podman 이 만드는 /run/.containerenv 가 있을 때.
+# 공용 호스트 컨테이너는 세션 보존을 위해 홈을 호스트와 같은 경로(/srv/pv/users/<id>)로 쓴다 (2026-09-17).
+if { [ "$HOME" = "/home/agent" ] || [ -f /run/.containerenv ]; } && ! pgrep -f "node .*cdp-proxy.js" >/dev/null 2>&1; then
   nohup node "$SCRIPT_DIR/cdp-proxy.js" >/dev/null 2>&1 &
   started="$started cdp-proxy"
 fi

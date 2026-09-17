@@ -538,6 +538,21 @@ PV_FEATURES_PROMPT = """
 """
 
 
+CONTAINER_ALWAYS_ON_PROMPT = """
+## 상시 실행 — 대화가 끝나도 계속 도는 서버·봇
+이 컨테이너는 대화가 끝나도 꺼지지 않습니다.
+- `&`·`nohup` 으로만 띄운 프로세스는 컨테이너가 재기동되면 사라집니다. **계속 돌아야 하는 서버·봇은 `pv-service` 로 등록**하세요.
+  재기동·서버 점검 뒤에도 자동으로 다시 뜨고, 죽으면 5분 안에 되살아납니다.
+  - 등록 후 시작: `pv-service add <이름> --cwd <폴더> -- <실행 명령>`
+    (예: `pv-service add blog --cwd "$PWD" -- npx next start -H 127.0.0.1 -p 3000`)
+  - `pv-service list` · `pv-service logs <이름>` · `pv-service restart <이름>` · `pv-service stop <이름>` · `pv-service rm <이름>`
+- **인터넷에 공개하는 주소**: `pv-tunnel route <이름> <포트>` → `https://<피터보이스아이디>-<이름>.peter-voice.site`
+  (처음 한 번 Cloudflare 터널을 만들고 연결기를 pv-service 로 등록합니다). 해제: `pv-tunnel unroute <이름>`, 상태: `pv-tunnel status`.
+  누구나 접속할 수 있는 주소가 되므로 **공개 전에 유저에게 확인**받으세요. `local-publish` 스킬의 맥용 절차(brew·launchd)는 이 환경에서 쓰지 않습니다.
+- 서버도 아래 메모리 한도를 대화 작업과 함께 나눠 씁니다. 서버는 `127.0.0.1` 에 바인딩하세요(터널 연결기가 같은 컨테이너 안에 있습니다).
+"""
+
+
 def _container_system_prompt(user_id: int | None = None) -> str:
     """전용 컨테이너용 환경 안내. 실제 적용값을 그대로 알려준다
     (하드코딩하면 호스트·티어별로 사양을 잘못 안내하게 된다).
@@ -559,6 +574,7 @@ def _container_system_prompt(user_id: int | None = None) -> str:
         hb_min = config.get("heartbeat_min_interval_min", 30)
     disk_txt = f"디스크 {disk}GB" if disk else "디스크 한도 없음"
     cpus = c.get("cpus", 1.5)
+    always_on_txt = CONTAINER_ALWAYS_ON_PROMPT if ctr.always_on() else ""
     dedicated = bool(config.get("dedicated"))
     intro = ("당신은 이 고객 **전용 서버** 위의 전용 리눅스 컨테이너에서 실행됩니다. "
              "다른 고객과 자원을 나눠 쓰지 않습니다."
@@ -577,7 +593,7 @@ def _container_system_prompt(user_id: int | None = None) -> str:
 - 패키지 설치 자유: `sudo apt-get install -y <패키지>`(비번 없이 됨), `pip install`, `npm install -g` 모두 가능.
   설치물은 유지됩니다.
 - 서버/포트도 컨테이너 내부라 자유롭게 사용 가능 (다른 사용자와 격리됨).
-
+{always_on_txt}
 ## 이 환경의 실제 사양 (추측하지 말고 이 값을 그대로 안내할 것)
 - 메모리 {mem} / CPU {cpus}코어 / 한 턴 최대 {mins}분 / {disk_txt}
 
@@ -971,6 +987,35 @@ def build_systemd_run(user_id: int, cmd: list[str], env: dict, cwd: str, unit: s
     ]
 
 
+def ensure_inter_container_block() -> None:
+    """유저 컨테이너끼리 서로의 포트에 붙지 못하게 브리지 내부 전달을 막는다
+    (config container.block_inter_container).
+
+    podman 3.4.4 는 격리 네트워크(isolate=true) 생성이 실패해 기본 브리지로 떨어지고, 그 상태에선
+    다른 컨테이너에서 남의 서버에 HTTP 200 이 났다 (2026-09-17 실측). 상시 서버가 기본이 되면
+    그대로 남의 서버·브라우저 디버그 포트에 접근할 수 있다. 호스트↔컨테이너(퍼블리시 포트)와
+    컨테이너→인터넷은 영향 없음. 멱등 — 기동마다 확인한다."""
+    c = config.get("container", {}) or {}
+    if not c.get("block_inter_container"):
+        return
+    br = c.get("bridge", "cni-podman0")
+    rule = ["FORWARD", "-i", br, "-o", br, "-j", "DROP"]
+    try:
+        subprocess.run(["sudo", "-n", "modprobe", "br_netfilter"], capture_output=True, timeout=15)
+        subprocess.run(["sudo", "-n", "sysctl", "-q", "-w", "net.bridge.bridge-nf-call-iptables=1"],
+                       capture_output=True, timeout=15)
+        if subprocess.run(["sudo", "-n", "iptables", "-C", *rule], capture_output=True,
+                          timeout=15).returncode != 0:
+            r = subprocess.run(["sudo", "-n", "iptables", "-I", rule[0], "1", *rule[1:]],
+                               capture_output=True, text=True, timeout=15)
+            if r.returncode != 0:
+                logger.error(f"inter-container block FAILED: {(r.stderr or '')[:200]}")
+                return
+            logger.info(f"inter-container traffic blocked on {br}")
+    except Exception as e:
+        logger.error(f"inter-container block FAILED: {e}")
+
+
 def kill_systemd_turns(user_id: int) -> None:
     """이 데몬 프로세스가 띄운 해당 유저의 턴 유닛을 정지한다 (systemd 격리 모드)."""
     prefix = f"pvturn-{user_id}-{os.getpid()}-"
@@ -1065,7 +1110,7 @@ def fetch_attachments(user_id: int, project: str, files: list) -> list[str]:
                 pass
             dest = Path(lp)
             if ctr.enabled_for(user_id):
-                out.append(f"/home/agent/workspace/{pdir.name}/docs/uploaded/{dest.name}")
+                out.append(ctr.cpath(user_id, f"workspace/{pdir.name}/docs/uploaded/{dest.name}"))
             else:
                 out.append(str(dest))
             continue
@@ -1084,7 +1129,7 @@ def fetch_attachments(user_id: int, project: str, files: list) -> list[str]:
             logger.error(f"attachment download failed {name}: {e}")
             continue
         if ctr.enabled_for(user_id):
-            out.append(f"/home/agent/workspace/{pdir.name}/docs/uploaded/{dest.name}")
+            out.append(ctr.cpath(user_id, f"workspace/{pdir.name}/docs/uploaded/{dest.name}"))
         else:
             out.append(str(dest))
     return out
@@ -1139,9 +1184,21 @@ def run_claude_turn(user_id: int, project: str, prompt: str) -> tuple[str, str]:
                                         name=_sysprompt_filename(project))
         sid = load_session(user_id, project)
         model, effort = resolve_model_effort(user_id, project)
-        rc, out, err = ctr.exec_claude_turn(user_id, project, prompt, sid, secrets, sp,
+        logger.info(f"[turn] user={user_id} project={project} model={model or '(default)'} "
+                    f"effort={effort or '(default)'} (container)")
+        argv, ef, limit_sec = ctr.turn_argv(user_id, project, prompt, sid, secrets, sp,
                                             limits=user_limits(user_id),
                                             model=model, effort=effort)
+        if not argv:
+            return ("(일시적 오류로 실행에 실패했어요. 잠시 후 다시 말씀해주세요.)", "ok")
+        try:
+            # 옛 방식과 같은 스트리밍 — 없으면 진행 중 발화·도구 로그가 턴 끝까지 안 보인다
+            rc, out, err = _run_streaming(argv, user_id, project, timeout=limit_sec + 60)
+        finally:
+            ctr.remove_envfile(ef)
+        if rc == 124 and err == "timeout":
+            # 데몬 쪽 감시가 먼저 끊은 경우 — exec 클라이언트만 죽고 안쪽 claude 는 살아 있다
+            ctr.kill_turns(user_id)
         if rc == 137:
             return ("", "heavy_mem")
         if rc == 124:
@@ -2437,6 +2494,14 @@ class CloudWorker:
                 pass
         return len(items)
 
+    def keep_services(self):
+        with roster._lock:
+            ids = set(roster._users.keys())
+        try:
+            ctr.keep_services(ids, limits_for=lambda uid: user_limits(uid, peek=True))
+        except Exception as e:
+            logger.warning(f"keep_services failed: {e}")
+
     def set_working(self, api_key: str, working: bool, project: str,
                     task: str | None = None, msg_id=None):
         """턴 진행 표시. 배치 heartbeat 는 last_heartbeat 만 갱신하므로 이 값을 덮지 않는다."""
@@ -2484,6 +2549,12 @@ class CloudWorker:
             reap_orphan_turns()
         except Exception as e:  # 정리 실패가 기동을 막으면 안 된다
             logger.error(f"orphan reap failed: {e}")
+        if config.get("container", {}).get("enabled"):
+            try:
+                ctr.reap_orphan_turns()
+            except Exception as e:
+                logger.error(f"container orphan reap failed: {e}")
+            ensure_inter_container_block()
         # 재시작 시 지난 턴의 잔여 env 파일 정리 (600, 시크릿 잔존 방지)
         try:
             for f in _turnenv_dir().glob("*.env"):
@@ -2492,6 +2563,9 @@ class CloudWorker:
             pass
         roster.sync(force=True)
         self.clear_stale_working()
+        if ctr.always_on():
+            # 호스트 재부팅·데몬 재시작 뒤 상시 컨테이너와 등록 서비스 복구
+            threading.Thread(target=self.keep_services, daemon=True).start()
         UsageThread().start()
         HandoffThread().start()
         last_heartbeat = 0.0
@@ -2512,6 +2586,8 @@ class CloudWorker:
                         kwargs={"skip": lambda uid: bool(
                             (user_limits(uid, peek=True) or {}).get("containerAlwaysOn"))},
                     ).start()
+                    if ctr.always_on():
+                        threading.Thread(target=self.keep_services, daemon=True).start()
                     last_reap = now
 
                 result = host_api("GET", "/api/cloud/poll")
