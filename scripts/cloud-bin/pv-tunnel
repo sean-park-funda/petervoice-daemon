@@ -51,6 +51,7 @@ if not r.get("tunnelId") or not r.get("tunnelToken"):
     sys.exit("터널 응답에 id/token 없음")
 json.dump({"tunnelId": r["tunnelId"], "tunnelToken": r["tunnelToken"], "username": sys.argv[1]}, open(sys.argv[2], "w"))
 ' "$user" "$STATE" ) || die "터널 정보 저장 실패"
+    chmod 600 "$STATE"  # 홈의 상속 ACL 이 umask 를 무시하므로 명시
     echo "터널 생성: pv-$user"
   fi
   command -v cloudflared >/dev/null || die "cloudflared 가 없습니다 (이미지 갱신 필요)"
