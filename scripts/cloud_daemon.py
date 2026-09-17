@@ -2163,7 +2163,13 @@ class CloudWorker:
             logger.error(f"provision failed user={user_id}: {e}")
             self.reply(api_key, "(일시적 오류로 준비에 실패했어요. 잠시 후 다시 시도해주세요.)", [msg_id], project)
             return
-        logger.info(f"msg #{msg_id} user={user_id} project={project}: {text[:60]}")
+        # 로그인 코드 대기 중에 온 메시지는 본문을 남기지 않는다 — 채팅으로 붙여넣은 OAuth 코드가
+        # 저널에 평문으로 남았다 (2026-09-17 sean3 재로그인에서 확인)
+        with login_lock:
+            _ls = login_sessions.get(user_id)
+        awaiting_code = bool(_ls and _ls.state == "waiting_code")
+        logger.info(f"msg #{msg_id} user={user_id} project={project}: "
+                    f"{'(로그인 코드 대기 중 — 본문 생략)' if awaiting_code else text[:60]}")
 
         # ── 자가진단 (턴 미소비, claude 미실행) ──
         if is_selfcheck_trigger(text):
