@@ -1475,8 +1475,11 @@ def _collect_stream(out: str) -> _StreamCollector | None:
 def _parse_turn_result(rc, out, err, user_id, project, prompt, sid) -> tuple[str, str]:
     out = (out or "").strip()
     err = (err or "").strip()
+    # "Failed to authenticate: OAuth session expired and could not be refreshed" 가 빠져 있어
+    # 토큰 만료가 재로그인 안내가 아니라 "오류가 발생했어요" 로 나갔다 (2026-09-17 sean3 실측).
     auth_markers = ("Invalid API key", "not logged in", "Please run /login",
-                    "OAuth token has expired", "authentication_error")
+                    "OAuth token has expired", "OAuth session expired",
+                    "Failed to authenticate", "authentication_error")
     if rc != 0:
         combined = f"{out}\n{err}"
         if any(m.lower() in combined.lower() for m in auth_markers):
