@@ -27,7 +27,8 @@ jget() { python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get(sys
 api() {  # api METHOD PATH [JSON]
   local out code
   out=$(curl -sS -m 60 -w $'\n%{http_code}' -X "$1" "${API_URL%/}$2" \
-        -H "X-Api-Key: $API_KEY" -H "Content-Type: application/json" ${3:+-d "$3"}) || return 1
+        -H "Authorization: Bearer $API_KEY" -H "X-Api-Key: $API_KEY" \
+        -H "Content-Type: application/json" ${3:+-d "$3"}) || return 1
   code="${out##*$'\n'}"; out="${out%$'\n'*}"
   if [ "${code:0:1}" != "2" ]; then echo "API $1 $2 → HTTP $code: $out" >&2; return 1; fi
   printf '%s' "$out"
