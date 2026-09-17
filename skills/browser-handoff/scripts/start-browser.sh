@@ -55,6 +55,16 @@ if ! curl -sf -m 2 "http://127.0.0.1:$CDP_PORT/json/version" >/dev/null 2>&1; th
   fi
 
   mkdir -p "$HOME/.pv-browser"
+  # 남의 호스트명으로 걸린 프로필 잠금 제거 — 컨테이너 재생성·호스트→컨테이너 이전 뒤엔 옛 호스트명의
+  # SingletonLock 이 남아 크롬이 "다른 컴퓨터에서 사용 중" 으로 기동을 거부한다 (2026-09-17 sean3 실측).
+  # 여기는 CDP 가 응답하지 않는 분기라 이 프로필을 쓰는 크롬이 없다.
+  lock="$HOME/.pv-browser/SingletonLock"
+  if [ -L "$lock" ]; then
+    owner="$(readlink "$lock")"
+    if [ "${owner%-*}" != "$(hostname)" ] || ! kill -0 "${owner##*-}" 2>/dev/null; then
+      rm -f "$HOME/.pv-browser/SingletonLock" "$HOME/.pv-browser/SingletonCookie" "$HOME/.pv-browser/SingletonSocket"
+    fi
+  fi
   # 헤드리스가 아니면(맥 GUI) 크롬 창이 고객 화면에 실제로 보인다. 빈 about:blank 창이
   # 갑자기 뜨면 무슨 창인지 알 수 없으므로, 정체를 알리는 랜딩 탭으로 띄운다.
   START_URL="about:blank"
