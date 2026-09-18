@@ -14,6 +14,7 @@ config.json 으로 언제든 풀 수 있게 한다(고객이 걸리면 코드 �
 import json
 import os
 import re
+import tempfile
 import threading
 import time
 from datetime import datetime, timedelta
@@ -59,6 +60,117 @@ def limit_env(config: dict) -> dict[str, str]:
     return env
 
 
+# ── AGENTS.md 폴백 차단 (2026-09-19 사고) ─────────────────────────────────────
+# Claude Code 2.1.27x 부터 내장 플러그인 agents-md@builtin 이 "cwd~루트 체인에 CLAUDE.md 가
+# 하나도 없으면 AGENTS.md 를 프로젝트 지시문으로 읽는다"(기본값 claude-md-or-agents-md).
+# 데몬은 Codex 실행 때마다 프로젝트 폴더에 AGENTS.md(역할 프롬프트+이전 세션 맥락 스냅샷)를
+# 쓰므로, 같은 폴더·하위 폴더의 **Claude 세션에 다른 브랜치의 신원과 낡은 규칙이 주입**된다.
+# 작업 디렉터리가 홈인 프로젝트가 Codex 로 돌면 그 맥의 전 프로젝트로 번진다(실제로 발생).
+# 이 옵션은 user 설정·--settings·managed 설정에서만 읽힌다(프로젝트 settings.json 은 안 읽힘).
+_AGENTS_MD_PLUGIN = "agents-md@builtin"
+_AGENTS_MD_MODE = "claude-md"           # CLAUDE.md 만 읽는다
+_AGENTS_MD_RECHECK_SEC = 6 * 3600       # 확정 후에도 주기 재확인 (CLI 가 설정을 다시 쓰며 키를 떨굴 수 있다)
+_AGENTS_MD_RETRY_SEC = 600              # 일시적 실패는 10분 뒤 재시도 — 한 번 실패로 보호가 영구히 꺼지면 안 된다
+_agents_md_next_check: dict[str, float] = {}
+_agents_md_locks: dict[str, threading.Lock] = {}
+_agents_md_guard = threading.Lock()     # 위 두 dict 만 보호한다. 파일 IO 는 폴더별 락에서.
+
+
+def _agents_md_apply(base: str) -> tuple[bool, bool]:
+    """(고쳤는가, 확정인가). 확정=False 면 호출자가 짧은 주기로 재시도한다."""
+    path = os.path.join(base, "settings.json")
+    if os.path.islink(path):
+        # dotfiles 동기화 등으로 심링크면 링크를 일반 파일로 바꿔치기하지 않고 실제 파일을 고친다
+        path = os.path.realpath(path)
+    raw: str | None = None
+    settings: dict = {}
+    mode = 0o600
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            raw = f.read()
+        try:
+            loaded = json.loads(raw) if raw.strip() else {}
+        except ValueError as e:
+            # 깨진 JSON 은 절대 덮어쓰지 않는다(유저 설정 보호가 우선). 유저가 고치면 다음 주기에 붙는다.
+            logger.warning(f"[agents-md] {path} JSON 파싱 실패 — 건드리지 않음: {e}")
+            return (False, False)
+        if not isinstance(loaded, dict):
+            logger.warning(f"[agents-md] {path} 최상위가 객체가 아님 — 건드리지 않음")
+            return (False, True)
+        settings = loaded
+        mode = os.stat(path).st_mode & 0o777
+    plugin_configs = settings.setdefault("pluginConfigs", {})
+    if not isinstance(plugin_configs, dict):
+        return (False, True)
+    entry = plugin_configs.setdefault(_AGENTS_MD_PLUGIN, {})
+    if not isinstance(entry, dict):
+        return (False, True)
+    options = entry.setdefault("options", {})
+    if not isinstance(options, dict) or options.get("instructionFiles") is not None:
+        return (False, True)  # 이미 있음(우리가 넣었거나 유저가 직접 정함) — 존중
+    options["instructionFiles"] = _AGENTS_MD_MODE
+
+    target_dir = os.path.dirname(path)
+    os.makedirs(target_dir, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=target_dir, prefix=".settings-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(settings, f, indent=2, ensure_ascii=False)
+            f.write("\n")
+        try:
+            os.chmod(tmp, mode)
+        except OSError:
+            pass
+        # 읽은 뒤 CLI 등 다른 주체가 파일을 바꿨으면 그 변경을 덮어쓰지 않는다 → 다음 주기에 재시도
+        current: str | None = None
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                current = f.read()
+        if current != raw:
+            logger.info(f"[agents-md] {path} 가 처리 중 변경됨 — 이번엔 쓰지 않고 재시도")
+            os.unlink(tmp)
+            return (False, False)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    logger.info(f"[agents-md] AGENTS.md 폴백 차단 옵션 추가: {path}")
+    return (True, True)
+
+
+def ensure_agents_md_ignored(config_dir: str | None = None) -> bool:
+    """해당 Claude 설정 폴더의 settings.json 에 AGENTS.md 폴백 차단 옵션을 보장한다.
+
+    - 유저가 instructionFiles 를 이미 정해 뒀으면 건드리지 않는다. 깨진 JSON 도 덮어쓰지 않는다.
+    - 원자적 교체. 확정되면 6시간마다, 일시적 실패면 10분 뒤 다시 본다.
+    - **어떤 예외도 밖으로 내지 않는다** — build_claude_env 가 죽으면 메시지 처리 전체가 멈춘다.
+    반환: 이번 호출에서 파일을 고쳤으면 True.
+    """
+    try:
+        base = os.path.expanduser(config_dir or os.environ.get("CLAUDE_CONFIG_DIR") or "~/.claude")
+        now = time.time()
+        with _agents_md_guard:
+            if now < _agents_md_next_check.get(base, 0.0):
+                return False
+            # 선점: 같은 폴더를 여러 워커가 동시에 파지 않게 먼저 재시도 시각을 밀어 둔다
+            _agents_md_next_check[base] = now + _AGENTS_MD_RETRY_SEC
+            lock = _agents_md_locks.setdefault(base, threading.Lock())
+        with lock:
+            changed, settled = _agents_md_apply(base)
+        with _agents_md_guard:
+            _agents_md_next_check[base] = time.time() + (_AGENTS_MD_RECHECK_SEC if settled else _AGENTS_MD_RETRY_SEC)
+        return changed
+    except Exception as e:  # noqa: BLE001 — 여기서 새는 예외는 전 세션을 죽인다
+        try:
+            logger.warning(f"[agents-md] 설정 보장 실패({config_dir or 'default'}): {e!r} — 세션은 그대로 진행")
+        except Exception:
+            pass
+        return False
+
+
 def build_claude_env(config: dict, account_config_dir: str | None = None) -> dict[str, str]:
     """claude CLI 를 띄울 때 쓰는 공용 env.
 
@@ -70,6 +182,8 @@ def build_claude_env(config: dict, account_config_dir: str | None = None) -> dic
     env.update(limit_env(config))
     if account_config_dir:
         env["CLAUDE_CONFIG_DIR"] = os.path.expanduser(account_config_dir)
+    # 이 세션이 실제로 쓸 설정 폴더에 AGENTS.md 폴백 차단을 보장 (폴더당 1회, 실패 무해)
+    ensure_agents_md_ignored(env.get("CLAUDE_CONFIG_DIR"))
     return env
 
 
