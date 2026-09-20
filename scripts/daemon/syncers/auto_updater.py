@@ -62,9 +62,18 @@ class AutoUpdater(threading.Thread):
             import os
             uid = os.getuid()
             plist = os.path.expanduser("~/Library/LaunchAgents/com.petervoice.home-portal.plist")
-            subprocess.run(["launchctl", "bootout", f"gui/{uid}", plist], capture_output=True)
-            subprocess.run(["launchctl", "bootstrap", f"gui/{uid}", plist], capture_output=True)
-            logger.info("[updater] Home Portal restarted")
+            out = subprocess.run(["launchctl", "bootout", f"gui/{uid}", plist], capture_output=True, text=True)
+            boot = subprocess.run(["launchctl", "bootstrap", f"gui/{uid}", plist], capture_output=True, text=True)
+            # 결과 코드를 안 보고 "restarted" 를 찍던 자리 — 실패해도 성공으로 기록돼, 포털이 옛 코드로
+            # 계속 도는 것을 아무도 몰랐다 (2026-09-21: 데몬은 최신인데 포털만 구코드인 기기 실측).
+            if out.returncode == 0 and boot.returncode == 0:
+                logger.info("[updater] Home Portal restarted")
+            else:
+                logger.warning(
+                    f"[updater] Home Portal restart NOT confirmed — portal may still run old code "
+                    f"(bootout rc={out.returncode} {(out.stderr or '').strip()[:120]!r}, "
+                    f"bootstrap rc={boot.returncode} {(boot.stderr or '').strip()[:120]!r})"
+                )
         except Exception as e:
             logger.warning(f"[updater] Home Portal restart failed: {e}")
 

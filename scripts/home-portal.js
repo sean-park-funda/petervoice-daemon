@@ -11,7 +11,7 @@ const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
-const { execSync, spawnSync, spawn } = require("child_process");
+const { execSync, spawnSync, spawn, execFile } = require("child_process");
 
 // 전역 안전망 — 요청 하나의 미처리 예외가 포탈 전체(멀티테넌트 공용)를 죽이지 않게 한다.
 // 2026-09-04 실측: 디렉토리 경로 요청의 ReadStream EISDIR 크래시로 전 유저 문서탭·인라인
@@ -274,7 +274,7 @@ function apiSystem() {
 
   let nodeVersion = "?";
   try {
-    nodeVersion = execSync("node --version", { encoding: "utf-8" }).trim();
+    nodeVersion = process.version; // 자기 버전 확인에 프로세스를 띄울 이유가 없다
   } catch {}
 
   return {
@@ -864,57 +864,56 @@ function renderHTML(req) {
 
 // ─── Action handlers ─────────────────────────────────
 
+// publish.py 는 빌드까지 돌려 수 분이 걸린다. execSync 로 돌리면 node 가 단일 스레드라 그동안
+// 포털의 모든 요청(문서탭·터미널 포함)이 멈춘다 → 비동기 실행. (2026-09-21)
+// 인자는 배열로 넘겨 셸을 거치지 않는다(따옴표 든 project_id·경로로 명령이 깨지지 않게).
+const publishInFlight = new Set();
+
+function runPublishPy(lockKey, args, timeoutMs) {
+  // 예전엔 execSync 가 요청을 줄 세워 같은 프로젝트의 동시 빌드가 구조적으로 불가능했다 — 그 보장을 유지
+  if (publishInFlight.has(lockKey)) return Promise.resolve({ error: "이미 진행 중인 작업이 있습니다" });
+  publishInFlight.add(lockKey);
+  return new Promise((resolve) => {
+    const script = path.join(__dirname, "publish.py");
+    execFile("python3", [script, ...args],
+      { encoding: "utf-8", timeout: timeoutMs, maxBuffer: 10 * 1024 * 1024 },
+      (err, stdout, stderr) => {
+        publishInFlight.delete(lockKey);
+        if (err) {
+          if (stderr) console.error("[publish] stderr:", String(stderr).slice(-2000));
+          return resolve({ error: String(err.message || err).slice(0, 500) });
+        }
+        try { resolve(JSON.parse(String(stdout).trim())); }
+        catch (e) { resolve({ error: ("publish.py 출력 파싱 실패: " + e.message).slice(0, 500) }); }
+      });
+  });
+}
+
+function publishUsername() {
+  const config = loadConfig();
+  return config.tunnel_url
+    ? new URL(config.tunnel_url).hostname.split(".")[0]
+    : (config.username || "user").toLowerCase().replace(/\s/g, "-");
+}
+
 function execPublish(body) {
   const { project_id, project_dir } = body;
   if (!project_id || !project_dir) return { error: "project_id, project_dir 필수" };
-  const config = loadConfig();
-  const username = config.tunnel_url
-    ? new URL(config.tunnel_url).hostname.split(".")[0]
-    : (config.username || "user").toLowerCase().replace(/\s/g, "-");
-  try {
-    const script = path.join(__dirname, "publish.py");
-    const out = execSync(
-      `python3 "${script}" publish "${project_id}" "${project_dir}" --username "${username}"`,
-      { encoding: "utf-8", timeout: 600000 }
-    );
-    return JSON.parse(out.trim());
-  } catch (e) {
-    return { error: e.message.slice(0, 500) };
-  }
+  return runPublishPy(String(project_id),
+    ["publish", String(project_id), String(project_dir), "--username", publishUsername()], 600000);
 }
 
 function execRebuild(body) {
   const { project_id } = body;
   if (!project_id) return { error: "project_id 필수" };
-  try {
-    const script = path.join(__dirname, "publish.py");
-    const out = execSync(
-      `python3 "${script}" rebuild "${project_id}"`,
-      { encoding: "utf-8", timeout: 600000 }
-    );
-    return JSON.parse(out.trim());
-  } catch (e) {
-    return { error: e.message.slice(0, 500) };
-  }
+  return runPublishPy(String(project_id), ["rebuild", String(project_id)], 600000);
 }
 
 function execUnpublish(body) {
   const { project_id } = body;
   if (!project_id) return { error: "project_id 필수" };
-  const config = loadConfig();
-  const username = config.tunnel_url
-    ? new URL(config.tunnel_url).hostname.split(".")[0]
-    : (config.username || "user").toLowerCase().replace(/\s/g, "-");
-  try {
-    const script = path.join(__dirname, "publish.py");
-    const out = execSync(
-      `python3 "${script}" unpublish "${project_id}" --username "${username}"`,
-      { encoding: "utf-8", timeout: 60000 }
-    );
-    return JSON.parse(out.trim());
-  } catch (e) {
-    return { error: e.message.slice(0, 500) };
-  }
+  return runPublishPy(String(project_id),
+    ["unpublish", String(project_id), "--username", publishUsername()], 60000);
 }
 
 // ─── Docs API ───────────────────────────────────────
@@ -1141,6 +1140,9 @@ function serveDocsFile(res, docsDir, filePath, opts = {}) {
         console.error(`[docs-file] stream error ${fullPath}:`, e.message);
         res.destroy();
       });
+      // pipe() 는 클라이언트가 중간에 끊어도 읽기 스트림을 닫지 않는다 — 비디오 시크·PDF 미리보기는
+      // 매번 끊으므로 그때마다 파일 핸들이 하나씩 영구히 샌다 (2026-09-21 실측: 접속 0인 포털이 미디어 32개 보유)
+      res.on("close", () => stream.destroy());
       stream.pipe(res);
     };
 
@@ -2772,13 +2774,13 @@ document.addEventListener('click', e => {
     json(apiGitDiffRange(dir, from, to));
   }
   else if (pathname === "/api/publish" && req.method === "POST") {
-    readBody().then(body => json(execPublish(body)));
+    readBody().then(body => execPublish(body)).then(r => json(r));
   }
   else if (pathname === "/api/rebuild" && req.method === "POST") {
-    readBody().then(body => json(execRebuild(body)));
+    readBody().then(body => execRebuild(body)).then(r => json(r));
   }
   else if (pathname === "/api/unpublish" && req.method === "POST") {
-    readBody().then(body => json(execUnpublish(body)));
+    readBody().then(body => execUnpublish(body)).then(r => json(r));
   }
   else if (pathname === "/api/browser/frame" && req.method === "GET") {
     // 브라우저 인계: 현재 화면 프레임 (JPEG base64) + 뷰포트/URL
