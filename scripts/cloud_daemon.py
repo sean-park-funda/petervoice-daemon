@@ -1375,6 +1375,7 @@ class _StreamCollector:
         self.session_id: str | None = None
         self.is_error = False
         self.error_text = ""
+        self.saw_result = False
         self._seg_start = 0
         self._pending_boundary = False
         self._saw_event = False
@@ -1389,6 +1390,10 @@ class _StreamCollector:
         except json.JSONDecodeError:
             return False
         self._saw_event = True
+        # 세션 id 는 init 이벤트에도 실려 온다. result 까지 못 간 턴(예: podman exec 실패)
+        # 에서도 세션을 잃지 않으려면 여기서 먼저 잡아둔다.
+        if not self.session_id and ev.get("session_id"):
+            self.session_id = ev["session_id"]
         et = ev.get("type", "")
         changed = False
         if et == "assistant":
@@ -1413,6 +1418,7 @@ class _StreamCollector:
                     self.text += t
                     changed = True
         elif et == "result":
+            self.saw_result = True
             if ev.get("session_id"):
                 self.session_id = ev["session_id"]
             rt = (ev.get("result") or "")
@@ -1539,6 +1545,25 @@ def _parse_turn_result(rc, out, err, user_id, project, prompt, sid) -> tuple[str
             f"claude exit {rc} user={user_id} project={project} "
             f"out={len(out)}B err={len(err)}B | stderr_tail={err[-600:]!r} | stdout_tail={out[-400:]!r}"
         )
+        # 종료코드가 0 이 아니어도 stdout 에 답이 이미 실려 있을 수 있다.
+        # 2026-09-21 jenn 님 실패 29건의 정체가 그것이었다 — podman 3.4 의 exec 종료파일
+        # 경쟁(`timed out waiting for file ... exit: internal libpod error`)으로, 클로드는
+        # 답을 다 만들고 끝났는데 podman 만 255 를 돌려줬다. 그 답을 버리면 유저는 "오류"만
+        # 보고 같은 작업을 자기 구독 토큰으로 다시 돌린다. 재실행이 아니라 회수로 처리한다
+        # (재실행은 이미 끝난 부수효과 — 파일 쓰기·메일 발송 — 를 두 번 일으킨다).
+        salv = _collect_stream(out)
+        if salv is not None:
+            if salv.session_id:
+                save_session(user_id, project, salv.session_id)
+            text = salv.text.strip()
+            if text and not salv.is_error:
+                _turn_tool_lines[(user_id, project)] = list(salv.tool_lines)
+                logger.warning(
+                    f"claude exit {rc} salvaged {len(text)}B user={user_id} "
+                    f"project={project} complete={salv.saw_result}")
+                if not salv.saw_result:
+                    text += "\n\n(연결이 끊겨 여기서 멈췄어요. 이어서 하려면 말씀해주세요.)"
+                return (text, "ok")
         return ("(처리 중 오류가 발생했어요. 다시 시도해주세요.)", "ok")
     col = _collect_stream(out)
     if col is not None:
