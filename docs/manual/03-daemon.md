@@ -406,11 +406,11 @@ git fetch origin main && git log --oneline HEAD..origin/main
 
 파일: `scripts/daemon/health.py`
 
-> ⚠️ **Stall Detection(30분 스니펫 수집 → session-manager 판단 → `[stall-check]` nudge)은 2026-09 커밋 `f5c69b3` 로 완전히 제거됐다.**
+> ⚠️ **SessionHealthChecker 의 Stall Detection(30분마다 대화 스니펫을 모아 session-manager 가 미완료 작업을 판단하고 `[stall-check]` nudge 를 보내던 기능)은 2026-07-16 커밋 `f5c69b3` 로 제거됐다.**
 > 이유: 매시간 모든 세션의 스니펫을 Claude 에 보내고 연달아 nudge 를 쏴서 워커가 claude 프로세스를 여러 개 동시에 띄웠다.
-> 지금 코드에는 `_check_stalls`·`stall_check_report` 가 없다. 유저의 "멈춘 것 같아요"는 자동 감지되지 않으며, 유저가 상태 배지·강제 재시작·`데몬 진단`·문제 신고로 대응한다(유저 매뉴얼 18장).
+> 지금 코드에는 `_check_stalls`·`stall_check_report` 가 없다. "대화 맥락을 읽고 깨우는" 자동 복구는 없지만, 워커 스레드 사망 감시·턴 타임아웃 후속 처리 등 다른 자동 복구는 별개로 남아 있다. 유저 대응 절차는 유저 매뉴얼 18장(맥: 데몬 재시작 → 강제 재시작 요청 → 문제 신고 / 클라우드: `데몬 진단` → 문제 신고).
 
-남은 것은 **2시간 주기 세션 건강 리포트** 하나다. 60초마다 tick 하며 주기 도달 시 실행한다.
+이 스레드에 남은 것은 **2시간 주기 세션 건강 리포트** 다. 초기 대기 30분 후 루프를 시작하고, 60초마다 tick 하며 주기 도달 시 실행한다.
 
 ```
 2시간마다:

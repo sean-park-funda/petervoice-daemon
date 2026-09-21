@@ -7,9 +7,9 @@
 | VoiceModeOverlay | `components/VoiceModeOverlay.tsx` | 전체화면 음성 UI |
 | VoiceModeToggle | `components/VoiceModeToggle.tsx` | 마이크 토글 버튼 |
 | VoiceSelector | `components/VoiceSelector.tsx` | TTS 음성 선택 |
-| useAudioCapture | `hooks/useAudioCapture.ts` | Deepgram STT 스트리밍 |
+| useAudioCapture | `hooks/useAudioCapture.ts` | Soniox STT 스트리밍 (2026-09-21 정정) |
 | useSpeechSynthesis | `hooks/useSpeechSynthesis.ts` | TTS 엔진 |
-| useSpeechRecognition | `hooks/useSpeechRecognition.ts` | Web Speech API 폴백 |
+| useSpeechRecognition | `hooks/useSpeechRecognition.ts` | Web Speech API 폴백 | — ⚠️ 2026-09-21 확인: `useVoiceSession` 은 `useAudioCapture` 만 사용하고 `useSpeechRecognition` 은 정의만 있어 실제 폴백으로 동작하지 않음
 | useWakeLock | `hooks/useWakeLock.ts` | 화면 꺼짐 방지 |
 
 ## 음성모드 상태 머신
@@ -48,7 +48,7 @@
 - 권한 거부는 자동 재시도로 풀리지 않음 → "마이크 권한을 허용한 뒤 음성 초기화(↺)" 안내
 - 유저용 증상별 대응은 `docs/help-topics/09-voice-microphone.md`(peter-voice 프로젝트) 참조
 
-### Web Speech API (폴백)
+### Web Speech API (폴백) — ⚠️ 2026-09-21 확인: `useVoiceSession` 은 `useAudioCapture` 만 사용하고 `useSpeechRecognition` 은 정의만 있어 실제 폴백으로 동작하지 않음
 
 - 브라우저 내장 음성인식 (`webkitSpeechRecognition`)
 - continuous + interimResults 모드
