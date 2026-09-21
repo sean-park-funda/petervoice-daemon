@@ -152,3 +152,22 @@ def _split_text_chunks(text: str, max_len: int = 3500) -> list[str]:
         chunks.append(text[:idx].rstrip())
         text = text[idx:].lstrip()
     return [c for c in chunks if c]
+
+
+_SENDER_RE = re.compile(r"[\x00-\x1f\[\]\n]")
+
+
+def with_sender(msg: dict, text: str) -> str:
+    """팀 프로젝트에서 팀원이 보낸 메시지에 발신자를 표시한다 (cloud_daemon.with_sender 와 같은 규칙).
+
+    메시지는 프로젝트 **소유자**의 user_id 로 저장되므로(팀원이 보내도 마찬가지),
+    이걸 붙이지 않으면 여러 사람이 한 세션을 써도 비서가 전부 같은 사람으로 인식한다.
+    소유자 본인 메시지에는 아무것도 붙이지 않는다(기존 동작 유지).
+    외부 메시지(subtype=external)도 from_user_id 를 쓰지만 팀원이 아니고, 이미
+    `[외부 relay @보낸사람 · kind]` 머리를 달고 오므로 제외한다."""
+    name = (msg.get("from_username") or "").strip()
+    if not name or msg.get("subtype") == "external":
+        return text
+    if msg.get("from_user_id") in (None, msg.get("user_id")):
+        return text
+    return f"[팀원 {_SENDER_RE.sub('', name)[:40]} 님이 보낸 메시지]\n{text}"

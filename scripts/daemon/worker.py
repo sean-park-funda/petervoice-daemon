@@ -27,7 +27,7 @@ from daemon.tasks import (
 from daemon.prompts import get_prompt_file, build_system_prompt
 from daemon.claude_runner import run_claude, run_codex, rewrite_for_voice, SHUTDOWN_INTERRUPTED
 from daemon.queue import enqueue_message, dequeue_message
-from daemon.utils import resolve_files, cleanup_downloads, _split_text_chunks, _read_json, _write_json
+from daemon.utils import resolve_files, cleanup_downloads, _split_text_chunks, _read_json, _write_json, with_sender
 from daemon.encryption import decrypt_message, get_encryptor
 # kanban messages now flow through messages table — no separate kanban import needed
 
@@ -315,6 +315,10 @@ class Worker(threading.Thread):
             orig_type = "봇" if reply_context.get("type") == "bot" else "유저"
             orig_text = reply_context.get("text", "")[:500]
             text = f"[이전 메시지에 대한 댓글입니다]\n> 원본 ({orig_type}): {orig_text}\n\n댓글: {text}"
+
+        # 팀원이 보낸 메시지면 맨 위에 발신자 표시 (명령어 처리 뒤라 /명령 매칭을 깨지 않고,
+        # 댓글 블록 뒤라 머리말이 "댓글:" 안에 파묻히지 않는다). codex·team 경로도 이 text 를 쓴다.
+        text = with_sender(msg, text)
 
         # Append file paths to prompt
         prompt_text = text
