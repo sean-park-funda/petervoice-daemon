@@ -9,7 +9,7 @@
 | VoiceSelector | `components/VoiceSelector.tsx` | TTS 음성 선택 |
 | useAudioCapture | `hooks/useAudioCapture.ts` | Soniox STT 스트리밍 (2026-09-21 정정) |
 | useSpeechSynthesis | `hooks/useSpeechSynthesis.ts` | TTS 엔진 |
-| useSpeechRecognition | `hooks/useSpeechRecognition.ts` | Web Speech API 폴백 | — ⚠️ 2026-09-21 확인: `useVoiceSession` 은 `useAudioCapture` 만 사용하고 `useSpeechRecognition` 은 정의만 있어 실제 폴백으로 동작하지 않음
+| useSpeechRecognition | `hooks/useSpeechRecognition.ts` | Web Speech API 폴백 (⚠️ 2026-09-21 확인: `useVoiceSession` 은 `useAudioCapture` 만 사용, 이 훅은 정의만 있어 실제 폴백으로 동작하지 않음) |
 | useWakeLock | `hooks/useWakeLock.ts` | 화면 꺼짐 방지 |
 
 ## 음성모드 상태 머신
