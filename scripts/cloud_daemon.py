@@ -1229,6 +1229,7 @@ def run_claude_turn(user_id: int, project: str, prompt: str) -> tuple[str, str]:
                                             model=model, effort=effort)
         if not argv:
             return ("(일시적 오류로 실행에 실패했어요. 잠시 후 다시 말씀해주세요.)", "ok")
+        started = time.time()
         try:
             # 옛 방식과 같은 스트리밍 — 없으면 진행 중 발화·도구 로그가 턴 끝까지 안 보인다
             rc, out, err = _run_streaming(argv, user_id, project, timeout=limit_sec + 60)
@@ -1241,6 +1242,11 @@ def run_claude_turn(user_id: int, project: str, prompt: str) -> tuple[str, str]:
             return ("", "heavy_mem")
         if rc == 124:
             return ("", "heavy_time")
+        if rc != 0 and ctr.exec_race(err):
+            text = _recover_exec_race(user_id, project, out, sid, started, limit_sec,
+                                      _sysprompt_filename(project))
+            if text:
+                return (text, "ok")
         return _parse_turn_result(rc, out, err, user_id, project, prompt, sid)
 
     claude_cmd = config.get("claude_cmd", "claude")
@@ -1514,6 +1520,66 @@ def _collect_stream(out: str) -> _StreamCollector | None:
     for line in out.splitlines():
         col.feed(line)
     return col if col._saw_event else None
+
+
+def _iso_epoch(ts: str | None) -> float:
+    try:
+        return datetime.fromisoformat((ts or "").replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return 0.0
+
+
+def _transcript_answer(user_id: int, session_id: str, since: float) -> str:
+    """전사에서 since(에폭) 이후의 assistant 텍스트를 순서대로 모은다.
+    서브에이전트 발화(isSidechain)는 제외 — 본 대화의 답이 아니다."""
+    raw = ctr.transcript_tail(user_id, session_id)
+    parts = []
+    # 끝에서 잘라 읽으므로 첫 줄은 깨져 있을 수 있다
+    for ln in raw.splitlines()[1:]:
+        ln = ln.strip()
+        if not ln.startswith("{"):
+            continue
+        try:
+            ev = json.loads(ln)
+        except json.JSONDecodeError:
+            continue
+        if ev.get("type") != "assistant" or ev.get("isSidechain"):
+            continue
+        if _iso_epoch(ev.get("timestamp")) < since:
+            continue
+        for b in (ev.get("message") or {}).get("content") or []:
+            if isinstance(b, dict) and b.get("type") == "text" and (b.get("text") or "").strip():
+                parts.append(b["text"].strip())
+    return "\n\n".join(parts).strip()
+
+
+def _recover_exec_race(user_id: int, project: str, out: str, sid: str | None,
+                       started: float, limit_sec: int, marker: str) -> str:
+    """podman 이 헛되이 실패를 돌려준 턴의 답을 회수한다.
+
+    2026-09-21 jenn 님 사례: exec 이 시작 34초 만에 255 로 끊겼는데 컨테이너 안 claude 는
+    계속 돌아 **4분 뒤 답을 완성**했다. 고객 화면에는 "오류"가 떴고 답은 전사에만 남았다.
+    stdout 회수(43b32aa)로 못 건진 이유는 끊긴 시점까지 도구 출력뿐이었기 때문이다.
+    그래서 ① 안쪽 프로세스가 끝나기를 기다리고 ② 전사에서 이 턴 구간을 읽는다.
+    재실행은 하지 않는다 — 이미 일어난 부수효과(파일 쓰기·메일 발송)를 두 번 일으킨다."""
+    col = _collect_stream(out)
+    live_sid = (col.session_id if col else None) or sid
+    if col:
+        if col.session_id:
+            save_session(user_id, project, col.session_id)
+        if col.tool_lines:
+            _turn_tool_lines[(user_id, project)] = list(col.tool_lines)
+    if not live_sid:
+        return ""
+    deadline = started + limit_sec
+    waited = 0
+    while time.time() < deadline and ctr.turn_alive(user_id, marker):
+        time.sleep(10)
+        waited += 10
+    text = _transcript_answer(user_id, live_sid, started)
+    logger.warning(f"exec race user={user_id} project={project} waited={waited}s "
+                   f"recovered={len(text)}B")
+    return text
 
 
 def _parse_turn_result(rc, out, err, user_id, project, prompt, sid) -> tuple[str, str]:

@@ -551,6 +551,48 @@ def kill_turns(user_id: int) -> None:
     _podman("exec", name(user_id), "pkill", "-f", "^claude ", timeout=15)
 
 
+_EXEC_RACE_RE = re.compile(r"timed out waiting for file|internal libpod error", re.I)
+
+
+def exec_race(stderr: str) -> bool:
+    """podman 이 턴 실패를 **헛되이** 보고한 경우인지 판정.
+
+    podman 3.4.4(우분투 22.04 기본)는 exec 이 끝날 때 conmon 이 쓰는 종료파일을 기다리다
+    먼저 포기하고 255 를 돌려준다. 이때 컨테이너 안 claude 는 **계속 돈다** — 클라이언트만
+    죽고 안쪽은 살아남는다는 kill_turns 의 실측과 같은 성질이다.
+    """
+    return bool(stderr and _EXEC_RACE_RE.search(stderr))
+
+
+def turn_alive(user_id: int, marker: str) -> bool:
+    """이 턴의 claude 가 아직 컨테이너 안에서 도는지.
+
+    marker 는 프로젝트별 시스템 프롬프트 파일명 — 같은 유저의 다른 브랜치 턴을 이것으로
+    구분한다. `^claude ` 로 세면 옆 브랜치 턴까지 끝나기를 기다리게 된다."""
+    if not marker or container_state(user_id) != "running":
+        return False
+    r = _podman("exec", name(user_id), "pgrep", "-f", marker, timeout=15)
+    return r.returncode == 0
+
+
+def transcript_tail(user_id: int, session_id: str, max_bytes: int = 4_000_000) -> str:
+    """세션 전사(.jsonl)의 끝부분을 읽어 돌려준다.
+
+    전사는 수백 MB 까지 자란다(2026-09-21 실측 최대 375MB) → 통째로 읽지 않는다.
+    찾는 것은 턴의 마지막 답이라 끝에서 잘라 읽으면 충분하다."""
+    if not re.fullmatch(r"[A-Za-z0-9_-]{8,}", session_id or ""):
+        return ""
+    base = home(user_id) / "claude" / "projects"
+    r = subprocess.run(["sudo", "-n", "find", str(base), "-name", f"{session_id}.jsonl"],
+                       capture_output=True, text=True, timeout=30)
+    paths = [p for p in (r.stdout or "").splitlines() if p.strip()]
+    if not paths:
+        return ""
+    r = subprocess.run(["sudo", "-n", "tail", "-c", str(int(max_bytes)), paths[0]],
+                       capture_output=True, text=True, errors="replace", timeout=60)
+    return r.stdout or ""
+
+
 def _envfile(user_id: int, env: dict) -> str:
     d = home_root() / ".turnenv"
     subprocess.run(["sudo", "-n", "mkdir", "-p", str(d)], capture_output=True)
