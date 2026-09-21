@@ -35,19 +35,18 @@
 
 ## STT (음성→텍스트)
 
-### Deepgram Nova-2 (기본)
+### Soniox 실시간 스트리밍 (현행 — 2026-09-21 정정, 이전 서술의 Deepgram 은 낡음)
 
 ```
-마이크 캡처 → MediaRecorder (250ms 청크)
-  → WebSocket (wss://api.deepgram.com/v1/listen)
-  → 실시간 전사 (한국어, nova-2 모델)
-  → 세그먼트 기반 표시 (진행 중 + 완료)
+마이크 캡처 → 브라우저가 POST /api/stt/token 으로 임시 키 발급
+  → Soniox 실시간 WebSocket 에 직접 스트리밍
+  → 실시간 전사 (진행 중 + 완료 세그먼트 표시)
 ```
 
-- 토큰: `POST /api/stt/token` → Deepgram API 키
-- 오디오 버퍼링: WebSocket 연결 중 최대 2초 버퍼
-- VAD (음성 활동 감지): utterance_end 1.5초 침묵
-- 볼륨 모니터링: AnalyserNode RMS 계산 → 파형 시각화
+- 토큰: `POST /api/stt/token` (`app/api/stt/token/route.ts`)
+- 자가복구(`hooks/useAudioCapture.ts`): 오류 시 백오프 재연결 1.5→3→6→10초, 토큰 요청 6초 타임아웃, 시작 10초 내 미연결 시 강제 재시작, 트랙 종료·mute·10초 무음 감시, 재연결 시 주인 화자 리셋
+- 권한 거부는 자동 재시도로 풀리지 않음 → "마이크 권한을 허용한 뒤 음성 초기화(↺)" 안내
+- 유저용 증상별 대응은 `docs/help-topics/09-voice-microphone.md`(peter-voice 프로젝트) 참조
 
 ### Web Speech API (폴백)
 

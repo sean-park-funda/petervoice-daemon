@@ -42,7 +42,7 @@
 │  │  SecretsSyncer   — 환경변수 DB→로컬 싱크 (60초)              │ │
 │  │  SkillsSyncer    — 스킬 업데이트 전용 싱크 (5분)             │ │
 │  │  AutoUpdater     — 데몬 자동 업데이트 (5분)                  │ │
-│  │  SessionHealthChecker — 세션 수명 관리 (2시간) + Stall (30분)│ │
+│  │  SessionHealthChecker — 세션 수명 관리 (2시간)               │ │
 │  │  HeartbeatThread — 자율 반복 작업 스케줄링 (1분)              │ │
 │  │  ManagerThread   — 자율 프로젝트 점검/제안 (설정 가능)        │ │
 │  │  SummonManager   — 다중 에이전트 리뷰 세션 관리              │ │
@@ -98,7 +98,7 @@ peter-voice/                       # 작업 디렉토리
 │   │   ├── publish.py             # 로컬 퍼블리싱 CLI
 │   │   └── daemon/                # 데몬 모듈
 │   │       ├── worker.py          # 메시지 폴링 + Claude Code CLI 실행
-│   │       ├── health.py          # SessionHealthChecker (세션 수명 + Stall 감지)
+│   │       ├── health.py          # SessionHealthChecker (세션 수명; stall 감지는 f5c69b3 로 제거)
 │   │       ├── heartbeat.py       # HeartbeatThread (자율 반복 작업)
 │   │       ├── kanban.py          # 칸반 세션 관리
 │   │       ├── summon.py          # SummonManager (다중 에이전트 리뷰)
