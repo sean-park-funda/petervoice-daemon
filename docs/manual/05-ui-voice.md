@@ -46,7 +46,7 @@
 - 토큰: `POST /api/stt/token` (`app/api/stt/token/route.ts`)
 - 자가복구(`hooks/useAudioCapture.ts`): 오류 시 백오프 재연결 1.5→3→6→10초, 토큰 요청 6초 타임아웃, 시작 10초 내 미연결 시 강제 재시작, 트랙 종료·mute·10초 무음 감시, 재연결 시 주인 화자 리셋
 - 권한 거부는 자동 재시도로 풀리지 않음 → "마이크 권한을 허용한 뒤 음성 초기화(↺)" 안내
-- 유저용 증상별 대응은 `docs/help-topics/09-voice-microphone.md`(peter-voice 프로젝트) 참조
+- 유저용 증상별 대응은 헬프 시트 09 — 공통 검색 `GET /api/help/search?q=마이크` 또는 `GET /api/help/topics/help%2F09-voice-microphone` (웹 레포 `content/help-topics/`)
 
 ### Web Speech API (폴백) — ⚠️ 2026-09-21 확인: `useVoiceSession` 은 `useAudioCapture` 만 사용하고 `useSpeechRecognition` 은 정의만 있어 실제 폴백으로 동작하지 않음
 
