@@ -1532,7 +1532,13 @@ def _parse_turn_result(rc, out, err, user_id, project, prompt, sid) -> tuple[str
         if killed:
             logger.warning(f"claude turn killed rc={rc} user={user_id} project={project}")
             return ("(작업이 중단됐어요. 이어서 하려면 다시 말씀해주세요.)", "ok")
-        logger.error(f"claude exit {rc} user={user_id}: {combined[:300]}")
+        # 오류 내용은 출력의 '끝'(대개 stderr)에 나온다. 앞 300자는 매번 똑같은 init JSON
+        # 이라 진단에 아무 쓸모가 없었다 — 2026-09-21 jenn 님이 하루 19번 실패하는 동안
+        # 로그만으로는 원인을 한 번도 볼 수 없었다. 머리 대신 꼬리를 남긴다.
+        logger.error(
+            f"claude exit {rc} user={user_id} project={project} "
+            f"out={len(out)}B err={len(err)}B | stderr_tail={err[-600:]!r} | stdout_tail={out[-400:]!r}"
+        )
         return ("(처리 중 오류가 발생했어요. 다시 시도해주세요.)", "ok")
     col = _collect_stream(out)
     if col is not None:
