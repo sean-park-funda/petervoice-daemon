@@ -389,6 +389,9 @@ _RESOURCE_EXHAUSTION_MARKERS = (
     "too many open files", "errno 24", "emfile",
 )
 _tunnel_exhaustion_streak = 0            # 연속 자원고갈 감지 횟수
+_EXHAUSTION_CHAT_AFTER = 3               # 이 횟수부터 고객 채팅에 안내(일시적 오탐 배제)
+_EXHAUSTION_CHAT_COOLDOWN = 6 * 3600     # 같은 사고로 채팅을 도배하지 않는다
+_last_exhaustion_chat_ts = 0.0           # 마지막 고객 안내 시각
 _last_recover_ts = 0.0                   # 마지막 _ensure_home_portal 복구 시각
 _recover_streak = 0                      # 연속 복구 시도 횟수 (지수 백오프용)
 _RECOVER_BACKOFF_BASE = 20               # 백오프 시작 간격(초): 20 → 40 → 80 … 최대 300
@@ -560,6 +563,63 @@ def _report_tunnel_health(state: str, note: str = ""):
         logger.warning(f"[tunnel][circuit] health report failed: {e}")
 
 
+def _count_time_wait() -> int | None:
+    """TIME_WAIT 소켓 수 — 경보에 실어 보낼 근거 숫자. 실패해도 경보 자체는 진행한다."""
+    import subprocess
+    for netstat in ("/usr/sbin/netstat", "netstat"):
+        try:
+            r = subprocess.run([netstat, "-an", "-p", "tcp"],
+                               capture_output=True, text=True, timeout=5)
+        except Exception:  # noqa: BLE001
+            continue
+        if r.returncode == 0:
+            return sum(1 for ln in r.stdout.splitlines() if "TIME_WAIT" in ln)
+    return None
+
+
+def _notify_exhaustion(note: str, streak: int):
+    """로컬 자원 고갈을 서버(관리자)와 고객에게 알린다.
+
+    감지 자체는 hoon 사고(2026-07-16) 때 넣었지만 로그만 남겼다. 그 결과 2026-09-20
+    고객 맥에서 730회 감지되는 동안 서버·관리자·고객 누구도 몰랐고 31시간 불통이
+    그대로 방치됐다(재로그인 시도만 7회 실패). 감지했으면 반드시 말해야 한다.
+    → 서버에는 감지 로그와 같은 주기로, 고객 채팅에는 확정 후 1회만(쿨다운).
+    """
+    global _last_exhaustion_chat_ts
+    import time
+    tw = _count_time_wait()
+    detail = (note or "unknown")[:120]
+    if tw is not None:
+        detail = f"{detail} | TIME_WAIT={tw}"
+    _report_tunnel_health("exhausted", detail)
+
+    if streak < _EXHAUSTION_CHAT_AFTER:
+        return
+    now = time.time()
+    if now - _last_exhaustion_chat_ts < _EXHAUSTION_CHAT_COOLDOWN:
+        return
+    api_key = config.get("api_key", "")
+    if not api_key:
+        return
+    tw_line = f"\n- 지금 잠겨 있는 통신 회선: **{tw:,}개**" if tw is not None else ""
+    text = (
+        "\u26a0\ufe0f **이 맥의 통신 회선(포트)이 모두 소진됐습니다.**\n\n"
+        "밖으로 새 연결을 맺지 못하는 상태라 답변이 계속 실패할 수 있습니다. "
+        "로그인 문제가 아니라 회선 문제라서 재로그인으로는 해결되지 않습니다."
+        f"{tw_line}\n\n"
+        "**맥을 한 번 재시동해 주세요.** 애플 메뉴 > 재시동을 누르시면 됩니다. "
+        "1~2분 뒤부터 정상으로 돌아옵니다.\n\n"
+        "재시동이 어려우시면 이 창에 말씀해 주세요 — 임시 조치를 안내해 드리겠습니다."
+    )
+    try:
+        api_request(api_key, "POST", "/api/bot/reply",
+                    {"text": text, "project": "general", "is_final": True})
+        _last_exhaustion_chat_ts = now
+        logger.warning("[tunnel] exhaustion notice sent to customer chat")
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"[tunnel] exhaustion chat notice failed: {e}")
+
+
 def _check_cloudflared_health():
     """2단계 헬스체크로 cloudflared 좀비 터널을 감지·자가치유.
 
@@ -568,6 +628,7 @@ def _check_cloudflared_health():
        - 연속 실패 임계치/시간당 backoff로 플래핑·무한루프 방지.
     """
     global _tunnel_unreachable_streak, _tunnel_exhaustion_streak, _recover_streak
+    global _last_exhaustion_chat_ts
     global _cb_state, _cb_fail_since, _cb_opened_ts, _cb_last_probe_ts
 
     if not config.get("home_portal_enabled", True):
@@ -615,6 +676,10 @@ def _check_cloudflared_health():
             _report_tunnel_health("closed", note)  # OPEN 해제 서버 통지
         elif _tunnel_unreachable_streak or _tunnel_exhaustion_streak:
             logger.info(f"[tunnel] external reachability recovered ({note})")
+            if _tunnel_exhaustion_streak:
+                # 고갈 경보를 올렸으면 해제도 올려야 관리자 화면이 계속 빨갛게 남지 않는다
+                _report_tunnel_health("closed", f"recovered from exhaustion ({note})")
+                _last_exhaustion_chat_ts = 0.0
         _cb_state = "closed"
         _cb_fail_since = 0.0
         _tunnel_unreachable_streak = 0
@@ -632,6 +697,7 @@ def _check_cloudflared_health():
                 f"streak={_tunnel_exhaustion_streak} — skipping recovery (would amplify). "
                 f"Likely ephemeral-port/FD exhaustion; needs local remediation."
             )
+            _notify_exhaustion(note, _tunnel_exhaustion_streak)
         return
     _tunnel_exhaustion_streak = 0
 
@@ -669,6 +735,8 @@ def _check_cloudflared_health():
                 f"[tunnel] local probe failed by resource exhaustion ({local_note}) "
                 f"— NOT triggering recovery (would amplify)"
             )
+            if _tunnel_exhaustion_streak <= 3 or _tunnel_exhaustion_streak % 10 == 0:
+                _notify_exhaustion(local_note, _tunnel_exhaustion_streak)
             return
         # 진짜 홈포탈 다운 → 프로세스 복구 경로로(지수 백오프)
         logger.warning(
