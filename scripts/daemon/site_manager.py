@@ -84,6 +84,29 @@ def _find_npm_or_npx() -> str:
     return "npx"
 
 
+def _ensure_serve_bin() -> list[str]:
+    """정적 사이트 서버(`serve`) 실행 명령. 가능하면 설치된 바이너리를 직접 쓴다.
+
+    예전에는 plist 에 `npx serve` 를 그대로 박았다. npx 는 **기동할 때마다** 패키지를
+    확인하느라 npm 레지스트리에 접속하는데, launchd 는 KeepAlive 로 죽으면 다시 띄운다.
+    네트워크가 흔들려 기동이 실패하는 구간에서는 이 둘이 맞물려 재시작 폭주가 되고,
+    맥의 임시 포트를 계속 태운다(2026-09-20 고객 맥 포트 고갈 사고의 용의선상).
+    설치된 바이너리를 쓰면 기동에 네트워크가 아예 필요 없다."""
+    for cand in ("serve", "/opt/homebrew/bin/serve", "/usr/local/bin/serve"):
+        found = shutil.which(cand)
+        if found:
+            return [found]
+    # 없으면 퍼블리싱 시점에 한 번만 설치한다 (서비스 기동 경로에서는 설치하지 않는다)
+    try:
+        subprocess.run(["npm", "install", "-g", "serve"], capture_output=True, timeout=180)
+        found = shutil.which("serve") or shutil.which("/opt/homebrew/bin/serve")
+        if found:
+            return [found]
+    except Exception:  # noqa: BLE001
+        pass
+    return [_find_npm_or_npx(), "serve"]   # 최후 폴백 — 기존 동작
+
+
 def _detect_framework(project_dir: str) -> str:
     """프로젝트 프레임워크 감지"""
     pkg_path = Path(project_dir) / "package.json"
@@ -164,7 +187,7 @@ def _create_launchd_plist(project_id: str, project_dir: str, port: int, framewor
     elif framework == "vite":
         program_args = [npx, "vite", "preview", "--port", str(port), "--host"]
     elif framework == "static":
-        program_args = [npx, "serve", "-l", str(port), "-s", "."]
+        program_args = _ensure_serve_bin() + ["-l", str(port), "-s", "."]
     else:
         program_args = [npx, "next", "start", "-p", str(port)]
 
@@ -188,7 +211,9 @@ def _create_launchd_plist(project_id: str, project_dir: str, port: int, framewor
         "EnvironmentVariables": env_vars,
         "RunAtLoad": True,
         "KeepAlive": True,
-        "ThrottleInterval": 10,
+        # 기동이 계속 실패하는 사이트가 10초마다 되살아나면 재시작 폭주가 된다.
+        # 30초면 사람이 체감하는 복구 속도는 그대로면서 폭주는 못 만든다.
+        "ThrottleInterval": 30,
         "StandardOutPath": str(log_dir / "stdout.log"),
         "StandardErrorPath": str(log_dir / "stderr.log"),
     }

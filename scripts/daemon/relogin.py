@@ -47,11 +47,36 @@ _ONBOARD_MARKERS = ("choose", "theme", "select", "text style", "press enter", "d
 
 def _sanitize(s: str) -> str:
     """제어문자(\r \x1b 등) 제거. URL/코드 정제 필수 (과거 \r 사고)."""
+    # OSC 시퀀스(터미널 하이퍼링크 ESC]8;;URL ST …)를 먼저 통째로 제거한다.
+    # 아래 CSI 제거만 하면 ESC 만 빠지고 "]8;;<URL>" 이 본문에 남아 보이는 URL 과
+    # 붙어버린다 → 링크가 두 번 이어진 깨진 URL 이 고객에게 그대로 나갔다
+    # (2026-09-21 신세호 님: 이 링크로 재로그인 7회 연속 실패).
+    s = re.sub(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)", "", s)
+    # 아직 끝나지 않은(잘려 들어온) OSC 꼬리도 버린다 — pty 는 조각으로 읽힌다
+    s = re.sub(r"\x1b\][^\x07\x1b]*$", "", s)
     # ANSI escape 시퀀스 제거
     s = re.sub(r"\x1b\[[0-9;?]*[a-zA-Z]", "", s)
     # 그 외 제어문자 제거
     s = "".join(ch for ch in s if ch == "\n" or (ord(ch) >= 0x20 and ord(ch) != 0x7f))
     return s.strip()
+
+
+def _trim_url(cand: str) -> str:
+    """캡처한 URL 에서 뒤에 붙은 잔재를 잘라낸다 (2차 방어).
+
+    _sanitize 가 놓친 OSC 잔재(`]8;;`)나, 같은 URL 이 한 번 더 이어붙은 경우를
+    자른다. 고객은 이 문자열을 그대로 브라우저에 붙여넣으므로 한 글자라도 더
+    붙으면 인증이 실패한다."""
+    for marker in ("\x1b]", "]8;;", "]8;"):
+        i = cand.find(marker)
+        if i > 0:
+            cand = cand[:i]
+    # 같은 URL 이 한 번 더 이어붙은 경우만 자른다. "http" 문자열이 아니라 스킴
+    # 패턴으로 찾아야 한다 — redirect_uri 안의 https%3A%2F%2F 는 잘라내면 안 된다.
+    m2 = re.search(r"https?://", cand[4:])
+    if m2:
+        cand = cand[:4 + m2.start()]
+    return cand.rstrip(").,")
 
 
 # 로그인 트리거 — 공백·대소문자·문장부호를 무시하고 매칭 (처음 쓰는 유저가 "재로그인"을
@@ -290,7 +315,7 @@ class ReloginSession:
                 clean = _sanitize(buf)
                 # URL 캡처
                 for m in _URL_RE.finditer(clean):
-                    cand = m.group(0).rstrip(").,")
+                    cand = _trim_url(m.group(0))
                     low = cand.lower()
                     if ("oauth" in low or "authorize" in low or "/login" in low
                             or "code=" in low or "claude.ai" in low or "claude.com" in low):
