@@ -14,7 +14,7 @@
 |----------|------|--------|------|
 | `/do` | 유저가 요청한 멀티턴 작업 | 유저 명령 | 빠름 (~60초/턴) |
 | HeartBeat | 주기적 반복 작업 | 타이머 (30분+) | 느림 |
-| Stall Detection | 실수로 멈춘 대화 감지 + nudge | 30분 점검 | 감지만 |
+| ~~Stall Detection~~ | (2026-09 `f5c69b3` 로 제거 — 자동 nudge 없음) | — | — |
 
 ---
 
@@ -104,38 +104,17 @@ HeartbeatThread (매 60초 폴링)
 
 ---
 
-## Stall Detection — 중단된 대화 감지
+## ~~Stall Detection~~ — 제거됨 (2026-09, 커밋 `f5c69b3`)
 
-파일: `scripts/daemon/health.py`
-
-에이전트가 "잠시만요" 하고 응답 후 실제로는 멈춰 있는 상황을 감지하고 nudge한다.
-
-### 흐름
-
-```
-SessionHealthChecker (30분마다)
-  ↓
-모든 활성 세션의 최근 대화 5건 스니펫 수집 (각 400자)
-  ↓
-session-manager 프로젝트(Haiku)에 [stall-check 리포트] 전송
-  ↓
-session-manager가 대화 맥락을 읽고 판단:
-  - 자연스럽게 끝난 대화 → 무시
-  - "잠시만요" 후 30분+ 침묵 → nudge
-  - 유저가 보류 요청 → 무시
-  ↓
-nudge 필요 시 → [stall-check] 릴레이를 해당 프로젝트에 전송
-nudge 불필요 시 → "없음" 한 마디 (토큰 절약)
-```
-
-### 왜 Python이 판단하지 않는가
-
-대부분의 대화는 봇 메시지로 끝난다. "완료했습니다"도 "잠시만요"도 둘 다 봇 메시지가 마지막이다. 기계적 임계값으로는 정상 종료와 중단을 구분할 수 없고, 대화 맥락을 이해하는 LLM(session-manager, Haiku)만이 판단 가능하다.
+30분마다 모든 세션 스니펫을 session-manager 에 보내 `[stall-check]` nudge 를 쏘던 기능은 **삭제됐다**. 매시간 전 세션 스니펫을 Claude 에 보내고 연달아 nudge 하면서 워커가 claude 프로세스를 여러 개 동시에 띄운 것이 이유다.
+- 지금 코드에 `_check_stalls`·`stall_check_report` 는 없다.
+- 남은 것은 **2시간 세션 건강 리포트**(`session_health_report`)뿐이며, 세션 TTL·리셋 제안·좀비 정리 용도다(03장 SessionHealthChecker).
+- "에이전트가 멈춘 것 같다"는 자동으로 감지되지 않는다. 유저는 상태 배지 → 강제 재시작 → `데몬 진단` → 문제 신고 순으로 대응한다(유저 매뉴얼 18장).
 
 ### session-manager 프로젝트
 
 - **Haiku 모델**의 Claude Code 세션
-- 세션 건강 관리(2시간 주기)와 stall 감지(30분 주기)를 모두 담당
+- 세션 건강 관리(2시간 주기)를 담당
 - `_ensure_session_manager()`가 첫 실행 시 자동 생성 (프로젝트 + 프롬프트 + haiku 모델 설정)
 
 ---
@@ -155,7 +134,7 @@ nudge 불필요 시 → "없음" 한 마디 (토큰 절약)
 프로젝트 B의 worker가 폴링 → Claude Code 실행 → 필요시 역방향 relay
 ```
 
-**사용 예**: 코드 리뷰 요청, 작업 결과 전달, stall-check nudge
+**사용 예**: 코드 리뷰 요청, 작업 결과 전달
 
 상세: [11-relay.md](./11-relay.md)
 
@@ -204,7 +183,7 @@ Scout (상태 질문) → Triage (AUTO/ASK/SKIP) → Execute (멀티턴)
   → HeartBeat (30분 간격, 에이전트가 HEARTBEAT.md 보고 자율 처리)
 
 에이전트가 응답해야 하는데 멈춰 있을 때
-  → Stall Detection (session-manager가 감지, 릴레이로 nudge)
+  → 자동 감지 없음 (Stall Detection 은 제거됨). 유저 매뉴얼 18장 절차(상태 배지 → 강제 재시작 → 데몬 진단 → 문제 신고)
 
 다른 프로젝트 에이전트에게 메시지/요청 전달
   → Relay (단방향 메시지 전달)

@@ -402,60 +402,32 @@ git fetch origin main && git log --oneline HEAD..origin/main
 - `sonolbot_web` 모노레포: 웹+데몬 통합 레포 → `petervoice-daemon` (PUBLIC) + `sonolbot_web` (PRIVATE)으로 분리
 - Supabase 직접 접근: `supabase_url`/`supabase_key`로 REST API 직접 호출 → API 프록시(`/api/bot/*`)로 전환
 
-## SessionHealthChecker — 세션 건강 관리 + Stall Detection
+## SessionHealthChecker — 세션 건강 리포트 (2시간)
 
 파일: `scripts/daemon/health.py`
 
-세션 수명 관리와 중단된 대화 감지를 하나의 스레드에서 수행한다.
+> ⚠️ **Stall Detection(30분 스니펫 수집 → session-manager 판단 → `[stall-check]` nudge)은 2026-09 커밋 `f5c69b3` 로 완전히 제거됐다.**
+> 이유: 매시간 모든 세션의 스니펫을 Claude 에 보내고 연달아 nudge 를 쏴서 워커가 claude 프로세스를 여러 개 동시에 띄웠다.
+> 지금 코드에는 `_check_stalls`·`stall_check_report` 가 없다. 유저의 "멈춘 것 같아요"는 자동 감지되지 않으며, 유저가 상태 배지·강제 재시작·`데몬 진단`·문제 신고로 대응한다(유저 매뉴얼 18장).
 
-### 듀얼 Tick 루프
-
-SessionHealthChecker는 두 가지 주기로 동작한다:
-
-| 주기 | 기능 | 설명 |
-|------|------|------|
-| 30분 | Stall 감지 | 모든 세션의 최근 대화 스니펫을 session-manager에게 전송 |
-| 2시간 | Health 체크 | 세션 TTL 관리, 리셋 제안, 좀비 세션 정리 |
-
-초기 대기 30분 후 루프 시작. 60초마다 tick하며 각 주기 도달 시 실행.
-
-### Stall 감지 흐름
-
-Python(데몬)은 **필터링이나 판단을 하지 않는다**. 모든 세션의 스니펫을 수집해서 session-manager에게 보내고, 판단은 session-manager(Haiku 모델의 Claude Code 세션)가 한다.
+남은 것은 **2시간 주기 세션 건강 리포트** 하나다. 60초마다 tick 하며 주기 도달 시 실행한다.
 
 ```
-30분마다 (_check_stalls):
-  1. 모든 활성 세션의 최근 대화 5건 스니펫 수집 (각 400자 제한)
-  2. [stall-check 리포트]로 묶어서 session-manager 프로젝트에 메시지 전송
-     (subtype: "stall_check_report")
-  3. session-manager가 대화 맥락을 읽고 지능적으로 판단:
-     - 자연스럽게 끝난 대화 → 무시
-     - "잠시만요" 후 30분+ 침묵 → nudge 필요
-     - 유저가 보류 요청 → 무시
-  4. nudge 필요 시 session-manager가 [stall-check] 릴레이를 해당 프로젝트에 전송
-  5. 깨울 대상 없으면 "없음" 한 마디로 응답 (토큰 절약)
+2시간마다:
+  1. 활성 세션 목록(프로젝트별 메시지 수·미사용 시간·수명) 수집
+  2. session-manager 프로젝트에 리포트 전송 (subtype: "session_health_report")
+  3. session-manager(Haiku)가 세션 TTL 관리·리셋 제안·좀비 세션 정리를 판단
 ```
-
-**왜 Python이 판단하지 않는가**: 대부분의 대화는 봇 메시지로 끝난다. "완료했습니다"도 "잠시만요"도 둘 다 봇 메시지가 마지막이다. 기계적 임계값으로는 정상 종료와 중단을 구분할 수 없고, 대화 맥락을 이해하는 LLM만이 판단 가능하다.
-
-### [stall-check] 릴레이 수신
-
-모든 에이전트의 `_common` 프롬프트에 `[stall-check]` 수신 가이드가 포함됨:
-1. 릴레이 메시지의 맥락 읽기 (어떤 작업이 중단되었는지)
-2. 필요시 이전 대화 조회
-3. 미완료 작업이 있으면 이어서 진행
-4. 완료되었거나 유저 입력 필요 시 현황 보고
-5. 불필요한 작업은 하지 않기 (오탐 가능)
 
 ### session-manager 프로젝트
 
-session-manager는 **Haiku 모델**의 Claude Code 세션으로, 세션 건강 관리와 stall 판단을 담당한다.
+session-manager는 **Haiku 모델**의 Claude Code 세션으로, 세션 건강 관리를 담당한다.
 
 **자동 생성**: `_ensure_session_manager()`가 첫 실행 시 프로젝트 존재 여부를 확인하고, 없으면 자동 생성한다:
 1. `GET /api/projects` → session-manager 존재 여부 확인 (결과 캐싱)
 2. 없으면 → `POST /api/projects`로 프로젝트 생성
 3. `PUT /api/projects`로 모델을 haiku로 설정
-4. `PUT /api/prompts`로 세션 관리 + stall 감지 프롬프트 자동 주입
+4. `PUT /api/prompts`로 세션 관리 프롬프트 자동 주입
    (프롬프트는 `health.py`의 `_SESSION_MANAGER_PROMPT` 클래스 변수에 내장)
 
 ## 멀티 계정 (Claude Code Account Switching)

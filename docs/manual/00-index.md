@@ -33,7 +33,7 @@ Peter Voice — 음성 기반 AI 어시스턴트 플랫폼.
 | 23 | [코드 리뷰](./23-code-reviews.md) | /reviews 페이지, Git diff 조회, 리포 등록, 리뷰 스레드 |
 | 24 | [에이전트 대시보드](./24-agent-dashboard.md) | /agents 페이지, 프롬프트 편집, 관리자 유저 선택 |
 | 25 | [고객 온보딩](./25-onboarding.md) | 자동 프로비저닝, 전문가 프리셋, 번들 스킬 배포 |
-| 26 | [장기 작업 & 협업](./26-long-tasks-collaboration.md) | /do 멀티턴, HeartBeat, Stall Detection, Relay, Summon 협업 패턴 |
+| 26 | [장기 작업 & 협업](./26-long-tasks-collaboration.md) | /do 멀티턴, HeartBeat, Relay, Summon 협업 패턴 (Stall Detection 은 제거됨) |
 | 27 | [고객 매니지먼트](./27-customer-management.md) | 고객 현황, 채팅 기록 조회, Tailscale SSH 원격 접속, 장애 복구 |
 | 28 | [문서의 기억화](./28-doc-memory.md) | 🚧 계획 — docs 인덱싱, doc-search 스킬, 문서 기반 자동 응답 |
 | 29 | [크로스유저 에이전트 연결](./29-cross-user-connections.md) | 다른 유저 에이전트 간 친구 기반 통신, 양방향 수신함, /api/relay/external, 핸드오프 |
