@@ -966,6 +966,8 @@ _CODEX_NO_ULTRA = ["low", "medium", "high", "xhigh", "max"]
 _CODEX_BASIC = ["low", "medium", "high", "xhigh"]
 CODEX_MODEL_EFFORTS = {
     "gpt-6-astra": _CODEX_FULL,
+    "gpt-6-sol": _CODEX_FULL,
+    "gpt-6-luna": _CODEX_NO_ULTRA,
     "gpt-5.6-sol": _CODEX_FULL,
     "gpt-5.6-terra": _CODEX_FULL,
     "gpt-5.6-luna": _CODEX_NO_ULTRA,
