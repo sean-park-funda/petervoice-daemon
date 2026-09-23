@@ -27,6 +27,7 @@ class AutoUpdater(threading.Thread):
         super().__init__(daemon=True, name="auto-updater")
         self._repo_dir = _find_repo_dir()
         self._consecutive_failures = 0
+        self._codex_repair_tried = False
 
     def _git(self, *args, timeout=30) -> subprocess.CompletedProcess:
         return subprocess.run(
@@ -297,19 +298,15 @@ class AutoUpdater(threading.Thread):
             logger.warning(f"[updater] Claude CLI update failed: {r.stderr.strip()[:200]}")
 
     def _update_codex_cli(self, _env: dict):
-        """Update @openai/codex to latest."""
-        r = subprocess.run(
-            ["codex", "--version"],
-            capture_output=True, text=True, timeout=10, env=_env,
-        )
-        # `codex --version` prints e.g. "codex-cli 0.144.3" — extract the semver token,
-        # not the leading "codex-cli" name (that caused every cycle to reinstall).
-        current = ""
-        if r.returncode == 0:
-            m = re.search(r"\d+\.\d+\.\d+", r.stdout)
-            current = m.group(0) if m else ""
+        """Update @openai/codex to latest, repairing the install if npm left it broken."""
+        current = self._codex_version(_env)
         if not current:
-            return
+            # Installed but not runnable: repair instead of giving up here, otherwise
+            # every later cycle bails out at this line and codex stays dead until a
+            # human notices.
+            current = self._repair_codex_cli(_env)
+            if not current:
+                return
 
         r = subprocess.run(
             ["npm", "view", "@openai/codex", "version"],
@@ -319,19 +316,61 @@ class AutoUpdater(threading.Thread):
         if not latest or current == latest:
             return
 
-        logger.info(f"[updater] Updating Codex CLI: {current} → {latest}")
+        logger.info(f"[updater] Updating Codex CLI: {current} \u2192 {latest}")
         r = subprocess.run(
             ["npm", "install", "-g", f"@openai/codex@{latest}"],
             capture_output=True, text=True, timeout=180, env=_env,
         )
-        if r.returncode == 0:
-            v = subprocess.run(["codex", "--version"], capture_output=True, text=True, timeout=10, env=_env)
-            if v.returncode == 0:
-                logger.info(f"[updater] Codex CLI updated to {v.stdout.strip()}")
-            else:
-                logger.warning("[updater] Codex CLI binary broken after update — may need manual fix")
-        else:
+        if r.returncode != 0:
             logger.warning(f"[updater] Codex CLI update failed: {r.stderr.strip()[:200]}")
+            return
+
+        updated = self._codex_version(_env) or self._repair_codex_cli(_env)
+        if updated:
+            logger.info(f"[updater] Codex CLI updated to {updated}")
+
+    def _codex_version(self, _env: dict) -> str:
+        """Installed codex version, or "" when the binary refuses to run."""
+        r = subprocess.run(
+            ["codex", "--version"],
+            capture_output=True, text=True, timeout=10, env=_env,
+        )
+        if r.returncode != 0:
+            return ""
+        # `codex --version` prints e.g. "codex-cli 0.144.3" \u2014 extract the semver token,
+        # not the leading "codex-cli" name (that caused every cycle to reinstall).
+        m = re.search(r"\d+\.\d+\.\d+", r.stdout)
+        return m.group(0) if m else ""
+
+    def _repair_codex_cli(self, _env: dict) -> str:
+        """Reinstall a codex whose binary won't run; returns the working version or "".
+
+        npm can drop the platform package (@openai/codex-darwin-arm64) during an upgrade,
+        after which every codex turn dies with exit 1 and only a reinstall brings it back
+        (2026-09-23, 0.155.1 -> 0.156.0). A failed repair is latched so a machine that
+        cannot be fixed does not reinstall on every 5-minute cycle.
+        """
+        if self._codex_repair_tried:
+            return ""
+        r = subprocess.run(
+            ["npm", "ls", "-g", "--depth=0", "@openai/codex"],
+            capture_output=True, text=True, timeout=30, env=_env,
+        )
+        if "@openai/codex@" not in r.stdout:
+            return ""  # codex is not installed here \u2014 nothing to repair
+        logger.warning("[updater] Codex CLI installed but not runnable \u2014 reinstalling")
+        subprocess.run(
+            ["npm", "install", "-g", "@openai/codex@latest"],
+            capture_output=True, text=True, timeout=300, env=_env,
+        )
+        version = self._codex_version(_env)
+        if version:
+            logger.info(f"[updater] Codex CLI repaired: {version}")
+        else:
+            self._codex_repair_tried = True
+            logger.error("[updater] Codex CLI still broken after reinstall \u2014 "
+                         "needs a manual: npm install -g @openai/codex@latest")
+        return version
 
     def check_once(self):
         if not config.get("auto_update_enabled", True):
