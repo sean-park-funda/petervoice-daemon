@@ -1289,6 +1289,7 @@ def run_codex(prompt: str, project: str, _retry_count: int = 0) -> tuple[str, st
         process_start_time = time.time()
         stdout_timeout = config.get("claude_stdout_timeout_sec", 600)
         hard_timeout = config.get("claude_hard_timeout_sec", 900)
+        hard_timeout_with_tools = config.get("claude_hard_timeout_with_tools_sec", 1800)
         stream_interval = config.get("stream_interval_sec", 2.0)
 
         _drain_deadline = None
@@ -1306,8 +1307,12 @@ def run_codex(prompt: str, project: str, _retry_count: int = 0) -> tuple[str, st
                     return (SHUTDOWN_INTERRUPTED, new_session_id, tool_lines, False)
 
             elapsed = time.time() - process_start_time
-            if elapsed > hard_timeout:
-                logger.error(f"[{bot_name}] Codex hard timeout ({hard_timeout}s, elapsed {elapsed:.0f}s) for {project}, killing")
+            # run_claude 와 동일 규칙: 도구를 한 번이라도 쓴 턴은 상한을 연장한다.
+            # (연장 분기가 없어 코덱스만 900초에 끊기던 것을 맞춤 — 2026-09-16)
+            effective_hard_timeout = hard_timeout_with_tools if tool_lines else hard_timeout
+            if elapsed > effective_hard_timeout:
+                label = "with-tools" if tool_lines else "no-tools"
+                logger.error(f"[{bot_name}] Codex hard timeout ({label}, {effective_hard_timeout}s, elapsed {elapsed:.0f}s) for {project}, killing")
                 proc.kill()
                 return (f"(Codex 실행 시간 초과 - {elapsed:.0f}초 경과)", sid, tool_lines, True)
 
