@@ -79,7 +79,7 @@ claude_daemon.py + scripts/daemon/
   "poll_interval_sec": 3,
   "stream_interval_sec": 2.0,
 
-  "claude_model": "claude-sonnet-4-5-20250514",
+  "claude_model": "claude-opus-5-5",
   "claude_effort": "medium",
   "claude_stdout_timeout_sec": 600,
   "claude_hard_timeout_sec": 900,

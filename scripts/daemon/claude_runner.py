@@ -289,8 +289,9 @@ def run_claude(
         cmd.append("--chrome")
 
     branch_model = branch_data.get("model") if is_branch and branch_data else None
-    # 기본 모델은 Opus 5. 브랜치/프로젝트/config에 지정이 없으면 opus-5로 폴백.
-    model = model_override or branch_model or proj_settings.get("model") or config.get("claude_model") or "claude-opus-5"
+    # 기본 모델은 Opus 5.5 (2026-09-26 Sean 결정, 전엔 Opus 5). 브랜치/프로젝트/config에 지정이 없으면 opus-5-5로 폴백.
+    # 웹 lib/modelCatalog.ts 의 DEFAULT_CLAUDE_MODEL 과 같은 값으로 유지할 것 (라벨 표시가 이 값을 따른다).
+    model = model_override or branch_model or proj_settings.get("model") or config.get("claude_model") or "claude-opus-5-5"
     # 엔진=claude인데 Codex(gpt-*) 모델 코드가 남아있으면 무시하고 Claude 기본값 사용.
     if model.startswith("gpt-"):
         model = config.get("claude_model") or "claude-sonnet-5"
