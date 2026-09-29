@@ -2930,6 +2930,11 @@ if (ptyModule && WebSocketServer) {
   console.warn("[terminal] WebSocket server disabled (node-pty/ws not available)");
 }
 
-server.listen(PORT, () => {
-  console.log(`PeterVoice Home Portal running on http://localhost:${PORT}`);
-});
+// PV_PORTAL_HOST: 바인딩 주소 (예: 127.0.0.1). 터널로만 노출하는 호스트는 루프백에 묶는다.
+// 비어 있으면 기존 동작(모든 인터페이스).
+const PORTAL_HOST = process.env.PV_PORTAL_HOST || "";
+const onListen = () => {
+  console.log(`PeterVoice Home Portal running on http://${PORTAL_HOST || "localhost"}:${PORT}`);
+};
+if (PORTAL_HOST) server.listen(PORT, PORTAL_HOST, onListen);
+else server.listen(PORT, onListen);
