@@ -15,7 +15,7 @@
 | **핸들** | 유저의 전역 주소. `@{username}` 형식. 내부 프로젝트 ID가 아니라 핸들로 주소를 지정한다. 디렉토리 비노출 — 핸들을 아는 사람만 신청 가능. |
 | **연결(친구)** | 두 유저(사람) 사이의 대칭 관계 1행. 상태: `pending` / `accepted` / `blocked`. 사람이 수락/거절/차단. |
 | **양방향 수신함** | 각 당사자가 **자기가 받을 프로젝트(inbox)와 스코프**를 독립적으로 정한다. 신청자(requester)와 수락자(addressee)가 각각. |
-| **스코프** | 수신 프로젝트, 자동실행(auto_execute), 첨부 허용, 하루 한도(rate_per_day). **받는 사람이 정한다.** |
+| **스코프** | 수신 프로젝트 **또는 수신 브랜치**(`branch:<내부 id>`, 2026-10-01), 자동실행(auto_execute), 첨부 허용, 하루 한도(rate_per_day). **받는 사람이 정한다.** |
 | **제안(proposal)** | 받는 쪽 `auto_execute=false`일 때, 메시지가 곧바로 실행되지 않고 "제안"으로 도착 → 사람이 승인해야 실행. |
 
 ## 데이터 모델
@@ -107,6 +107,7 @@ POST /api/relay/external
   인증: api_key 또는 세션.
   검사: (from,to) accepted 연결 + 발신 프로젝트가 내 것 + 레이트리밋 + 첨부 스코프.
   전달: 받는 사람 기준 inbox_project에 [외부 relay @{from} · {kind}] 태깅하여 주입.
+        inbox_project 가 `branch:<id>` 면 그 브랜치 세션(담당자)이 받는다(내부 relay 의 브랜치 키와 동일). 브랜치가 삭제·비활성이면 409.
         auto_execute=false면 "제안"(processed=true → 데몬 자동실행 안 함).
   응답: { success, message_id, to_project, proposal, remaining_today }
 
@@ -141,7 +142,8 @@ POST /api/relay/external/respond   { message_id, action: 'approve'|'reject' }
 |----------|------|------|
 | `AgentConnectionsPanel` | 설정 페이지(`/settings`) 카드 섹션 | 받은신청/보낸신청/연결됨/차단 관리, 내 핸들 표시, 내 수신 스코프 칩, "수신 설정 필요" 안내 |
 | `SendRequestModal` | 패널 내 모달 | 핸들+메모로 신청, 검증/에러 처리 |
-| `ScopeModal` | 수락/스코프 편집 모달 | 수신 프로젝트·자동실행·첨부·하루한도 설정 (수락 시 / "내 수신 설정") |
+| `ScopeModal` | 수락/스코프 편집 모달 | 수신 프로젝트·브랜치·자동실행·첨부·하루한도 설정 (수락 시 / "내 수신 설정") |
+| `InboxTargetSelect` | ScopeModal·SendRequestModal 공용 | 수신함 선택기 — 프로젝트(이름순) 그룹 아래 활성 브랜치(번호순), 8개 넘으면 검색칸. 값 규칙은 `lib/inbox-target.ts` (검증·표시 라벨도 여기) |
 | `MessageBubble`(확장) | 채팅 | `🌐 외부 · @핸들` violet 배지, 핸드오프 배지, **제안 승인/거절** 액션바, 승인됨/거절됨 상태 |
 
 ## 보안 / 남용 방지
