@@ -262,7 +262,16 @@ def main():
     L += ["## 6. 설정", ""]
     L += [f"- 공통 프롬프트(`_common`) {common_len:,}자" + (" — **2,000자 미만: 반복해서 설명하는 규칙·배경을 여기에 쌓으면 매 턴 자동으로 들어간다** (BP `memory-graphify`·`past-conversation-recall` 참고)" if common_len < 2000 else " — 규칙이 쌓여 있다")]
     if model_flags:
-        L.append("- 구형·소형 모델로 고정된 프로젝트: " + ", ".join(f"`{pid}`={m}{' (추론 강도 없음)' if not e else ''}" for pid, m, e in model_flags) + " → 주력 프로젝트는 **Opus 5.5 + 추론 강도 high** 권장 (프로젝트 설정 > 엔진 & 모델)")
+        # 모델별로 "같은 급의 최신"을 먼저 권한다 — Opus 를 일괄 권하면 Claude 주간 한도를 빨리 태운다 (2026-10-07 줄이 사례)
+        def model_rx(m, e):
+            if m.startswith("claude-sonnet-5") and not m.startswith("claude-sonnet-5-5"):
+                return "**Sonnet 5.5**(같은 급·최신, 한도 소모 비슷)로 올리기. 정확도가 중요한 주력 프로젝트만 Opus 5.5 + high"
+            if m.startswith("claude-opus-5") and not m.startswith("claude-opus-5-5"):
+                return "**Opus 5.5**로 올리기(같은 급·최신)"
+            if "haiku" in m:
+                return "가벼운 감시·분류 역할이면 유지, 주력 작업이면 Sonnet 5.5"
+            return "같은 급의 최신 모델로"
+        L.append("- 구형·소형 모델로 고정된 프로젝트: " + " · ".join(f"`{pid}`={m}{' (추론 강도 없음)' if not e else ''} → {model_rx(m, e)}" for pid, m, e in model_flags) + " (프로젝트 설정 > 엔진 & 모델). Claude 주간 한도 사용률이 50% 를 넘는 계정에는 Opus 상시 사용을 권하지 않는다")
     else:
         L.append("- 구형·소형 모델로 고정된 프로젝트 없음")
     if no_effort:
