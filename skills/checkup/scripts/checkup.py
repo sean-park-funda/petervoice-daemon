@@ -79,6 +79,8 @@ def main():
     neg_hits = []       # 축 1 후보
     aborts = []         # 중단·한도로 끝난 턴 (부정 결론이 아니라 시스템 종료 — 따로 센다)
     tool_text = []      # 도구 로그 전체 (축 2 사용 신호)
+    user_msgs = []      # (when, pid, bno, title, text) — BP 규칙 (전달 요청·경로 질문·현황 질문)
+    bot_msgs = []       # (when, pid, bno, title, text) — BP 규칙 (기억 없음 문구)
     msgs_total = 0
     for kind, key, pid, bno, title in items:
         data = api(f"/api/bot/conversation?project={urllib.parse.quote(key)}&limit=50", bearer=True)
@@ -96,6 +98,7 @@ def main():
                 st["user"] += 1
                 if t.startswith("[relay from:"): st["relay_in"] += 1
                 if t.startswith("[heartbeat]"): st["heartbeat"] += 1
+                elif not t.startswith("[relay from:") and not t.startswith("[카드 #"): user_msgs.append((m["created_at"][:16].replace("T", " "), pid, bno, title, t[:400]))
                 last_user = t
             elif m.get("type") == "bot":
                 if t.startswith("🔧"):
@@ -104,11 +107,14 @@ def main():
                     if t.startswith("🔧 Agent") or t.startswith("🔧 Task"): st["agent"] += 1
                     continue
                 st["bot"] += 1
+                bot_msgs.append((m["created_at"][:16].replace("T", " "), pid, bno, title, t[:600]))
                 if "⏹ 작업이 중단되었습니다" in t or t.startswith("⏸") or t.startswith("(응답 없음)"):
                     st["aborted"] += 1
                     aborts.append({"when": m["created_at"][:16].replace("T", " "), "pid": pid, "bno": bno, "title": title, "kind": ("한도" if t.startswith("⏸") else "중단")})
                     continue
-                if NEG.search(t[-300:]) and last_user and not last_user.startswith("[heartbeat]") and not last_user.startswith("[relay from:"):
+                last_para = t.strip().split("\n\n")[-1]
+                caveat = ("확인하지 못한 점" in last_para) or last_para.lstrip().startswith("- **확인")
+                if NEG.search(last_para[-300:]) and not caveat and last_user and not last_user.startswith("[heartbeat]") and not last_user.startswith("[relay from:"):
                     st["neg"] += 1
                     neg_hits.append({"when": m["created_at"][:16].replace("T", " "), "pid": pid, "bno": bno, "title": title,
                                      "ask": excerpt(last_user, 70), "said": excerpt(t[-300:], 110)})
@@ -160,6 +166,63 @@ def main():
     applied = {k for k, v in bp_status.items() if v.get("status") == "applied"}
     bp_not = [c for c in bp_cards if isinstance(c, dict) and c.get("id") and c["id"] not in applied]
 
+    # ── BP 처방: 카탈로그(detect)가 가리키는 신호를 수집 데이터에서 찾는다 (2026-10-07 Sean 결정 — BP = 검진 규칙) ──
+    DEFAULT_DETECT = {  # 라이브 manifest 에 detect 가 없을 때(구버전) 폴백 — 내용은 manifest 와 같게 유지
+        "agent-relay": ("forward_without_relay", "담당자 간 릴레이로 한 번에 넘기게 한다", "이 결과를 마케팅 담당자에게 전달해줘"),
+        "past-conversation-recall": ("no_memory_phrases", "세션 리셋 시 이전 대화를 조회해 복구하는 규칙 한 줄", "아까 얘기한 거 이어서 해줘"),
+        "delegate-to-experts": ("solo_projects", "주제별 담당자(브랜치)로 나누고 릴레이로 잇는다", "이 프로젝트를 영업 담당자와 회계 담당자로 나눠줘"),
+        "vp-task-management": ("many_active_no_coordinator", "COO(부사장) 담당자를 만들어 전 프로젝트 현황을 맡긴다", "부사장 담당자를 만들어서 전 프로젝트 현황을 관리하게 해줘"),
+        "temp-share-hub": ("many_published_pages", "고정 temp 허브의 하위 경로로 모은다", "공유 페이지는 temp 허브 아래에 모아줘"),
+        "browser-handoff": ("login_wall_giveup", "원격 로그인 인계로 유저가 한 번 로그인하면 에이전트가 이어받는다", "로그인은 내가 할 테니 화면 넘겨줘"),
+        "route-evidence-based": ("route_questions_without_tool", "route-search 스킬로 실시간 경로 데이터로 답한다", "양양 가는 길에 점심 먹을 데 찾아줘"),
+        "memory-graphify": (None, "지식 그래프로 과거 대화·문서를 검색하게 한다", "지난번에 정한 가격 기준 다시 찾아줘"),
+        "research-cross-validation": (None, "교차검증 규칙 한 줄 + 같은 주제 재조사로 전후 비교", "이 업체를 실사용 후기 기준으로 다시 검증해줘"),
+    }
+    cat = {}
+    for c in bp_cards:
+        if not isinstance(c, dict) or not c.get("id"): continue
+        d = c.get("detect") or {}
+        auto, presc, ask = DEFAULT_DETECT.get(c["id"], (None, "", ""))
+        cat[c["id"]] = {"title": c.get("title", c["id"]), "auto": d.get("auto", auto), "prescription": d.get("prescription") or presc, "ask": d.get("ask") or ask, "signal": d.get("signal", "")}
+    active_roots = [pid for pid, r in root_msgs.items() if r["msgs"] >= 6 and pid in pmap]
+    coord = re.compile(r"(coo|vp|부사장|비서|secretary|manager|총괄)", re.I)
+    def rule(key):
+        """→ (count, [발췌…]) — 발췌는 근거 요건(최대 2개)"""
+        if key == "solo_projects":
+            return len(solo), [f"[{pid}]({link(pid)}) 30일 {r['msgs']}{'+' if r['capped'] else ''}턴 · 브랜치 0" for pid, r in solo[:2]]
+        if key == "many_active_no_coordinator":
+            has = any(coord.search(pid) or coord.search(pmap[pid].get("name") or "") for pid in active_roots)
+            return (len(active_roots) if (len(active_roots) >= 6 and not has) else 0), [f"활성 담당자 {len(active_roots)}개, 조정 역할 프로젝트 없음"]
+        if key == "login_wall_giveup":
+            rx = re.compile(r"로그인.{0,24}(필요|직접|해 ?주|하셔야|할 수 없|진행할 수 없|막혀|인증)")
+            hits = [h for h in neg_hits if rx.search(h["said"])]
+            return len(hits), [f"{h['when']} [{h['title'][:18]}]({link(h['pid'], h['bno'])}) {h['said'][:90]}" for h in hits[:2]]
+        if key == "no_memory_phrases":
+            rx = re.compile(r"(이전 대화를 확인할 수 없|이전 대화 기록이 없|기억이 없|대화 기록이 없어|세션이 새로 시작|이전 세션의 내용은)")
+            hits = [b for b in bot_msgs if rx.search(b[4])]
+            return len(hits), [f"{b[0]} [{b[3][:18]}]({link(b[1], b[2])}) {excerpt(b[4], 90)}" for b in hits[:2]]
+        if key == "forward_without_relay":
+            rx = re.compile(r"(전달해 ?줘|전해 ?줘|공유해 ?줘|넘겨 ?줘)")
+            hits = [u for u in user_msgs if rx.search(u[4])]
+            return (len(hits) if relay_total == 0 and len(hits) >= 2 else 0), [f"{u[0]} [{u[3][:18]}]({link(u[1], u[2])}) {excerpt(u[4], 90)}" for u in hits[:2]]
+        if key == "many_published_pages":
+            n = sum(1 for t in tool_text if re.search(r"(files/upload|local-publish|file-share|publish\.py)", t))
+            return (n if n >= 5 else 0), [f"업로드·퍼블리싱 도구 호출 {n}회 (30일)"]
+        if key == "route_questions_without_tool":
+            rx = re.compile(r"(맛집|휴게소|주유소|가는 길에|경로로|몇 시쯤 어디)")
+            hits = [u for u in user_msgs if rx.search(u[4])]
+            used = any("route" in t.lower() for t in tool_text)
+            return (len(hits) if hits and not used else 0), [f"{u[0]} [{u[3][:18]}]({link(u[1], u[2])}) {excerpt(u[4], 90)}" for u in hits[:2]]
+        return 0, []
+    bp_findings = []
+    for bid, c in cat.items():
+        if not c["auto"]: continue
+        n, ev = rule(c["auto"])
+        if n > 0:
+            bp_findings.append({"id": bid, "title": c["title"], "count": n, "evidence": ev, "prescription": c["prescription"], "ask": c["ask"], "applied": bid in applied})
+    bp_findings.sort(key=lambda f: -f["count"])
+    judged = [bid for bid, c in cat.items() if not c["auto"]]
+
     # ── 보고서 초안 ──
     L = [f"# 사용 검진 보고서 — {today} (최근 {a.days}일)", "",
          "_검진 스킬 1단계 자동 초안. 담당자가 판단을 덧붙인 뒤 유저에게는 요약 5줄과 결정 1~3개만 보고합니다. 대화 원문은 120자 발췌만 담았습니다._", "",
@@ -204,6 +267,18 @@ def main():
     if no_effort:
         L.append("- 대화량 상위 프로젝트 중 추론 강도 미지정: " + ", ".join(f"`{p}`" for p in no_effort))
     L.append(f"- 베스트 프랙티스 미적용 {len(bp_not)}/{len(bp_cards)}장: " + ", ".join(f"`{c['id']}`" for c in bp_not[:10]) + (" …" if len(bp_not) > 10 else "") + " (설정 > Best Practice, 또는 `GET /api/bp/doc?id=`)")
+    L += ["## BP 처방 — 신호가 보인 베스트 프랙티스 (상한 3)", ""]
+    if bp_findings:
+        for i, f in enumerate(bp_findings[:3], 1):
+            L += [f"**처방 {i}. {f['title']}**" + (" _(카드는 적용됨인데 신호가 남아 있음 — 쓰이지 않는다)_" if f["applied"] else ""),
+                  f"- 신호 {f['count']}건: " + " · ".join(f["evidence"]),
+                  f"- 이렇게: {f['prescription']}",
+                  f"- 유저 예시 요청: 「{f['ask']}」 · 적용하려면 「처방 {i} 적용해줘」 (카드 Setup: `GET /api/bp/doc?id={f['id']}`)", ""]
+        if len(bp_findings) > 3:
+            L += [f"_상한 밖 후보 {len(bp_findings) - 3}개: " + ", ".join(f"{f['title']}({f['count']})" for f in bp_findings[3:]) + " — 다음 달에 다시 본다._", ""]
+    else:
+        L += ["자동 탐지 신호 없음.", ""]
+    L += ["담당자 판단 규칙(자동 탐지 없음): " + ", ".join(cat[b]["title"] for b in judged if b in cat) + " — 1축 발췌와 조사형 대화를 열어 근거 2개 이상일 때만 처방에 더한다.", ""]
     L += ["", "## 부록 — 훑은 범위",
           f"- 프로젝트 {len(projects)}개 + 활성 브랜치 {len(branches)}개 중 {a.days}일 내 대화가 있는 {len(stats)}곳, 메시지 {msgs_total:,}건(항목당 최근 50건까지 — `+` 표시는 그 이상)",
           f"- 조회 실패 {len(ERRORS)}건" + (": " + "; ".join(ERRORS[:5]) if ERRORS else "") + " — 실패는 0건이 아니다",
@@ -212,7 +287,7 @@ def main():
     summary = {"out": str(out), "items_scanned": len(stats), "messages": msgs_total, "neg_hits": len(neg_hits), "neg_answered": len(answered), "aborted_turns": len(aborts),
                "unused_key_skills": unused_key, "services_connected_unused": [s for s, c, u in svc_rows if c and u == 0],
                "solo_projects": [p for p, _ in solo[:8]], "model_flags": model_flags, "common_prompt_len": common_len,
-               "bp_not_applied": [c["id"] for c in bp_not], "errors": len(ERRORS)}
+               "bp_not_applied": [c["id"] for c in bp_not], "bp_findings": [(f["id"], f["count"]) for f in bp_findings], "errors": len(ERRORS)}
     print(json.dumps(summary, ensure_ascii=False))
 
 if __name__ == "__main__":
