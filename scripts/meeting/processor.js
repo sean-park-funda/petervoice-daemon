@@ -60,6 +60,17 @@ async function triggerMinutes(config, meeting, transcriptDocRelPath, opts = {}) 
   const minutesDoc = meeting.minutes_doc || minutesDocFor(transcriptDocRelPath);
   const names = Object.values(meeting.speaker_map || {}).filter(Boolean);
   const attendees = names.length ? names.join(", ") : "미확정 (화자1/2/3 표기)";
+  // Realtime-caption transcripts (live fast path / async fallback) have rough
+  // diarization and typos. Names are no longer entered after the meeting, so
+  // the bot infers them only from clear in-conversation evidence.
+  const rough = meeting.source === "live" || meeting.phase === "fallback";
+  const nameGuide = names.length
+    ? `참석자 이름은 위 목록만 사용하고 `
+    : rough
+    ? `화자 번호(화자1/2…)는 실시간 자동 구분이라 섞여 있을 수 있으니 문장마다 발언자를 따지지 말고 ` +
+      `내용 중심으로 정리하세요. 대화 중 이름이 불리는 등 근거가 분명할 때만 실명을 쓰고(불확실하면 화자N 또는 생략), ` +
+      `실시간 자막의 오탈자·끊김은 문맥으로 보정하되 `
+    : `대화 중 이름이 불리는 등 근거가 분명할 때만 화자N 대신 실명을 쓰고(불확실하면 화자N 유지) `;
 
   const text = opts.upgraded
     ? (
@@ -82,14 +93,16 @@ async function triggerMinutes(config, meeting, transcriptDocRelPath, opts = {}) 
     )
     : (
       `[회의록 정리] meeting_id=${meeting.id}\n` +
-      `회의 전사가 완료됐습니다.\n` +
+      (meeting.source === "live"
+        ? `회의가 끝났습니다. 회의 중 실시간 자막으로 받아 적은 전사입니다.\n`
+        : `회의 전사가 완료됐습니다.\n`) +
       `원본 전사: ${transcriptDocRelPath}\n` +
       `참석자: ${attendees}\n` +
       `회의록 파일: ${minutesDoc}\n\n` +
       `이 전사를 읽고 정리된 회의록을 **정확히 위 회의록 파일 경로에** 작성해주세요. ` +
       `이미 그 파일이 있으면 새로 만들지 말고 덮어써 갱신하세요. ` +
       `구성: 제목, 일시, 참석자, 핵심 논의, 결정사항, 액션아이템(담당/기한). ` +
-      `장황하지 않게, 회의에서 실제 오간 내용 중심으로. 참석자 이름은 위 목록만 사용하고 ` +
+      `장황하지 않게, 회의에서 실제 오간 내용 중심으로. ${nameGuide}` +
       `전사에 없는 내용을 지어내지 마세요.`
     );
 
@@ -113,34 +126,6 @@ async function triggerMinutes(config, meeting, transcriptDocRelPath, opts = {}) 
     return res.ok;
   } catch (e) {
     console.warn(`[meeting] ${meeting.id} minutes trigger failed: ${e.message || e}`);
-    return false;
-  }
-}
-
-/**
- * Post a bot-side notice straight into the meeting session's chat via
- * /api/bot/reply — a plain bot message, so the agent is NOT invoked (no
- * Claude turn, no cost). Fills the silent gap between meeting end and the
- * label-or-grace-period-delayed minutes.
- */
-async function postChatNotice(config, project, text) {
-  const apiUrl = config.api_url || "https://www.peter-voice.site";
-  const apiKey = config.api_key;
-  if (!apiKey || !project) return false;
-  try {
-    const res = await fetch(`${apiUrl}/api/bot/reply`, {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${apiKey}`,
-        "X-Api-Key": apiKey,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ project, text, subtype: "meeting_notice" }),
-    });
-    if (!res.ok) console.warn(`[meeting] chat notice failed: HTTP ${res.status} (${project})`);
-    return res.ok;
-  } catch (e) {
-    console.warn(`[meeting] chat notice failed: ${e.message || e} (${project})`);
     return false;
   }
 }
@@ -229,27 +214,16 @@ async function processMeeting({ configDir, config, meetingId, projectDocsDir, lo
     // Audio is no longer needed once transcribed → delete to cap local disk use.
     try { store.deleteAudio(configDir, meetingId); } catch { /* best-effort */ }
 
-    if (meta.minutes_requested_at) {
-      // Minutes already went out based on the rough live transcript (fallback).
-      // Tell the bot to refresh them from the precise transcript.
-      const triggered = await triggerMinutes(config || {}, updated, transcriptRel, { upgraded: true });
-      store.updateMeta(configDir, meetingId, {
-        status: triggered ? "minutes_pending" : "transcribed",
-        ...(triggered ? { minutes_requested_at: new Date().toISOString() } : {}),
-      });
-      out(`[meeting] ${meetingId} precise-upgrade minutes ${triggered ? "triggered" : "NOT triggered"}`);
-    } else {
-      // NOTE: minutes are NOT triggered here. The user labels speakers first, and
-      // labelMeeting (or the auto-minutes checker after the grace period) triggers
-      // minutes with the resolved names — otherwise the bot guesses names.
-      out(`[meeting] ${meetingId} awaiting speaker labels before minutes`);
-      const durMin = Math.max(1, Math.round((updated.duration_sec || meta.duration_sec || 0) / 60));
-      await postChatNotice(config || {}, updated.project,
-        `🎙️ 회의 전사가 저장되었습니다 (약 ${durMin}분, 화자 ${speakers.length}명).\n` +
-        `- 전체 대화 기록: ${transcriptRel} (문서 탭에서 확인)\n` +
-        `- 회의 화면에서 화자 이름을 입력하면 실명으로 회의록을 정리합니다.\n` +
-        `- 이름 입력이 없으면 약 ${AUTO_MINUTES_AFTER_MIN}분 후 화자1/화자2 표기로 자동 정리됩니다.`);
-    }
+    // Minutes go out right away (2026-10-07: the post-meeting speaker-name step
+    // was removed — names are inferred from context). A meeting whose minutes
+    // were already written from the rough live transcript gets them refreshed.
+    const upgraded = !!meta.minutes_requested_at;
+    const triggered = await triggerMinutes(config || {}, updated, transcriptRel, { upgraded });
+    store.updateMeta(configDir, meetingId, {
+      status: triggered ? "minutes_pending" : "transcribed",
+      ...(triggered ? { minutes_requested_at: new Date().toISOString() } : {}),
+    });
+    out(`[meeting] ${meetingId} ${upgraded ? "precise-upgrade " : ""}minutes ${triggered ? "triggered" : "NOT triggered (auto-retry later)"}`);
   } catch (e) {
     // Fallback: if async diarization failed but we captured a live transcript,
     // save that so the meeting isn't lost.
@@ -264,6 +238,22 @@ async function processMeeting({ configDir, config, meetingId, projectDocsDir, lo
     });
     out(`[meeting] ${meetingId} error: ${e.message || e}`);
   }
+}
+
+/**
+ * Write a realtime-caption transcript doc to <docs>/meetings/ and return its
+ * docs-relative path ("docs/meetings/…"). name: file name after the stamp.
+ */
+function writeRoughTranscriptDoc(projectDocsDir, meta, name, md) {
+  const outDir = path.join(projectDocsDir, "meetings");
+  fs.mkdirSync(outDir, { recursive: true });
+  const p = (n) => String(n).padStart(2, "0");
+  const d = new Date(meta.created_at || Date.now());
+  const stamp = `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}`;
+  const docPath = path.join(outDir, `${stamp}-${name}`);
+  fs.writeFileSync(docPath, md);
+  const rel = docPath.split("/docs/").pop();
+  return rel ? `docs/${rel}` : docPath;
 }
 
 /**
@@ -282,15 +272,7 @@ async function fallbackToLiveTranscript({ configDir, config, meta, projectDocsDi
       `- 일시: ${dateStr}\n` +
       `> ⚠️ 정밀 화자분리(async)에 실패하여 **실시간 전사(러프)**로 대체했습니다.\n` +
       `> 사유: ${reason}\n\n## 전사 (실시간)\n\n${fallback}\n`;
-    const outDir = path.join(projectDocsDir, "meetings");
-    fs.mkdirSync(outDir, { recursive: true });
-    const p = (n) => String(n).padStart(2, "0");
-    const d = new Date(meta.created_at || Date.now());
-    const stamp = `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}`;
-    const docPath = path.join(outDir, `${stamp}-fallback-transcript.md`);
-    fs.writeFileSync(docPath, md);
-    const rel = docPath.split("/docs/").pop();
-    const fallbackRel = rel ? `docs/${rel}` : docPath;
+    const fallbackRel = writeRoughTranscriptDoc(projectDocsDir, meta, "fallback-transcript.md", md);
     const updated = store.updateMeta(configDir, meetingId, {
       status: "transcribed", phase: "fallback",
       transcript_doc: fallbackRel,
@@ -318,6 +300,49 @@ async function fallbackToLiveTranscript({ configDir, config, meta, projectDocsDi
     out(`[meeting] ${meetingId} fallback write failed: ${e2.message}`);
     return false;
   }
+}
+
+/**
+ * Fast path (2026-10-07): the browser already transcribed the meeting live, so
+ * on stop it sends only that text — no audio upload, no async diarization, no
+ * speaker labeling. Write the transcript doc and ask the bot for minutes now.
+ * meta.live_transcript holds the text; returns the updated meta.
+ */
+async function processLiveMeeting({ configDir, config, meetingId, projectDocsDir, log }) {
+  const out = log || (() => {});
+  const meta = store.readMeta(configDir, meetingId);
+  if (!meta) throw new Error("meeting not found");
+  const transcript = (meta.live_transcript || "").trim();
+  if (!transcript || !projectDocsDir) throw new Error("전사 또는 docs 경로 없음");
+
+  const dateStr = new Date(meta.created_at || Date.now()).toLocaleString("ko-KR");
+  const durMin = meta.duration_sec ? Math.max(1, Math.round(meta.duration_sec / 60)) : null;
+  const md =
+    `# ${meta.title || "회의 전사"}\n\n` +
+    `- 일시: ${dateStr}\n` +
+    (durMin ? `- 길이: 약 ${durMin}분\n` : "") +
+    `\n> 회의 중 실시간 자막으로 받아 적은 전사입니다. 화자 번호는 자동 구분이라 섞여 있을 수 있습니다.\n\n` +
+    // one paragraph per utterance (single newlines collapse into one block when rendered)
+    `## 전사\n\n${transcript.split("\n").filter((l) => l.trim()).join("\n\n")}\n`;
+  const slug = String(meta.title || "meeting").trim()
+    .replace(/[\\/:*?"<>|]+/g, "").replace(/\s+/g, "-").slice(0, 40) || "meeting";
+  const transcriptRel = writeRoughTranscriptDoc(projectDocsDir, meta, `${slug}-transcript.md`, md);
+
+  const updated = store.updateMeta(configDir, meetingId, {
+    status: "transcribed", phase: "live", source: "live",
+    transcript_doc: transcriptRel,
+    minutes_doc: meta.minutes_doc || minutesDocFor(transcriptRel),
+    docs_dir: projectDocsDir,
+  });
+  // A sweep redo after the trigger already went out must not ask twice.
+  const already = !!meta.minutes_requested_at;
+  const triggered = already ? false : await triggerMinutes(config || {}, updated, transcriptRel);
+  const final = store.updateMeta(configDir, meetingId, {
+    status: (triggered || already) ? "minutes_pending" : "transcribed",
+    ...(triggered ? { minutes_requested_at: new Date().toISOString() } : {}),
+  });
+  out(`[meeting] ${meetingId} live transcript → ${transcriptRel}, minutes ${already ? "already requested" : triggered ? "triggered" : "NOT triggered (auto-retry later)"}`);
+  return final;
 }
 
 // A meeting stuck in "processing" whose meta hasn't been touched for this long
@@ -354,7 +379,14 @@ async function sweepStuckMeetings({ configDir, config, log }) {
     if (meta.status === "processing") {
       const touched = Date.parse(meta.updated_at || meta.created_at || "") || 0;
       if (touched > cutoff) continue; // still fresh — likely actively processing
-      if (hasAudio && meta.docs_dir) {
+      if (meta.source === "live" && meta.docs_dir) {
+        out(`[meeting] sweep: ${id} live meeting stuck — redoing live minutes`);
+        await processLiveMeeting({ configDir, config, meetingId: id, projectDocsDir: meta.docs_dir, log: out })
+          .catch((e) => {
+            out(`[meeting] sweep live retry failed: ${e.message}`);
+            store.updateMeta(configDir, id, { status: "failed", error: String(e.message || e) });
+          });
+      } else if (hasAudio && meta.docs_dir) {
         out(`[meeting] sweep: ${id} stuck in processing — retrying transcription`);
         await processMeeting({ configDir, config, meetingId: id, projectDocsDir: meta.docs_dir, log: out })
           .catch((e) => out(`[meeting] sweep retry failed: ${e.message}`));
@@ -393,7 +425,8 @@ async function sweepStuckMeetings({ configDir, config, log }) {
   }
 }
 
-// Grace period for manual speaker labeling before minutes are auto-triggered.
+// Minutes are now triggered right away; this only retries a failed trigger
+// (and covers meetings transcribed by a pre-2026-10-07 build awaiting labels).
 const AUTO_MINUTES_AFTER_MIN = 10;
 
 /**
@@ -410,7 +443,7 @@ async function autoTriggerPendingMinutes({ configDir, config, log }) {
   try { metas = store.listMeetings(configDir); } catch { return; }
   const cutoff = Date.now() - AUTO_MINUTES_AFTER_MIN * 60 * 1000;
   for (const meta of metas) {
-    if (meta.status !== "transcribed" || meta.phase !== "done") continue;
+    if (meta.status !== "transcribed" || !["done", "live"].includes(meta.phase)) continue;
     if (meta.minutes_requested_at || !meta.transcript_doc) continue;
     const t = Date.parse(meta.updated_at || meta.created_at || "") || 0;
     if (t > cutoff) continue; // still within the labeling grace period
@@ -468,4 +501,4 @@ async function labelMeeting({ configDir, config, meetingId, labels }) {
   return { speaker_map: speakerMap, rewritten: !!rewritten, minutes_triggered: triggered };
 }
 
-module.exports = { processMeeting, triggerMinutes, labelMeeting, sweepStuckMeetings, autoTriggerPendingMinutes };
+module.exports = { processMeeting, processLiveMeeting, triggerMinutes, labelMeeting, sweepStuckMeetings, autoTriggerPendingMinutes };

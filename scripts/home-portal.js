@@ -24,11 +24,11 @@ process.on("unhandledRejection", (e) => {
 });
 
 // ─── Meeting mode (modular) ──────────────────────────
-let meetingStore = null, processMeeting = null, meetingLabel = null, meetingSweep = null, meetingAutoMinutes = null;
+let meetingStore = null, processMeeting = null, processLiveMeeting = null, meetingLabel = null, meetingSweep = null, meetingAutoMinutes = null;
 try {
   const MDIR = path.join(path.dirname(__filename), "meeting");
   meetingStore = require(path.join(MDIR, "meeting-store"));
-  ({ processMeeting, labelMeeting: meetingLabel, sweepStuckMeetings: meetingSweep,
+  ({ processMeeting, processLiveMeeting, labelMeeting: meetingLabel, sweepStuckMeetings: meetingSweep,
     autoTriggerPendingMinutes: meetingAutoMinutes } = require(path.join(MDIR, "processor")));
 } catch (e) {
   console.warn("[meeting] module not available:", e.message);
@@ -2317,6 +2317,53 @@ const server = http.createServer((req, res) => {
 
       json({ ok: true, meeting: meta });
     }).catch(e => json({ error: "업로드 실패: " + e.message }, 400));
+  }
+  // POST /api/meetings/live — 실시간 자막 전사로 바로 회의록 (오디오 업로드·화자 라벨 없음, 2026-10-07).
+  // body: { meetingId, project, dir, title, duration, liveTranscript }. 클라우드: dir 필수
+  else if (pathname === "/api/meetings/live" && req.method === "POST") {
+    if (!meetingStore || !processLiveMeeting) return json({ error: "meeting 모듈 없음" }, 503);
+    readBody().then(async (body) => {
+      const meetingId = String(body.meetingId || "").replace(/[^a-zA-Z0-9_-]/g, "");
+      const transcript = String(body.liveTranscript || "").trim();
+      if (!meetingId || !transcript) return json({ error: "meetingId, liveTranscript 필요" }, 400);
+      const ctx = await meetingCtx(body.dir || url.searchParams.get("dir"));
+      if (ctx.error) return json({ error: ctx.error }, 403);
+      if (!ctx.docsDir) return json({ error: "dir 필요 (문서 저장 경로)" }, 400);
+      const slimMeta = (m) => { const { segments, live_transcript, ...rest } = m; return rest; };
+      // 멱등: 응답 유실 후 재전송이 회의록 요청을 두 번 보내지 않게
+      const existing = meetingStore.readMeta(ctx.configDir, meetingId);
+      if (existing) return json({ ok: true, meeting: slimMeta(existing), already: true });
+      const now = new Date().toISOString();
+      meetingStore.writeMeta(ctx.configDir, meetingId, {
+        id: meetingId,
+        project: body.project || null,
+        title: body.title || "제목 없는 회의",
+        duration_sec: parseInt(body.duration || "0") || null,
+        live_transcript: transcript,
+        source: "live",
+        docs_dir: ctx.docsDir,
+        ...(ctx.uid ? { cloud_uid: ctx.uid } : {}),
+        status: "processing",
+        phase: "live",
+        created_at: now,
+        updated_at: now,
+      });
+      try {
+        const meta = await processLiveMeeting({
+          configDir: ctx.configDir, config: ctx.config, meetingId,
+          projectDocsDir: ctx.docsDir, log: (m) => console.log(m),
+        });
+        json({ ok: true, meeting: slimMeta(meta) });
+      } catch (e) {
+        // 브라우저가 채팅 백업으로 넘어가므로 여기서 재시도하지 않는다(회의록 중복 방지).
+        // meta 는 지운다 — 남겨두면 같은 meetingId 의 오디오 재업로드가 멱등 분기(already)에
+        // 걸려 녹음이 저장되지 않는다. 포탈이 요청 도중 죽어 processing 으로 남은 경우만
+        // stuck sweep 이 live 경로로 재시도.
+        console.error("[meeting] live process error:", e);
+        try { fs.unlinkSync(meetingStore.metaPath(ctx.configDir, meetingId)); } catch {}
+        json({ error: "회의록 요청 실패: " + (e.message || e) }, 500);
+      }
+    }).catch((e) => json({ error: e.message }, 400));
   }
   // GET /api/meetings/list — 회의 목록(메타). 큰 필드 제외.
   // 클라우드: ?dir=(본인 워크스페이스) 필수 → 그 유저의 회의만 (크로스 테넌트 차단)
