@@ -194,7 +194,8 @@ def main():
             has = any(coord.search(pid) or coord.search(pmap[pid].get("name") or "") for pid in active_roots)
             return (len(active_roots) if (len(active_roots) >= 6 and not has) else 0), [f"활성 담당자 {len(active_roots)}개, 조정 역할 프로젝트 없음"]
         if key == "login_wall_giveup":
-            rx = re.compile(r"로그인.{0,24}(필요|직접|해 ?주|하셔야|할 수 없|진행할 수 없|막혀|인증)")
+            # "로그인 계정을 확인했습니다" 같은 보고는 제외 — 로그인이 "필요/막힘/직접 해 달라" 로 이어질 때만
+            rx = re.compile(r"로그인[^.\n]{0,16}(필요합니다|필요해|필요하|직접 (해|로그인)|해 ?주세요|하셔야|할 수 없|진행할 수 없|막혀|막힙)")
             hits = [h for h in neg_hits if rx.search(h["said"])]
             return len(hits), [f"{h['when']} [{h['title'][:18]}]({link(h['pid'], h['bno'])}) {h['said'][:90]}" for h in hits[:2]]
         if key == "no_memory_phrases":
