@@ -318,6 +318,9 @@ class Worker(threading.Thread):
 
         # 팀원이 보낸 메시지면 맨 위에 발신자 표시 (명령어 처리 뒤라 /명령 매칭을 깨지 않고,
         # 댓글 블록 뒤라 머리말이 "댓글:" 안에 파묻히지 않는다). codex·team 경로도 이 text 를 쓴다.
+        # 검진 키워드(「검진 시작」·/검진 등)는 데몬이 고정 지시로 바꾼다 — 모델의 스킬 선택에 맡기지 않는다 (2026-10-07)
+        from daemon.checkup_trigger import expand_checkup_trigger
+        text = expand_checkup_trigger(text) or text
         text = with_sender(msg, text)
 
         # Append file paths to prompt
