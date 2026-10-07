@@ -11,7 +11,7 @@ from pathlib import Path
 
 # 결론부(메시지 끝 300자)에서만 본다 — 본문 중간의 설명("…안 됩니다 라고 답하기 전에")은 결론이 아니다
 NEG = re.compile(r"(불가능합니다|할 수 없습니다|할 수 없었습니다|할 수가 없|못 찾았습니다|찾지 못했습니다|찾을 수 없었습니다|지원하지 않습니다|지원되지 않습니다|안 됩니다|되지 않습니다|직접 해 ?주(세요|셔야)|직접 (진행|하셔야|해 주셔야)|수동으로 (해|진행)|제가 할 수 없|처리할 수 없)")
-OLD_MODEL = re.compile(r"(^claude-sonnet-5$|claude-sonnet-5-20\d{6}|haiku|^claude-opus-5$|claude-(opus|sonnet)-4)")
+OLD_MODEL = re.compile(r"(^claude-sonnet-5$|claude-sonnet-5-20\d{6}|claude-haiku-[34]|^claude-opus-5$|claude-(opus|sonnet)-4)")  # 별칭 haiku 는 Haiku 5.5 를 가리킨다(2026-10-08) — 구형 아님
 KEY_SKILLS = ["gmail", "google-calendar", "google-drive", "google-sheets", "google-docs", "slack", "notion-api", "agent-browser",
               "browser-handoff", "commons-lookup", "pv-api", "file-share", "local-publish", "graphify"]
 SERVICE_SIGNALS = {  # 연결 신호(환경변수) → 사용 신호(도구 로그에 나타나는 문자열)
@@ -268,8 +268,8 @@ def main():
                 return "**Sonnet 5.5**(같은 급·최신, 한도 소모 비슷)로 올리기. 정확도가 중요한 주력 프로젝트만 Opus 5.5 + high"
             if m.startswith("claude-opus-5") and not m.startswith("claude-opus-5-5"):
                 return "**Opus 5.5**로 올리기(같은 급·최신)"
-            if "haiku" in m:
-                return "가벼운 감시·분류 역할이면 유지, 주력 작업이면 Sonnet 5.5"
+            if m.startswith("claude-haiku-"):
+                return "**Haiku 5.5**(같은 급·최신, 입·출력 단가 1/10)로 올리기. 주력 작업이면 Sonnet 5.5"
             return "같은 급의 최신 모델로"
         L.append("- 구형·소형 모델로 고정된 프로젝트: " + " · ".join(f"`{pid}`={m}{' (추론 강도 없음)' if not e else ''} → {model_rx(m, e)}" for pid, m, e in model_flags) + " (프로젝트 설정 > 엔진 & 모델). Claude 주간 한도 사용률이 50% 를 넘는 계정에는 Opus 상시 사용을 권하지 않는다")
     else:
