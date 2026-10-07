@@ -184,6 +184,12 @@ def build_claude_env(config: dict, account_config_dir: str | None = None) -> dic
         env["CLAUDE_CONFIG_DIR"] = os.path.expanduser(account_config_dir)
     # 이 세션이 실제로 쓸 설정 폴더에 AGENTS.md 폴백 차단을 보장 (폴더당 1회, 실패 무해)
     ensure_agents_md_ignored(env.get("CLAUDE_CONFIG_DIR"))
+    # claude.ai 커넥터(Gmail·Drive·Docs·Notion·Slack MCP) 자동 로딩 끄기 — 2026-10-07 Sean 승인(vibement #1 이관, KI-027).
+    # claude -p 비대화형에선 OAuth 가 안 돼 매 세션 "인증하라" 리마인더만 생기고 담당자가 유저에게 그대로 옮겼다.
+    # 실업무 연동은 피터보이스 스킬(env 토큰 주입)이 맡는다. Claude Code 2.1.292 공식 스위치.
+    # 되돌리려면 config.json 에 "claudeai_connectors": true (대화형 CLI 는 이 env 를 안 거치므로 영향 없음).
+    if not config.get("claudeai_connectors", False):
+        env["ENABLE_CLAUDEAI_MCP_SERVERS"] = "false"
     return env
 
 

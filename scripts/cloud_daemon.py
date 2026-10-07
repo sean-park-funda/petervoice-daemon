@@ -492,6 +492,8 @@ def claude_env(user_id: int) -> dict:
     """비격리 모드(로컬)용 전체 env."""
     env = os.environ.copy()
     env.update(isolated_env_overrides(user_id))
+    if not config.get("claudeai_connectors", False):
+        env["ENABLE_CLAUDEAI_MCP_SERVERS"] = "false"   # claude.ai 커넥터 끄기 (2026-10-07)
     return env
 
 
@@ -1291,6 +1293,9 @@ def run_claude_turn(user_id: int, project: str, prompt: str) -> tuple[str, str]:
     secrets["PV_PROJECT"] = project
     # 비컨테이너 실행: chromium 이 호스트에서 직접 돌므로 포탈이 유도하는 유저별 포트를 써야 한다
     secrets["PV_CDP_PORT"] = str(ctr.CDP_PORT_BASE + user_id)
+    # claude.ai 커넥터 자동 로딩 끄기 (limits.build_claude_env 와 같은 이유, 2026-10-07) — 컨테이너 env 파일·비격리 env 둘 다 secrets 를 거친다
+    if not config.get("claudeai_connectors", False):
+        secrets.setdefault("ENABLE_CLAUDEAI_MCP_SERVERS", "false")
     env = {**isolated_env_overrides(user_id), **secrets}
 
     if not isolation_enabled():
