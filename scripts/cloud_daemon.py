@@ -583,13 +583,13 @@ def _container_system_prompt(user_id: int | None = None) -> str:
         mins = int(lim.get("turnTimeoutMin") or 30)
         disk = int(lim.get("diskGb") or 0)
         hb_min = int(lim.get("automationMinIntervalMin")
-                     or config.get("heartbeat_min_interval_min", 30))
+                     or config.get("heartbeat_min_interval_min", 1))
     else:
         mem = str(c.get("memory", "3g")).upper().replace("G", "GB")
         mins = int(c.get("turn_timeout_sec", config.get("limits", {}).get(
             "turn_timeout_sec", TURN_TIMEOUT_SEC)) / 60)
         disk = config.get("limits", {}).get("disk_quota_gb", 0)
-        hb_min = config.get("heartbeat_min_interval_min", 30)
+        hb_min = config.get("heartbeat_min_interval_min", 1)
     disk_txt = f"디스크 {disk}GB" if disk else "디스크 한도 없음"
     cpus = c.get("cpus", 1.5)
     always_on_txt = CONTAINER_ALWAYS_ON_PROMPT if ctr.always_on() else ""
@@ -640,11 +640,11 @@ def _shared_system_prompt(user_id: int | None = None) -> str:
         mem = f"{int(tl.get('turnMemoryMb') or 3072) / 1024:g}GB"
         mins = int(tl.get("turnTimeoutMin") or 30)
         hb_min = int(tl.get("automationMinIntervalMin")
-                     or config.get("heartbeat_min_interval_min", 30))
+                     or config.get("heartbeat_min_interval_min", 1))
     else:
         mem = str(lim.get("memory_max", "3G")).upper().replace("G", "GB")
         mins = int(lim.get("turn_timeout_sec", TURN_TIMEOUT_SEC) / 60)
-        hb_min = config.get("heartbeat_min_interval_min", 30)
+        hb_min = config.get("heartbeat_min_interval_min", 1)
     return CLOUD_SYSTEM_PROMPT_TMPL.format(mem=mem, mins=mins, hb_min=hb_min)
 
 
@@ -718,7 +718,7 @@ def _dedicated_host_prompt() -> str:
     mem = str(lim.get("memory_max", "6G")).upper().replace("G", "GB")
     mins = int(lim.get("turn_timeout_sec", TURN_TIMEOUT_SEC) / 60)
     disk = lim.get("disk_quota_gb", 0)
-    hb_min = config.get("heartbeat_min_interval_min", 30)
+    hb_min = config.get("heartbeat_min_interval_min", 1)
     return f"""# 실행 환경: 피터보이스 (고객 전용 서버)
 
 당신은 이 고객사 **전용 서버**에서 실행됩니다. 다른 사용자와 자원을 나눠 쓰지 않습니다.

@@ -8,7 +8,7 @@ import threading
 from datetime import datetime, timedelta, timezone
 
 import daemon.globals as g
-from daemon.globals import config, active_projects, active_projects_lock, shutdown_event, logger, CLAUDE_CMD
+from daemon.globals import config, active_projects, active_projects_lock, processed_ids, shutdown_event, logger, CLAUDE_CMD
 from daemon.api import api_request, inject_system_message
 from daemon.supabase import get_project_dir
 from daemon.limits import clear_account_cooldown_if_stale, claude_account_email
@@ -84,10 +84,18 @@ class HeartbeatThread(threading.Thread):
     POLL_INTERVAL = 60
     USAGE_INTERVAL = 15 * 60  # Claude 사용 한도 수집 주기(초)
     HEARTBEAT_MSG = "HEARTBEAT.md를 확인하고 할 일이 있으면 처리해줘. 없으면 '할 일 없음'이라고 답해."
+    # 간격 하한(분). 2026-10-12 Sean 지시로 30분 하한 폐지 — 1분은 폴링 주기(60초) 때문이지 정책이 아니다.
+    MIN_INTERVAL_MIN = 1
+    # 프로젝트가 작업 중일 때 미루는 상한(분). 예전엔 고정 5분이라 1분 간격 태스크도 5분을 기다렸다.
+    BUSY_POSTPONE_MAX_MIN = 5
+    # 주입했는데 워커가 아직 집지 않은 메시지를 기억하는 시간(초). 넘으면 잊고 다시 주입한다.
+    PENDING_TTL_SEC = 10 * 60
 
     def __init__(self):
         super().__init__(daemon=True, name="heartbeat")
         self._last_usage_fetch = 0.0
+        # project → (직전 주입 msg_id, 주입 시각). 짧은 간격에서 큐에 메시지가 쌓이는 것을 막는다.
+        self._pending: dict[str, tuple[int, float]] = {}
 
     def run(self):
         logger.info("[heartbeat] Thread started")
@@ -158,8 +166,37 @@ class HeartbeatThread(threading.Thread):
         except Exception:
             return None
 
+    @classmethod
+    def _interval_min(cls, task: dict) -> int:
+        """태스크 간격(분). 비정상 값은 30, 하한은 MIN_INTERVAL_MIN."""
+        try:
+            iv = int(task.get("interval_min") or 30)
+        except (TypeError, ValueError):
+            iv = 30
+        return max(cls.MIN_INTERVAL_MIN, iv)
+
+    @classmethod
+    def _busy_postpone_min(cls, interval: int) -> int:
+        """작업 중일 때 미루는 분. 간격보다 길게 미루지 않는다(상한 5분) —
+        1분 간격 태스크는 1분 뒤 다시 보므로 긴 단계가 끝난 직후 다음 단계가 뜬다."""
+        return max(cls.MIN_INTERVAL_MIN, min(interval, cls.BUSY_POSTPONE_MAX_MIN))
+
+    def _previous_wakeup_queued(self, project: str) -> bool:
+        """직전에 주입한 하트비트 메시지를 워커가 아직 집지 않았으면 True.
+        (워커 동시 처리 슬롯이 꽉 찼을 때 1분 간격 태스크가 메시지를 쌓아 연속 실행되는 것을 막는다.
+        워커는 메시지를 집는 순간 processed_ids 에 넣는다 — 그 뒤는 active_projects 가 맡는다.)"""
+        ent = self._pending.get(project)
+        if not ent:
+            return False
+        msg_id, injected_at = ent
+        if msg_id in processed_ids or time.time() - injected_at > self.PENDING_TTL_SEC:
+            self._pending.pop(project, None)
+            return False
+        return True
+
     def _process_task(self, task: dict):
         project = task["project"]
+        interval = self._interval_min(task)
 
         # Check HEARTBEAT.md existence and update warning
         warning = self._check_heartbeat_md(project)
@@ -182,14 +219,20 @@ class HeartbeatThread(threading.Thread):
         with active_projects_lock:
             busy = project in active_projects
         if busy:
-            next_run = datetime.now(timezone.utc) + timedelta(minutes=5)
+            delay = self._busy_postpone_min(interval)
+            next_run = datetime.now(timezone.utc) + timedelta(minutes=delay)
             self._update_task(task["id"], {"next_run_at": next_run.isoformat()})
-            logger.info(f"[heartbeat] {project} busy → postponed 5m")
+            logger.info(f"[heartbeat] {project} busy → postponed {delay}m")
+            return
+
+        if self._previous_wakeup_queued(project):
+            next_run = datetime.now(timezone.utc) + timedelta(minutes=self.MIN_INTERVAL_MIN)
+            self._update_task(task["id"], {"next_run_at": next_run.isoformat()})
+            logger.info(f"[heartbeat] {project} previous wake-up still queued → postponed {self.MIN_INTERVAL_MIN}m")
             return
 
         # Skip inject if no valid HEARTBEAT.md
         if warning and "파일 없음" in warning:
-            interval = task.get("interval_min", 30)
             next_run = datetime.now(timezone.utc) + timedelta(minutes=interval)
             self._update_task(task["id"], {
                 "next_run_at": next_run.isoformat(),
@@ -203,7 +246,7 @@ class HeartbeatThread(threading.Thread):
             logger.warning(f"[heartbeat] {project} inject failed")
             return
 
-        interval = task.get("interval_min", 30)
+        self._pending[project] = (msg_id, time.time())
         next_run = datetime.now(timezone.utc) + timedelta(minutes=interval)
         self._update_task(task["id"], {
             "next_run_at": next_run.isoformat(),
