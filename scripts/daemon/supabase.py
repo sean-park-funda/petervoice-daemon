@@ -281,8 +281,13 @@ def clear_stop_requested(user_id: int):
     api_request(api_key, "PATCH", "/api/bot/status", body={"stop_requested": False, "stop_requested_at": None, "stop_project": None}, timeout=5)
 
 
-def _fetch_recent_conversation(project: str, limit: int = 10) -> str:
-    """Fetch recent messages for a project to provide context."""
+def _fetch_recent_conversation(project: str, limit: int = 10, max_chars: int = 500) -> str:
+    """Fetch recent messages for a project to provide context.
+
+    메시지당 max_chars 자만 남긴다. 잘린 메시지는 몇 자 중 몇 자가 남았는지 표시해서,
+    이 텍스트를 읽는 모델이 '...' 뒤를 추측으로 채우지 않게 한다 (티켓 #29, 2026-10-08:
+    리셋 인계 요약이 500자에서 잘린 시나리오 표의 뒷부분을 지어내 '확정'으로 넘김).
+    """
     api_key = config.get("api_key", "")
     if not api_key:
         return ""
@@ -301,7 +306,7 @@ def _fetch_recent_conversation(project: str, limit: int = 10) -> str:
         role = "유저" if r.get("type") == "user" else "클로드"
         text = r.get("text", "").strip()
         if text and not text.startswith("🔧"):
-            if len(text) > 500:
-                text = text[:500] + "..."
+            if len(text) > max_chars:
+                text = text[:max_chars] + f" …[잘림: 원문 {len(text):,}자 중 앞 {max_chars:,}자만 표시]"
             lines.append(f"[{role}] {text}")
     return "\n".join(lines)

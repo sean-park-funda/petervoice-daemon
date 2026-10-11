@@ -57,7 +57,7 @@ claude_daemon.py + scripts/daemon/
 | `POST /api/bot/reply` | 응답 전송 |
 | `GET /api/bot/prompt` | 프로젝트 프롬프트 조회 |
 | `GET /api/bot/system-prompt` | `_petervoice_system` 시스템 프롬프트 조회 |
-| `GET /api/bot/conversation` | 최근 대화 조회 |
+| `GET /api/bot/conversation` | 최근 대화 조회 (최신순 `limit`건, 더 이전은 응답 `next_before` 를 `before` 로) |
 | `GET /api/secrets?raw=true` | 환경변수 조회 |
 | `GET /api/branches` | 브랜치 목록/관리 |
 | `GET /api/bot/skills` | 스킬 목록 |

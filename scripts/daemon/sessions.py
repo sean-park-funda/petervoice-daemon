@@ -132,13 +132,29 @@ def _save_session_summary(project: str, summary: str):
         logger.error(f"Failed to save session summary for {project}")
 
 
+def _session_transcript_path(session_id: str, config_dir: str | None = None) -> str:
+    """Claude Code 세션 원본 대화 파일(<config>/projects/<slug>/<sid>.jsonl) 경로. 못 찾으면 ''."""
+    bases = [Path(config_dir).expanduser()] if config_dir else []
+    bases.append(Path.home() / ".claude")
+    for base in bases:
+        try:
+            for p in (base / "projects").glob(f"*/{session_id}.jsonl"):
+                return str(p)
+        except Exception:
+            pass
+    return ""
+
+
 def save_session_context(project: str) -> bool:
     """Save session context before reset: ask Claude to summarize, then store."""
     key = session_key(project)
     with sessions_lock:
         sess = g.sessions.get(key)
+    recent_turns = config.get("session_recent_turns", 20)
+    # 인계용 발췌는 메시지당 500자(기본)로는 표·시나리오가 중간에서 끊긴다 (티켓 #29).
+    recent_max_chars = config.get("session_recent_max_chars", 3000)
     if not sess or not sess.get("session_id"):
-        conv = _fetch_recent_conversation(project, limit=10)
+        conv = _fetch_recent_conversation(project, limit=10, max_chars=recent_max_chars)
         if conv:
             fallback = f"[자동 요약 — 이전 세션 요약 불가, 최근 대화 원본]\n\n{conv}"
             _save_session_summary(project, fallback)
@@ -149,29 +165,42 @@ def save_session_context(project: str) -> bool:
     sid = sess["session_id"]
     project_dir = get_project_dir(project)
 
+    proj_settings = _fetch_project_settings(project)
+    account_name = proj_settings.get("account") or "default"
+    accounts = config.get("accounts", {})
+    account_config_dir = accounts.get(account_name, {}).get("config_dir") if account_name != "default" else None
+
+    # 다음 세션이 요약을 원본과 대조할 수 있도록 이전 세션 대화 파일 경로를 함께 남긴다.
+    transcript = _session_transcript_path(sid, account_config_dir)
+    source_note = (f"\n\n## 원본 기록\n이전 세션 대화 파일: `{transcript}`" if transcript else "")
+
     # 슬라이딩 윈도우 단기기억(작업 A):
-    # 최근 N턴은 다음 세션에 '원문 그대로' 붙일 것이므로, 요약에서는 그 이전만 다룬다.
+    # 최근 N건은 다음 세션에 발췌로 붙일 것이므로, 요약에서는 그 이전만 다룬다.
     # recent_raw를 요약 프롬프트에 '제외 대상'으로 명시해 경계를 내용 기준으로 고정 →
-    # 저장 시점에 [요약(N턴 이전) + 원문(최근 N턴)]이 확정되어 중복/누락 없음(경계 정합).
-    recent_turns = config.get("session_recent_turns", 20)
-    recent_raw = _fetch_recent_conversation(project, limit=recent_turns)
+    # 저장 시점에 [요약(N건 이전) + 발췌(최근 N건)]이 확정되어 중복/누락 없음(경계 정합).
+    # 발췌는 메시지별로 잘릴 수 있어 '원문 그대로'라고 쓰면 안 된다 — 모델이 잘린 뒤를
+    # 지어내 '확정'으로 적은 사고가 있었다 (티켓 #29, 2026-10-08).
+    recent_raw = _fetch_recent_conversation(project, limit=recent_turns, max_chars=recent_max_chars)
     summary_prompt = (
         "세션이 곧 리셋됩니다. 다음 세션에서 이어갈 수 있도록 지금까지의 핵심 맥락을 요약해주세요.\n"
-        "단, 아래 '최근 대화'는 다음 세션에 원문 그대로 다시 제공되므로 **요약에서 제외**하고, "
+        "아래 '최근 대화'는 다음 세션에도 이 발췌 그대로 함께 전달되므로 요약에서는 제외하고, "
         "그 이전 내용만 요약하세요 (최근 대화 내용을 다시 적지 마세요):\n"
         "1. 현재 진행 중인 작업과 상태\n"
         "2. 최근 내린 주요 결정사항\n"
         "3. 아직 완료되지 않은 과제\n"
         "4. 중요한 컨텍스트 (에러, 제약사항 등)\n"
         "간결하게 500자 이내로 작성해주세요.\n\n"
-        "--- 최근 대화 (요약 제외 대상, 이미 다음 세션에 원문 제공됨) ---\n"
+        "반드시 지킬 것 — 다음 세션은 이 요약을 근거로 바로 작업합니다:\n"
+        "- 이 대화나 아래 발췌에 실제로 있는 내용만 적으세요. 원문에 없는 결정·수치·문구를 만들지 마세요.\n"
+        "- 발췌는 메시지마다 잘렸을 수 있습니다. `[잘림: …]` 뒤에 있었을 내용을 추측해 채우지 마세요. "
+        "잘린 메시지에 중요한 결정이 걸려 있으면, 이 대화에서 그 전문이 실제로 보일 때만 요약에 적고 "
+        "아니면 '원문 확인 필요(잘림)'라고만 적으세요.\n"
+        "- 기억이 불확실한 내용은 '원문 확인 필요'라고 적으세요.\n"
+        "- '확정'은 유저가 명시적으로 확정한 것에만 쓰세요. 초안·제안·추정은 그렇게 구분해 적으세요.\n"
+        "- 결과물을 파일로 저장해 두었다면 그 경로를 적으세요.\n\n"
+        "--- 최근 대화 (요약 제외 대상 · 다음 세션에 이 발췌 그대로 전달됨 · 메시지별로 잘렸을 수 있음) ---\n"
         f"{recent_raw or '(최근 대화 없음)'}"
     )
-
-    proj_settings = _fetch_project_settings(project)
-    account_name = proj_settings.get("account") or "default"
-    accounts = config.get("accounts", {})
-    account_config_dir = accounts.get(account_name, {}).get("config_dir") if account_name != "default" else None
 
     # --verbose 필수: CLI가 "When using --print, --output-format=stream-json requires --verbose"로
     # exit 1 하며 즉시 죽는다(1초). 이 인자가 없어 AI 요약이 항상 실패하고 폴백(원문)만
@@ -219,7 +248,9 @@ def save_session_context(project: str) -> bool:
             # 경계는 위 recent_raw로 이미 고정됨(요약에서 제외하도록 지시). 저장/주입 시점 재조회 없음.
             combined = summary_text
             if recent_raw:
-                combined += f"\n\n## 최근 {recent_turns}턴 (원문)\n{recent_raw}"
+                combined += (f"\n\n## 최근 대화 {recent_turns}건 (발췌 — 메시지당 앞 {recent_max_chars:,}자까지, "
+                             f"잘린 메시지는 [잘림] 표시)\n{recent_raw}")
+            combined += source_note
             _save_session_summary(project, combined)
             return True
         else:
@@ -227,9 +258,9 @@ def save_session_context(project: str) -> bool:
     except Exception as e:
         logger.error(f"Failed to get session summary for {project}: {e}")
 
-    conv = _fetch_recent_conversation(project, limit=10)
+    conv = _fetch_recent_conversation(project, limit=10, max_chars=recent_max_chars)
     if conv:
-        fallback = f"[자동 요약 — AI 요약 실패, 최근 대화 원본]\n\n{conv}"
+        fallback = f"[자동 요약 — AI 요약 실패, 최근 대화 원본]\n\n{conv}{source_note}"
         _save_session_summary(project, fallback)
         return True
     return False
@@ -292,9 +323,17 @@ def _build_session_context_prompt(project: str) -> str:
     summary = _fetch_session_summary(project)
     if not summary or len(summary.strip()) < 20:
         return ""
+    # 요약은 기계가 만든 것이라 틀릴 수 있다. 새 세션이 그대로 믿고 작업해 유저가 확정한
+    # 내용과 다른 결과물을 만든 사고가 있었다 (티켓 #29) → 원본과 대조하는 방법을 함께 준다.
     return (
         "# 이전 세션 컨텍스트\n"
-        "아래는 이전 세션에서 저장된 맥락입니다. 필요 시 참고하세요.\n\n"
+        "아래는 이전 세션이 리셋되기 직전에 자동으로 만든 인계 메모입니다. 기계 요약이라 틀리거나 빠진 것이 있을 수 있습니다.\n"
+        "- '최근 대화'는 메시지마다 앞부분만 남긴 발췌입니다. `[잘림: …]` 표시가 있는 메시지는 뒷부분이 없으니 추측해서 채우지 마세요.\n"
+        "- 이전 세션의 결정·확정 사항(시나리오, 스펙, 수치 등)을 근거로 작업하기 전에 `docs/` 의 해당 파일이나 원본 기록과 대조하세요. "
+        "원본에서 확인되지 않는 내용은 유저에게 확인받은 뒤 진행하세요.\n"
+        "- 원본 기록 찾는 법: ① 메모 끝 '원본 기록'의 이전 세션 대화 파일(있으면) — 크므로 Read 말고 Grep 으로 키워드 검색 "
+        f"② 대화 조회 API `GET $API_URL/api/bot/conversation?project={project}&limit=200` (X-Api-Key 헤더) — 더 이전 대화는 응답의 "
+        "`next_before` 값을 `&before=` 로 넘겨 계속 거슬러 올라갑니다.\n\n"
         f"{summary.strip()}"
     )
 
