@@ -29,7 +29,7 @@ claude_daemon.py + scripts/daemon/
 ├── SecretsSyncer        — 환경변수 DB→로컬 (60초)
 ├── SkillsSyncer         — 스킬 업데이트 전용 (5분)
 ├── AutoUpdater          — Git 기반 자동 업데이트 (5분)
-├── SessionHealthChecker — 세션 수명 관리 (2시간) + Stall 감지 (30분)
+├── SessionHealthChecker — 세션 수명 관리 (2시간) (Stall 감지는 2026-07-16 제거 — 26장)
 ├── HeartbeatThread      — 반복 작업 스케줄링 (1분)
 ├── ManagerThread        — 자율 프로젝트 점검 (설정 가능)
 ├── SummonManager       — 다중 에이전트 리뷰 세션 관리
