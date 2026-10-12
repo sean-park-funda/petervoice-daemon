@@ -332,7 +332,7 @@ def _build_session_context_prompt(project: str) -> str:
         "- 이전 세션의 결정·확정 사항(시나리오, 스펙, 수치 등)을 근거로 작업하기 전에 `docs/` 의 해당 파일이나 원본 기록과 대조하세요. "
         "원본에서 확인되지 않는 내용은 유저에게 확인받은 뒤 진행하세요.\n"
         "- 원본 기록 찾는 법: ① 메모 끝 '원본 기록'의 이전 세션 대화 파일(있으면) — 크므로 Read 말고 Grep 으로 키워드 검색 "
-        f"② 대화 조회 API `GET $API_URL/api/bot/conversation?project={project}&limit=200` (X-Api-Key 헤더) — 더 이전 대화는 응답의 "
+        f"② 대화 조회 API `GET $API_URL/api/bot/conversation?project={project}&limit=200` (`Authorization: Bearer <config.json 의 api_key>` 헤더 — X-Api-Key 는 거절됨) — 더 이전 대화는 응답의 "
         "`next_before` 값을 `&before=` 로 넘겨 계속 거슬러 올라갑니다.\n\n"
         f"{summary.strip()}"
     )
