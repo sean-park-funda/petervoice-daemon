@@ -22,6 +22,7 @@ from daemon.limits import (
     build_claude_env, detect_cap_hit, record_cap_hit, cap_notice,
     detect_usage_limit, usage_limit_notice,
     start_account_cooldown, clear_account_cooldown, account_cooldown_notice,
+    seat_config_dir, active_seat,
 )
 import daemon.globals as g
 import signal
@@ -137,11 +138,7 @@ def resolve_account_config_dir(project: str) -> str | None:
             kc = _fetch_kanban_card(int(project.split(":")[1]))
             real = kc.get("project_id", "general") if kc else "general"
         settings = _fetch_project_settings(real)
-        account_name = settings.get("account") or "default"
-        if account_name == "default":
-            return None
-        accounts = config.get("accounts", {})
-        cd = accounts.get(account_name, {}).get("config_dir")
+        cd = seat_config_dir(settings.get("account") or "default")
         return os.path.expanduser(cd) if cd else None
     except Exception:
         return None
@@ -369,10 +366,11 @@ def run_claude(
         cmd.extend(["--resume", sid])
 
     cmd.extend(["--", prompt])
-    accounts = config.get("accounts", {})
-    account_config_dir = accounts.get(account_name, {}).get("config_dir") if account_name != "default" else None
-    if account_config_dir:
-        logger.info(f"[{bot_name}] Claude: project={project}, dir={project_dir}, session={sid or 'new'}, account={account_name}")
+    account_config_dir = seat_config_dir(account_name)
+    _seat = active_seat()
+    if account_config_dir or _seat:
+        logger.info(f"[{bot_name}] Claude: project={project}, dir={project_dir}, session={sid or 'new'}, account={account_name}"
+                    + (f", seat={_seat}" if _seat else ""))
     else:
         logger.info(f"[{bot_name}] Claude: project={project}, dir={project_dir}, session={sid or 'new'}")
 

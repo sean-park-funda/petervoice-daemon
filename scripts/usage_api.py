@@ -13,6 +13,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -85,17 +86,26 @@ def token_from_credentials_json(text: str | None) -> str | None:
         return None
 
 
+def keychain_service(config_dir: str | None = None) -> str:
+    """macOS 키체인 항목 이름. CLAUDE_CONFIG_DIR 를 지정한 계정은 그 경로 문자열의 sha256 앞 8자가 붙는다
+    (2026-10-14 실측: ~/.claude-account-b/.claude → 'Claude Code-credentials-e4f8c36d')."""
+    if not config_dir:
+        return KEYCHAIN_SERVICE
+    path = os.path.expanduser(config_dir).rstrip("/")
+    return f"{KEYCHAIN_SERVICE}-{hashlib.sha256(path.encode()).hexdigest()[:8]}"
+
+
 def local_access_token(config_dir: str | None = None) -> str | None:
     """이 머신의 기본(또는 config_dir) 계정 액세스 토큰.
     macOS 는 키체인이 정본(파일은 stale 로 남는다), 리눅스는 CLAUDE_CONFIG_DIR/.credentials.json."""
-    if sys.platform == "darwin" and not config_dir:
+    if sys.platform == "darwin":
         # CLI 는 acct=$USER 항목에 쓴다. -a 없이 찾으면 같은 이름의 낡은 항목(acct=unknown — USER 없는
         # 환경에서 한 번 로그인된 흔적)을 먼저 집어 API 가 매번 실패하고 15분마다 CLI 폴백이 돌았다
         # (2026-10-14 Sean 맥 실측: 10/06 만료 토큰을 읽어 하루 96회 `claude -p /usage`).
         user = os.environ.get("USER") or os.environ.get("LOGNAME")
         for extra in ([["-a", user]] if user else []) + [[]]:
             try:
-                r = subprocess.run(["security", "find-generic-password", "-s", KEYCHAIN_SERVICE, *extra, "-w"],
+                r = subprocess.run(["security", "find-generic-password", "-s", keychain_service(config_dir), *extra, "-w"],
                                    capture_output=True, text=True, timeout=10)
                 tok = token_from_credentials_json(r.stdout.strip()) if r.returncode == 0 else None
                 if tok:

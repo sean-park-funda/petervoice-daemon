@@ -9,7 +9,7 @@ from datetime import datetime
 from pathlib import Path
 
 import daemon.globals as g
-from daemon.limits import build_claude_env
+from daemon.limits import build_claude_env, seat_config_dir
 from daemon.globals import (
     config, sessions_lock, shutdown_event, logger,
     DAEMON_DIR, SESSIONS_PATH, PENDING_RESETS_PATH, CODEX_SESSIONS_PATH,
@@ -167,8 +167,7 @@ def save_session_context(project: str) -> bool:
 
     proj_settings = _fetch_project_settings(project)
     account_name = proj_settings.get("account") or "default"
-    accounts = config.get("accounts", {})
-    account_config_dir = accounts.get(account_name, {}).get("config_dir") if account_name != "default" else None
+    account_config_dir = seat_config_dir(account_name)
 
     # 다음 세션이 요약을 원본과 대조할 수 있도록 이전 세션 대화 파일 경로를 함께 남긴다.
     transcript = _session_transcript_path(sid, account_config_dir)

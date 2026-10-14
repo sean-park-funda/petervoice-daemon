@@ -11,7 +11,7 @@ import daemon.globals as g
 from daemon.globals import config, active_projects, active_projects_lock, processed_ids, shutdown_event, logger, CLAUDE_CMD
 from daemon.api import api_request, inject_system_message
 from daemon.supabase import get_project_dir
-from daemon.limits import clear_account_cooldown_if_stale, claude_account_email
+from daemon.limits import clear_account_cooldown_if_stale, claude_account_email, seat_config_dir
 import usage_api
 
 
@@ -23,14 +23,19 @@ def fetch_usage_limits() -> dict | None:
     폴백: `claude -p /usage` — API 가 실패(토큰 만료·폐기 등)했을 때만. CLI 실행이 토큰을
     갱신하므로 다음 주기부터 API 가 다시 산다. (2026-08-25, 기존엔 15분마다 CLI 만 돌아
     고객 맥 1대당 하루 96세션을 배너 하나에 썼다)"""
-    limits = usage_api.fetch_oauth_usage(usage_api.local_access_token())
+    # 계정 자리(claude_seat)가 걸려 있으면 그 자리를 잰다 — 보드가 "Sean 이 지금 어느 계정인지"를 이 값으로 안다
+    cdir = seat_config_dir("default")
+    limits = usage_api.fetch_oauth_usage(usage_api.local_access_token(cdir))
     if limits:
-        limits["account"] = claude_account_email()
+        limits["account"] = claude_account_email(cdir)
         return limits
+    env = dict(os.environ)
+    if cdir:
+        env["CLAUDE_CONFIG_DIR"] = cdir
     try:
         r = subprocess.run(
             [CLAUDE_CMD, "-p", "/usage"],
-            capture_output=True, text=True, timeout=90,
+            capture_output=True, text=True, timeout=90, env=env,
         )
     except Exception as e:
         logger.warning(f"[usage] claude /usage failed: {e}")
@@ -59,7 +64,7 @@ def fetch_usage_limits() -> dict | None:
         "week_fable_pct": fable_pct,
         "session_reset": session_reset,
         "week_reset": week_reset,
-        "account": claude_account_email(),
+        "account": claude_account_email(cdir),
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
 
