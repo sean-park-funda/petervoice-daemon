@@ -22,7 +22,7 @@ from daemon.limits import (
     build_claude_env, detect_cap_hit, record_cap_hit, cap_notice,
     detect_usage_limit, usage_limit_notice,
     start_account_cooldown, clear_account_cooldown, account_cooldown_notice,
-    seat_config_dir, active_seat,
+    seat_config_dir, active_seat, run_seat_limit_hook,
 )
 import daemon.globals as g
 import signal
@@ -226,6 +226,23 @@ def build_project_prompt(project: str) -> str:
     combined = "\n\n".join(p for p in [sys_prompt, system_prompt_pv, common_prompt, connected_services, prompt_content, global_wiki, wiki_index, session_context] if p)
     # 프롬프트에 {담당자 명부}가 있으면 실시간 프로젝트·브랜치 목록으로 치환
     return apply_roster_placeholder(combined)
+
+
+def _switch_seat_and_retry(seat: str | None, limit_retry: int, project: str, api_key: str, stream_to_chat: bool) -> bool:
+    """계정(세션·주간) 한도에 걸렸을 때 자동 교체 훅을 돌린다. 다른 자리로 옮겨졌으면 True → 호출부가 같은 턴을 재시도.
+    한 턴에서 한 번만(재시도한 턴이 또 걸리면 쿨다운 경로). 훅이 없는 머신(고객 전부)은 항상 False."""
+    if limit_retry or not seat:
+        return False
+    new_seat = run_seat_limit_hook(seat)
+    if not new_seat:
+        return False
+    logger.warning(f"[seat] {project}: 자리 {seat} 한도 → {new_seat} 로 옮겨 같은 턴 재시도")
+    if stream_to_chat:
+        api_request(api_key, "POST", "/api/bot/reply", {
+            "text": f"(클로드 계정 한도 — 자리 {seat} → {new_seat} 로 자동 교체해 다시 시도합니다)",
+            "project": project, "is_final": False,
+        })
+    return True
 
 
 def run_claude(
@@ -737,6 +754,12 @@ def run_claude(
                                     stream_to_chat=stream_to_chat, segments_out=segments_out,
                                     model_override=_fb, _limit_retry=_limit_retry + 1)
                             return (usage_limit_notice(_limit), new_session_id, tool_lines, False)
+                        _moved = _switch_seat_and_retry(_seat, _limit_retry, project, api_key, stream_to_chat)
+                        if _moved:
+                            return run_claude(prompt, project, _retry_count, 0,
+                                session_key_override=session_key_override, prompt_override=prompt_override,
+                                stream_to_chat=stream_to_chat, segments_out=segments_out,
+                                model_override=model_override, _limit_retry=_limit_retry + 1)
                         start_account_cooldown("세션 한도", _limit.get("resets", ""), account_name, account_config_dir)
                         return (usage_limit_notice(_limit), new_session_id, tool_lines, False)
                     if "could not process image" in error_text.lower() or "invalid_request_error" in error_text.lower():
@@ -806,6 +829,11 @@ def run_claude(
                 record_cap_hit(project, f"계정 한도(stderr:{_limit['kind']})", config)
                 _release_semaphore()
                 if _limit["kind"] == "session":
+                    if _switch_seat_and_retry(_seat, _limit_retry, project, api_key, stream_to_chat):
+                        return run_claude(prompt, project, _retry_count, 0,
+                            session_key_override=session_key_override, prompt_override=prompt_override,
+                            stream_to_chat=stream_to_chat, segments_out=segments_out,
+                            model_override=model_override, _limit_retry=_limit_retry + 1)
                     # account_name 을 빼먹으면 "default" 슬롯에 걸린다 — 정작 막힌 계정은
                     # 계속 헛스폰하고 멀쩡한 default 프로젝트 전체가 멈춘다(스폰 검사는
                     # account_name 으로 조회한다). 738행 stream 경로와 반드시 같은 키.

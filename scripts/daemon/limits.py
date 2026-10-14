@@ -14,6 +14,8 @@ config.json 으로 언제든 풀 수 있게 한다(고객이 걸리면 코드 �
 import json
 import os
 import re
+import shlex
+import subprocess
 import tempfile
 import threading
 import time
@@ -179,7 +181,7 @@ def ensure_agents_md_ignored(config_dir: str | None = None) -> bool:
 # 세션 키는 계정 라벨이라 자리를 바꿔도 세션이 리셋되지 않고, 자리 폴더의 projects/ 는
 # ~/.claude/projects 로 심링크돼 있어(peter-voice scripts/claude-seat.py prepare) --resume 이 이어진다.
 # 기준 문서: peter-voice docs/plans/2026-10-14-claude-account-seats.md
-_seat_state: dict = {"mtime": None, "seat": None, "seats": {}}
+_seat_state: dict = {"mtime": None, "seat": None, "seats": {}, "hook": None}
 _seat_lock = threading.Lock()
 _seat_warned: set[str] = set()
 
@@ -199,7 +201,7 @@ def _live_seat_settings() -> tuple[str | None, dict]:
                 seats = data.get("claude_seats") if isinstance(data.get("claude_seats"), dict) else {}
                 if seat != _seat_state["seat"]:
                     logger.info(f"[seat] 계정 자리 {_seat_state['seat'] or '(기본)'} → {seat or '(기본)'}")
-                _seat_state.update(mtime=mtime, seat=seat, seats=seats)
+                _seat_state.update(mtime=mtime, seat=seat, seats=seats, hook=data.get("claude_seat_limit_hook") or None)
             except Exception as e:  # noqa: BLE001 — 쓰는 도중의 반쪽 JSON 일 수 있다: 직전 값 유지, 다음 호출에 재시도
                 logger.warning(f"[seat] config.json 읽기 실패 — 직전 자리 유지: {e!r}")
         return _seat_state["seat"], _seat_state["seats"]
@@ -233,6 +235,44 @@ def seat_config_dir(account_name: str | None = "default", config: dict | None = 
     if config is None:
         from daemon.globals import config
     return (config.get("accounts", {}).get(name) or {}).get("config_dir") or None
+
+
+# 자동 교체 (2026-10-14 Sean 사전 승인 「A」): 지금 자리가 한도에 막히면 config.json 의
+# "claude_seat_limit_hook" 명령(Sean 맥: 사용량 보드 --auto-switch)을 즉시 돌려 다음 자리로 옮긴다.
+# 판단(어디로 갈지)은 그 명령이 한다 — 데몬은 부르고, 자리가 바뀌었는지만 본다. 키가 없으면 아무 일도 없다.
+_seat_hook_lock = threading.Lock()
+_seat_hook_last: dict[str, float] = {}
+SEAT_HOOK_TIMEOUT = 120
+SEAT_HOOK_MIN_GAP = 120   # 같은 자리로 2분 안에 다시 부르지 않는다 (교체할 곳이 없을 때 턴마다 도는 것 방지)
+
+
+def run_seat_limit_hook(limited_seat: str | None) -> str | None:
+    """한도에 걸린 자리에서 자동 교체를 시도한다. 자리가 바뀌었으면 새 자리 이름, 아니면 None.
+
+    동시에 여러 턴이 한도에 걸려도 훅은 한 번만 돈다 — 나머지는 락에서 기다렸다가 바뀐 자리를 받아 간다.
+    """
+    _live_seat_settings()  # config.json 이 바뀌었으면 훅 설정도 다시 읽는다
+    hook = _seat_state.get("hook")
+    if not hook or not limited_seat:
+        return None
+    with _seat_hook_lock:
+        current = active_seat()
+        if current and current != limited_seat:
+            return current  # 다른 턴이 이미 옮겼다
+        now = time.time()
+        if now - _seat_hook_last.get(limited_seat, 0.0) < SEAT_HOOK_MIN_GAP:
+            return None
+        _seat_hook_last[limited_seat] = now
+        logger.warning(f"[seat] 자리 {limited_seat} 한도 — 자동 교체 훅 실행")
+        try:
+            r = subprocess.run(shlex.split(hook) + ["--limited-seat", limited_seat],
+                               capture_output=True, text=True, timeout=SEAT_HOOK_TIMEOUT)
+            tail = (r.stdout or "").strip().splitlines()[-1:] or (r.stderr or "").strip().splitlines()[-1:]
+            logger.info(f"[seat] 훅 종료 rc={r.returncode} {tail[0][:200] if tail else ''}")
+        except Exception as e:  # noqa: BLE001 — 훅 실패는 기존 쿨다운 경로로 넘어간다
+            logger.warning(f"[seat] 자동 교체 훅 실패: {e!r}")
+        new = active_seat()
+        return new if new and new != limited_seat else None
 
 
 def build_claude_env(config: dict, account_config_dir: str | None = None) -> dict[str, str]:
