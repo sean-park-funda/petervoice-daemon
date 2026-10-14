@@ -1128,7 +1128,9 @@ def _prepare_agents_md(project_dir: str, prompt_content: str):
 
     if _AGENTS_MD_MARKER_START in existing:
         pattern = re.escape(_AGENTS_MD_MARKER_START) + r".*?" + re.escape(_AGENTS_MD_MARKER_END)
-        merged = re.sub(pattern, daemon_block, existing, flags=re.DOTALL)
+        # 치환 문자열을 템플릿으로 해석하지 않도록 함수로 넘긴다 — 프롬프트 속 `C:\AI` 같은
+        # 백슬래시가 "bad escape" 로 턴 전체를 죽이거나 `\n` 이 실제 줄바꿈으로 바뀐다
+        merged = re.sub(pattern, lambda _m: daemon_block, existing, flags=re.DOTALL)
     elif existing.strip():
         merged = f"{existing}\n\n{daemon_block}"
     else:
