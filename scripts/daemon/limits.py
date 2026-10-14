@@ -171,15 +171,82 @@ def ensure_agents_md_ignored(config_dir: str | None = None) -> bool:
         return False
 
 
+# ── 계정 자리(seat) — 설정 한 줄로 계정 교체 (2026-10-14, Sean 맥미니) ──────────────
+# config.json 에 "claude_seat": "<이름>" 이 있으면 **모든 계정 라벨(default·secondary…)** 을 그 자리의
+# 설정 폴더로 실행한다. 자리 목록: "claude_seats": {"<이름>": {"config_dir": "~/.claude-seats/x"}}
+# (config_dir 이 "" 면 기본 자리 ~/.claude). 교체에 재시작이 필요 없도록 config.json 을 mtime 이
+# 바뀔 때마다 다시 읽는다. 두 키가 없는 머신(고객 전부)은 기존 동작 그대로다.
+# 세션 키는 계정 라벨이라 자리를 바꿔도 세션이 리셋되지 않고, 자리 폴더의 projects/ 는
+# ~/.claude/projects 로 심링크돼 있어(peter-voice scripts/claude-seat.py prepare) --resume 이 이어진다.
+# 기준 문서: peter-voice docs/plans/2026-10-14-claude-account-seats.md
+_seat_state: dict = {"mtime": None, "seat": None, "seats": {}}
+_seat_lock = threading.Lock()
+_seat_warned: set[str] = set()
+
+
+def _live_seat_settings() -> tuple[str | None, dict]:
+    path = Path(DAEMON_DIR) / "config.json"
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        return None, {}
+    with _seat_lock:
+        if mtime != _seat_state["mtime"]:
+            try:
+                with open(path, encoding="utf-8") as f:
+                    data = json.load(f)
+                seat = data.get("claude_seat") or None
+                seats = data.get("claude_seats") if isinstance(data.get("claude_seats"), dict) else {}
+                if seat != _seat_state["seat"]:
+                    logger.info(f"[seat] 계정 자리 {_seat_state['seat'] or '(기본)'} → {seat or '(기본)'}")
+                _seat_state.update(mtime=mtime, seat=seat, seats=seats)
+            except Exception as e:  # noqa: BLE001 — 쓰는 도중의 반쪽 JSON 일 수 있다: 직전 값 유지, 다음 호출에 재시도
+                logger.warning(f"[seat] config.json 읽기 실패 — 직전 자리 유지: {e!r}")
+        return _seat_state["seat"], _seat_state["seats"]
+
+
+def active_seat() -> str | None:
+    """지금 적용 중인 자리 이름 (설정이 없거나 모르는 이름이면 None)."""
+    seat, seats = _live_seat_settings()
+    return seat if seat and seat in seats else None
+
+
+def seat_config_dir(account_name: str | None = "default", config: dict | None = None) -> str | None:
+    """계정 라벨 → claude 를 띄울 CLAUDE_CONFIG_DIR (None = 기본 ~/.claude).
+
+    계정→폴더 해석은 반드시 이 함수 하나로 한다 — 본 턴·칸반·세션 요약·재로그인·사용량 측정이
+    서로 다른 폴더를 보면 "로그인은 A, 측정은 B" 같은 엇갈림이 생긴다.
+    """
+    seat, seats = _live_seat_settings()
+    if seat:
+        spec = seats.get(seat)
+        if spec is not None:
+            d = spec.get("config_dir") if isinstance(spec, dict) else spec
+            # 키체인 항목 이름이 이 문자열의 해시라서 로그인 때와 똑같은 모양(절대경로, 끝 / 없음)으로 맞춘다
+            return os.path.expanduser(d).rstrip("/") if d else None
+        if seat not in _seat_warned:
+            _seat_warned.add(seat)
+            logger.warning(f"[seat] claude_seat={seat!r} 가 claude_seats 에 없음 — 무시하고 계정 설정대로 실행")
+    name = account_name or "default"
+    if name == "default":
+        return None
+    if config is None:
+        from daemon.globals import config
+    return (config.get("accounts", {}).get(name) or {}).get("config_dir") or None
+
+
 def build_claude_env(config: dict, account_config_dir: str | None = None) -> dict[str, str]:
     """claude CLI 를 띄울 때 쓰는 공용 env.
 
     claude 를 실행하는 지점이 5곳(본 턴·rewriter·bp·kanban·sessions)이라 각자 env 를 만들면
     한 곳만 고쳐도 나머지로 샌다. 반드시 이 함수를 거칠 것.
+    account_config_dir 를 안 주면 기본 계정 — 계정 자리(claude_seat)가 걸려 있으면 그 자리로 간다.
     """
     env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
     env["LANG"] = "en_US.UTF-8"
     env.update(limit_env(config))
+    if account_config_dir is None:
+        account_config_dir = seat_config_dir("default", config)
     if account_config_dir:
         env["CLAUDE_CONFIG_DIR"] = os.path.expanduser(account_config_dir)
     # 이 세션이 실제로 쓸 설정 폴더에 AGENTS.md 폴백 차단을 보장 (폴더당 1회, 실패 무해)

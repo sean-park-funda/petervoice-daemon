@@ -15,7 +15,7 @@ from daemon.globals import (
     config, shutdown_event, logger, PROMPTS_DIR, SECRETS_ENV_PATH,
     DAEMON_DIR, CLAUDE_CMD, IS_WINDOWS,
 )
-from daemon.limits import build_claude_env
+from daemon.limits import build_claude_env, seat_config_dir
 from daemon.api import api_request
 from daemon.supabase import (
     resolve_user_id, get_project_dir, fetch_prompt_from_supabase,
@@ -309,8 +309,7 @@ def run_kanban_claude(
 
     # Environment — use account config dir if specified, otherwise default ~/.claude
     account_name = proj_settings.get("account") or "default"
-    accounts = config.get("accounts", {})
-    account_config_dir = accounts.get(account_name, {}).get("config_dir") if account_name != "default" else None
+    account_config_dir = seat_config_dir(account_name)
 
     claude_env = build_claude_env(config, account_config_dir)
 

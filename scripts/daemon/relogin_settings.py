@@ -61,9 +61,10 @@ def poll_relogin(user_id: int):
         if _starting or relogin.status().get("state") in ("pending_url", "waiting_code", "verifying"):
             return
         _starting = True
-        # 채팅이 아닌 DB 로 URL/결과 전달 (on_event) — 기본 계정으로 로그인
+        # 채팅이 아닌 DB 로 URL/결과 전달 (on_event) — 기본 계정(계정 자리가 걸려 있으면 그 자리)으로 로그인
         patch_relogin({"relogin_state": "starting", "relogin_url": None})
-        relogin.start("general", config_dir=None, on_event=_on_event)
+        from daemon.limits import seat_config_dir
+        relogin.start("general", config_dir=seat_config_dir("default"), on_event=_on_event)
         logger.info("[relogin-settings] engine started (requested->starting)")
         return
 
