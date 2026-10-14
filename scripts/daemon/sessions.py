@@ -12,7 +12,7 @@ import daemon.globals as g
 from daemon.limits import build_claude_env, seat_config_dir
 from daemon.globals import (
     config, sessions_lock, shutdown_event, logger,
-    DAEMON_DIR, SESSIONS_PATH, PENDING_RESETS_PATH, CODEX_SESSIONS_PATH,
+    DAEMON_DIR, SESSIONS_PATH, PENDING_RESETS_PATH, CODEX_SESSIONS_PATH, GEMINI_SESSIONS_PATH,
     CLAUDE_CMD, IS_WINDOWS,
 )
 from daemon.supabase import resolve_user_id, get_project_dir, _fetch_project_settings, _fetch_recent_conversation
@@ -315,6 +315,58 @@ def reset_codex_session(project: str, reason: str = ""):
     if removed:
         _save_codex_sessions()
         logger.info(f"Codex session reset for {project}" + (f" ({reason})" if reason else ""))
+
+
+# ─── Gemini session management (코덱스와 같은 구조, 파일만 다름) ───
+
+_gemini_sessions: dict = {}
+_gemini_sessions_lock = threading.Lock()
+
+
+def load_gemini_sessions():
+    global _gemini_sessions
+    try:
+        if GEMINI_SESSIONS_PATH.exists():
+            data = json.loads(GEMINI_SESSIONS_PATH.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                _gemini_sessions = data
+                logger.info(f"Gemini sessions loaded: {len(data)} active")
+                return
+    except Exception as e:
+        logger.warning(f"Failed to load gemini sessions: {e}")
+    _gemini_sessions = {}
+
+
+def _save_gemini_sessions():
+    try:
+        with _gemini_sessions_lock:
+            data = dict(_gemini_sessions)
+        GEMINI_SESSIONS_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as e:
+        logger.warning(f"Failed to save gemini sessions: {e}")
+
+
+def get_gemini_session_id(project: str) -> str | None:
+    with _gemini_sessions_lock:
+        return _gemini_sessions.get(project, {}).get("session_id")
+
+
+def update_gemini_session(project: str, session_id: str):
+    now = datetime.now().isoformat()
+    with _gemini_sessions_lock:
+        sess = _gemini_sessions.setdefault(project, {"created_at": now, "message_count": 0})
+        sess["session_id"] = session_id
+        sess["last_used"] = now
+        sess["message_count"] = sess.get("message_count", 0) + 1
+    _save_gemini_sessions()
+
+
+def reset_gemini_session(project: str, reason: str = ""):
+    with _gemini_sessions_lock:
+        removed = _gemini_sessions.pop(project, None)
+    if removed:
+        _save_gemini_sessions()
+        logger.info(f"Gemini session reset for {project}" + (f" ({reason})" if reason else ""))
 
 
 def _build_session_context_prompt(project: str) -> str:

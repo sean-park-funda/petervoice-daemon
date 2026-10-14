@@ -1,8 +1,8 @@
-# 32. 엔진 선택 (Claude Code vs Codex)
+# 32. 엔진 선택 (Claude Code / Codex / Gemini)
 
 ## 개요
 
-Peter Voice 데몬은 **Claude Code CLI**와 **OpenAI Codex CLI** 두 가지 엔진을 지원합니다.  
+Peter Voice 데몬은 **Claude Code CLI**, **OpenAI Codex CLI**, 그리고 2026-10-14부터 **Google Gemini CLI**(제3 엔진, 파일럿) 세 가지 엔진을 지원합니다.  
 프로젝트별 또는 브랜치별로 엔진을 다르게 설정할 수 있습니다.
 
 ## 엔진 종류
@@ -11,6 +11,7 @@ Peter Voice 데몬은 **Claude Code CLI**와 **OpenAI Codex CLI** 두 가지 엔
 |------|-----|-----------|-----------|
 | `claude` | `@anthropic-ai/claude-code` | claude-sonnet-4-6 | 기본값, 코드 이해/수정 |
 | `codex` | `@openai/codex` | OpenAI 기본값 | 클라우드 유저 기본값 |
+| `gemini` | `@google/gemini-cli` | gemini-4-argon | 맥미니(셀프호스팅) 전용 파일럿. 클라우드 데몬은 미지원 |
 
 ## 설정 방법
 
@@ -79,3 +80,18 @@ curl -X PATCH "$API_URL/api/projects" \
 - Codex 엔진 사용 시 `OPENAI_API_KEY` 환경변수가 설정되어 있어야 합니다
 - Codex CLI가 설치되지 않은 경우 해당 프로젝트 메시지는 오류 처리됨
 - 엔진 전환은 다음 메시지부터 적용됩니다 (현재 진행 중인 세션에는 미적용)
+
+## Gemini CLI (제3 엔진, 2026-10-14~ 파일럿)
+
+- 설정: 프로젝트/브랜치의 `engine` 을 `gemini` 로. 웹 UI 드롭다운에는 아직 없어 API 로 설정한다 —
+  `PATCH /api/projects {"id":"…","engine":"gemini","model":"gemini-4-argon"}` 또는 `PATCH /api/branches/{id}` 같은 body.
+- 필요: `npm install -g @google/gemini-cli` + 시크릿 `GEMINI_API_KEY`. 둘 중 하나가 없으면 그 턴에 안내 메시지로 답하고 끝난다.
+- 모델: 브랜치 `model` > 프로젝트 `model` > config `gemini_default_model` > 기본 `gemini-4-argon`. `gemini-` 로 시작하지 않는 코드(옛 claude/gpt 잔재)는 무시.
+- 세션: `~/.claude-daemon/gemini_sessions.json` 에 프로젝트/브랜치별 UUID, 다음 턴은 `--resume <uuid>`. `/reset`(`/새세션`)으로 초기화. 세션 파일이 사라져 재개에 실패하면 자동으로 새 세션 1회 재시도.
+- 컨텍스트 주입: 시스템 가이드·공통·역할·세션 맥락을 **프로젝트 폴더에 파일로 쓰지 않고** 새 세션 첫 턴에 stdin 으로 넘긴다(코덱스 AGENTS.md 와 다른 점). 재개 턴은 메시지만 보낸다 → 세션이 살아 있는 동안의 프롬프트 수정은 `/reset` 뒤에 반영된다.
+- 출력: `--output-format stream-json` 을 줄 단위로 읽어 도구 로그(🔧)와 본문을 웹에 스트리밍한다.
+- 스킬: Gemini CLI 는 에이전트 스킬 표준(SKILL.md)을 `~/.gemini/skills/`·`~/.agents/skills/`·워크스페이스 `.gemini/skills/` 에서 읽는다. 피터보이스 스킬을 쓰려면 `~/.gemini/skills/<name> → ~/.claude/skills/<name>` 심링크.
+- 상태: 하트비트 payload 의 `gemini_available`(설치+키, 5분 캐시).
+- 자동 업데이트 대상 아님 — `AutoUpdater` 는 Claude·Codex 만 갱신한다. 검증된 버전은 0.55.1.
+- 실행 로그 예: `Gemini: project=branch:1024, dir=…, session=new, model=gemini-4-argon, context=stdin 61234B`
+

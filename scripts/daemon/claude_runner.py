@@ -14,8 +14,8 @@ from pathlib import Path
 import re
 
 from daemon.globals import (
-    IS_WINDOWS, CLAUDE_CMD, CODEX_CMD, PROMPTS_DIR, SECRETS_ENV_PATH,
-    MAX_CONTEXT_OVERFLOW_RETRIES,
+    IS_WINDOWS, CLAUDE_CMD, CODEX_CMD, GEMINI_CMD, PROMPTS_DIR, SECRETS_ENV_PATH,
+    MAX_CONTEXT_OVERFLOW_RETRIES, DEFAULT_GEMINI_MODEL,
     config, sessions_lock, shutdown_event, logger,
 )
 from daemon.limits import (
@@ -40,6 +40,7 @@ from daemon.sessions import (
     reset_session, session_key,
     save_session_context, _save_session_summary, _build_session_context_prompt,
     get_codex_session_id, update_codex_session, reset_codex_session,
+    get_gemini_session_id, update_gemini_session, reset_gemini_session,
 )
 from daemon.tasks import get_current_task, get_task_description
 from daemon.prompts import get_prompt_file, build_system_prompt, build_connected_services_note, apply_roster_placeholder
@@ -1482,6 +1483,351 @@ def run_codex(prompt: str, project: str, _retry_count: int = 0) -> tuple[str, st
     finally:
         # 성공·실패 어느 쪽으로 끝나든 한도를 갱신한다.
         _report_codex_usage(api_key, project, model, new_session_id)
+        try:
+            _release_semaphore()
+        except ValueError:
+            pass
+
+
+# ─── Gemini CLI engine (제3 엔진, 2026-10-14) ───────────────────────────────
+# 코덱스 러너와 같은 계약: (response_text, session_id, tool_lines, timed_out).
+# 차이 두 가지.
+#  1) 컨텍스트(시스템 가이드+공통+역할+세션 맥락)는 프로젝트 폴더에 파일(GEMINI.md)로 쓰지 않고
+#     새 세션 첫 턴에 stdin 으로 넘긴다 — 9/19 코덱스 AGENTS.md 사고(디스크 잔재가 그래프·git 으로
+#     샘, 같은 폴더 브랜치끼리 덮어씀) 재발 방지. 재개 턴은 -p 만(세션이 기억한다, 10/14 실측).
+#  2) 출력은 --output-format stream-json 을 줄 단위로 읽는다:
+#     init(session_id) / tool_use / tool_result / message(role=assistant, delta) / result(stats).
+# 근거·실측: docs/plans/2026-10-14-gemini-argon-engine-pilot-review.md
+
+_GEMINI_STDERR_NOISE = ("256-color", "YOLO mode", "Skill conflict", "is overriding", "[STARTUP]", "Retrying with backoff")
+_GEMINI_TOOL_LABELS = {
+    "run_shell_command": "Shell", "read_file": "Read", "write_file": "Write", "replace": "Edit",
+    "list_directory": "List", "glob": "Glob", "search_file_content": "Grep", "grep_search": "Grep",
+    "read_many_files": "ReadMany", "google_web_search": "WebSearch", "web_fetch": "WebFetch",
+    "activate_skill": "Skill", "save_memory": "Memory",
+}
+
+
+def _gemini_api_key() -> str | None:
+    key = os.environ.get("GEMINI_API_KEY") or config.get("gemini_api_key")
+    if key:
+        return key
+    try:
+        if SECRETS_ENV_PATH.exists():
+            for line in SECRETS_ENV_PATH.read_text(encoding="utf-8").splitlines():
+                if line.startswith("GEMINI_API_KEY="):
+                    return line.split("=", 1)[1].strip().strip('"').strip("'") or None
+    except Exception:
+        pass
+    return None
+
+
+def _gemini_tool_brief(name: str, params) -> str:
+    label = _GEMINI_TOOL_LABELS.get(name, name or "tool")
+    if not isinstance(params, dict):
+        return label
+    for k in ("command", "file_path", "path", "absolute_path", "url", "query", "prompt", "pattern", "name", "skill_name"):
+        v = params.get(k)
+        if v:
+            return f"{label}: {' '.join(str(v).split())[:80]}"
+    return label
+
+
+def _gemini_clean_stderr(text: str) -> str:
+    lines = [l for l in _strip_ansi(text or "").splitlines() if l.strip() and not any(n in l for n in _GEMINI_STDERR_NOISE)]
+    return "\n".join(lines)[:500]
+
+
+def _engine_context(project: str) -> dict:
+    """프로젝트/브랜치/칸반 식별 → 작업 폴더·설정·원본 데이터 (run_codex 와 같은 해석)."""
+    ctx = {"is_branch": project.startswith("branch:"), "is_kanban": project.startswith("kanban:"),
+           "branch_data": None, "kanban_card": None}
+    if ctx["is_branch"]:
+        from daemon.branches import fetch_branch
+        ctx["branch_data"] = fetch_branch(int(project.split(":")[1]))
+        real = ctx["branch_data"].get("project_id", "general") if ctx["branch_data"] else "general"
+    elif ctx["is_kanban"]:
+        from daemon.kanban import _fetch_kanban_card
+        ctx["kanban_card"] = _fetch_kanban_card(int(project.split(":")[1]))
+        real = ctx["kanban_card"].get("project_id", "general") if ctx["kanban_card"] else "general"
+    else:
+        real = project
+    ctx["settings_project"] = real
+    ctx["project_dir"] = get_project_dir(real)
+    ctx["proj_settings"] = _fetch_project_settings(real)
+    return ctx
+
+
+def _engine_prompts(project: str, ctx: dict, sid: str | None, prompt: str) -> tuple[str, str]:
+    """(결합 시스템 프롬프트, 유저 프롬프트). 새 세션이면 유저 프롬프트 앞에 브랜치/칸반/세션 맥락을 붙인다.
+    run_codex 의 프롬프트 조립과 같은 내용 — 코덱스 쪽은 건드리지 않으려고 분리해 두었다."""
+    if ctx["is_branch"] and ctx["branch_data"]:
+        from daemon.branches import build_branch_prompt, build_branch_context
+        combined = build_branch_prompt(ctx["branch_data"])
+        if not sid:
+            prompt = f"{build_branch_context(ctx['branch_data'])}\n\n---\n\n{prompt}"
+        return combined, prompt
+    if ctx["is_kanban"] and ctx["kanban_card"]:
+        from daemon.kanban import build_kanban_prompt, build_kanban_card_context
+        combined = build_kanban_prompt(ctx["kanban_card"])
+        if not sid:
+            prompt = f"{build_kanban_card_context(ctx['kanban_card'])}\n\n---\n\n{prompt}"
+        return combined, prompt
+    current_task = get_current_task(project)
+    task_desc = get_task_description(project, current_task)
+    sys_prompt = build_system_prompt(project, current_task, task_desc)
+    system_prompt_pv = fetch_prompt_from_supabase("_petervoice_system", user_id_override=0) or ""
+    common_prompt = fetch_prompt_from_supabase("_common") or ""
+    if common_prompt and "{동적으로 키 목록 삽입}" in common_prompt:
+        secret_keys = []
+        if SECRETS_ENV_PATH.exists():
+            for line in SECRETS_ENV_PATH.read_text(encoding="utf-8").splitlines():
+                if "=" in line:
+                    secret_keys.append(line.split("=", 1)[0])
+        key_list = "\n".join(f"- {k}" for k in secret_keys) if secret_keys else "(없음)"
+        common_prompt = common_prompt.replace("{동적으로 키 목록 삽입}", key_list)
+    prompt_file = get_prompt_file(project)
+    prompt_content = prompt_file.read_text(encoding="utf-8") if prompt_file and prompt_file.exists() else ""
+    session_context = _build_session_context_prompt(project) if not sid else ""
+    combined = "\n\n".join(p for p in [sys_prompt, system_prompt_pv, common_prompt, prompt_content, session_context] if p)
+    return combined, prompt
+
+
+def run_gemini(prompt: str, project: str, _retry_count: int = 0) -> tuple[str, str | None, list[str], bool]:
+    """Run Gemini CLI (headless, stream-json) and return (response_text, session_id, tool_lines, timed_out)."""
+    api_key = config["api_key"]
+    bot_name = config.get("bot_name", "bot")
+
+    ctx = _engine_context(project)
+    project_dir = ctx["project_dir"]
+    branch_data = ctx["branch_data"]
+    proj_settings = ctx["proj_settings"]
+    sid = get_gemini_session_id(project)
+    combined, prompt = _engine_prompts(project, ctx, sid, prompt)
+
+    # 모델: 브랜치 > 프로젝트 > config > 기본값. gemini-* 가 아닌 코드(claude/gpt 잔재)는 무시.
+    branch_model = branch_data.get("model") if ctx["is_branch"] and branch_data else None
+    model = branch_model or proj_settings.get("model") or proj_settings.get("gemini_model") or config.get("gemini_default_model")
+    if not model or not str(model).startswith("gemini"):
+        model = DEFAULT_GEMINI_MODEL
+
+    gemini_key = _gemini_api_key()
+    if not gemini_key:
+        return (
+            "이 기기에는 Gemini API 키가 없습니다. 설정 > 시크릿에 GEMINI_API_KEY 를 등록하면 이 엔진을 쓸 수 있어요. "
+            "그 전까지는 엔진을 Claude 로 되돌려 주세요.",
+            sid, [], False,
+        )
+
+    cmd = [GEMINI_CMD, "-m", model, "--yolo", "--output-format", "stream-json"]
+    if sid:
+        cmd.extend(["--resume", sid])
+    cmd.extend(["-p", prompt])
+    feed_stdin = bool(combined) and not sid   # 새 세션 첫 턴에만 컨텍스트를 stdin 으로
+
+    logger.info(f"[{bot_name}] Gemini: project={project}, dir={project_dir}, session={sid or 'new'}, model={model}, "
+                f"context={'stdin %dB' % len(combined.encode('utf-8')) if feed_stdin else 'resume'}")
+
+    _sem_held = False
+    new_session_id = sid
+    proc = None
+
+    def _release_semaphore():
+        nonlocal _sem_held
+        if _sem_held:
+            _sem_held = False
+            g.claude_semaphore.release()
+
+    try:
+        g.claude_semaphore.acquire()
+        _sem_held = True
+        gemini_env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
+        gemini_env.update({
+            "LANG": "en_US.UTF-8",
+            "GEMINI_API_KEY": gemini_key,
+            "GEMINI_CLI_TRUST_WORKSPACE": "true",   # 폴더 신뢰 프롬프트 없이 헤드리스 실행
+            "NO_COLOR": "1",
+        })
+
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE if feed_stdin else subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd=project_dir,
+            env=gemini_env,
+            shell=IS_WINDOWS,
+        )
+        if feed_stdin:
+            # 파이프 버퍼(64KB)보다 큰 컨텍스트를 동기로 쓰면 자식이 stdout 을 채울 때 교착할 수 있어 스레드로 흘린다.
+            def _feed(p=proc, data=combined + "\n\n---\n\n"):
+                try:
+                    p.stdin.write(data.encode("utf-8"))
+                    p.stdin.close()
+                except Exception as e:
+                    logger.warning(f"[{bot_name}] Gemini stdin feed failed: {e}")
+            threading.Thread(target=_feed, daemon=True).start()
+
+        response_text = ""
+        tool_lines: list[str] = []
+        error_text = ""
+        last_stream_time = time.time()
+        last_activity_time = time.time()
+        process_start_time = time.time()
+        stdout_timeout = config.get("claude_stdout_timeout_sec", 600)
+        hard_timeout = config.get("claude_hard_timeout_sec", 900)
+        hard_timeout_with_tools = config.get("claude_hard_timeout_with_tools_sec", 1800)
+        stream_interval = config.get("stream_interval_sec", 2.0)
+        _drain_deadline = None
+
+        def _stream_partial(force: bool = False):
+            nonlocal last_stream_time
+            if not force and time.time() - last_stream_time < stream_interval:
+                return
+            streaming = "\n".join(tool_lines) + "\n\n" + response_text if tool_lines else response_text
+            if streaming.strip():
+                api_request(api_key, "POST", "/api/bot/reply", {"text": streaming, "project": project, "is_final": False})
+                last_stream_time = time.time()
+
+        while True:
+            if shutdown_event.is_set():
+                if _drain_deadline is None:
+                    _drain_sec = config.get("shutdown_drain_sec", 90)
+                    _drain_deadline = time.time() + _drain_sec
+                    logger.info(f"[{bot_name}] Shutdown requested — draining gemini turn for {project} (up to {_drain_sec}s)")
+                elif time.time() >= _drain_deadline:
+                    logger.warning(f"[{bot_name}] Drain limit exceeded for {project} — killing gemini; message stays queued for auto-resume")
+                    proc.kill()
+                    return (SHUTDOWN_INTERRUPTED, new_session_id, tool_lines, False)
+
+            elapsed = time.time() - process_start_time
+            effective_hard_timeout = hard_timeout_with_tools if tool_lines else hard_timeout
+            if elapsed > effective_hard_timeout:
+                label = "with-tools" if tool_lines else "no-tools"
+                logger.error(f"[{bot_name}] Gemini hard timeout ({label}, {effective_hard_timeout}s, elapsed {elapsed:.0f}s) for {project}, killing")
+                proc.kill()
+                return (f"(Gemini 실행 시간 초과 - {elapsed:.0f}초 경과)", sid, tool_lines, True)
+
+            if IS_WINDOWS:
+                import threading as _thr
+                _line_ready = _thr.Event()
+                def _check_readable():
+                    try:
+                        if proc.stdout.readable():
+                            _line_ready.set()
+                    except Exception:
+                        _line_ready.set()
+                _t = _thr.Thread(target=_check_readable, daemon=True)
+                _t.start()
+                _t.join(timeout=2)
+                ready = _line_ready.is_set()
+            else:
+                ready_list, _, _ = select.select([proc.stdout], [], [], 2)
+                ready = bool(ready_list)
+
+            if not ready:
+                if proc.poll() is not None:
+                    break
+                if time.time() - last_activity_time > stdout_timeout:
+                    logger.error(f"[{bot_name}] Gemini stdout timeout ({stdout_timeout}s) for {project}, killing")
+                    proc.kill()
+                    return (f"(Gemini 응답 시간 초과 - {stdout_timeout}초 동안 출력 없음)", sid, tool_lines, True)
+                uid = resolve_user_id()
+                _sr = get_stop_request(uid) if uid else {"requested": False}
+                if _sr.get("requested") and (not _sr.get("project") or _sr.get("project") == project):
+                    logger.info(f"[{bot_name}] Stop requested for {project}, terminating gemini process")
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                    clear_stop_requested(uid)
+                    partial = response_text.strip()
+                    result = partial + "\n\n(작업이 중단되었습니다)" if partial else "(작업이 중단되었습니다)"
+                    return (result, new_session_id, tool_lines, False)
+                continue
+
+            raw = proc.stdout.readline()
+            if not raw:
+                break
+            last_activity_time = time.time()
+            line = raw.decode("utf-8", errors="replace").strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue   # 업데이트 안내 등 비-JSON 줄은 무시
+            if not isinstance(event, dict):
+                continue
+
+            etype = event.get("type", "")
+            if etype == "init":
+                new_session_id = event.get("session_id") or new_session_id
+            elif etype == "tool_use":
+                tool_lines.append(f"🔧 {_gemini_tool_brief(event.get('tool_name', ''), event.get('parameters'))}")
+                _stream_partial(force=True)
+            elif etype == "tool_result":
+                if event.get("status") not in (None, "success") and tool_lines:
+                    tool_lines[-1] += " ✗"
+            elif etype == "message":
+                if event.get("role") == "assistant":
+                    response_text += event.get("content") or ""
+                    _stream_partial()
+            elif etype == "result":
+                st = event.get("stats") or {}
+                logger.info(f"[{bot_name}] Gemini turn done for {project}: status={event.get('status')}, "
+                            f"input={st.get('input_tokens', '?')}, output={st.get('output_tokens', '?')}, cached={st.get('cached', '?')}, "
+                            f"tools={st.get('tool_calls', 0)}, {st.get('duration_ms', '?')}ms")
+                if event.get("status") not in (None, "success"):
+                    error_text = str(event.get("error") or event.get("message") or event.get("status"))
+            elif etype == "error":
+                error_text = str(event.get("message") or event.get("error") or event)
+                logger.error(f"[{bot_name}] Gemini error event for {project}: {error_text[:300]}")
+
+        proc.wait(timeout=300)
+        stderr_output = _gemini_clean_stderr(proc.stderr.read().decode("utf-8", errors="replace"))
+
+        if proc.returncode != 0 and not response_text:
+            logger.error(f"[{bot_name}] Gemini exited {proc.returncode}: {stderr_output[:500]}")
+            # 세션 파일이 사라졌거나 폴더가 바뀌어 재개 실패 → 세션 리셋 후 1회 재시도 (exit 42 "Error resuming session", 10/14 실측)
+            if sid and ("resuming session" in stderr_output.lower() or "invalid session" in stderr_output.lower()):
+                logger.warning(f"[{bot_name}] Invalid gemini session for {project}, resetting (retry {_retry_count + 1})")
+                reset_gemini_session(project)
+                _release_semaphore()
+                if _retry_count >= MAX_CONTEXT_OVERFLOW_RETRIES:
+                    return ("(Gemini 세션 오류 - 최대 재시도 횟수 초과)", None, tool_lines, False)
+                return run_gemini(prompt, project, _retry_count + 1)
+            detail = error_text or stderr_output.splitlines()[0] if (error_text or stderr_output) else ""
+            return (f"(Gemini 오류: exit {proc.returncode}{' - ' + detail[:200] if detail else ''})", new_session_id, tool_lines, False)
+
+        if not response_text:
+            if error_text:
+                response_text = f"(Gemini 오류: {error_text[:200]})"
+            else:
+                response_text = "(작업 완료)" if tool_lines else "(응답 없음)"
+
+        if new_session_id:
+            update_gemini_session(project, new_session_id)
+
+        return (response_text, new_session_id, tool_lines, False)
+
+    except subprocess.TimeoutExpired:
+        if proc:
+            proc.kill()
+        logger.error(f"[{bot_name}] Gemini timed out for {project}")
+        return ("(Gemini 응답 시간 초과)", sid, [], True)
+    except FileNotFoundError:
+        logger.error(f"[{bot_name}] Gemini CLI not installed on this machine ({GEMINI_CMD})")
+        return (
+            "이 기기에는 Gemini CLI가 설치되어 있지 않습니다. `npm install -g @google/gemini-cli` 로 설치하고 "
+            "시크릿에 GEMINI_API_KEY 를 등록하면 이 엔진을 쓸 수 있어요. 그 전까지는 엔진을 Claude 로 되돌려 주세요.",
+            sid, [], False,
+        )
+    except Exception as e:
+        logger.error(f"[{bot_name}] Gemini error: {e}")
+        return (f"(Gemini 실행 오류: {e})", sid, [], False)
+    finally:
         try:
             _release_semaphore()
         except ValueError:

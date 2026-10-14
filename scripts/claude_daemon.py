@@ -14,7 +14,7 @@ import signal
 import daemon.globals as g
 from daemon.globals import config, shutdown_event, logger
 from daemon.config import setup_logging, load_config, acquire_pid_lock, release_pid_lock, cleanup_stale_state, ensure_default_projects
-from daemon.sessions import load_sessions, load_codex_sessions, _process_pending_resets
+from daemon.sessions import load_sessions, load_codex_sessions, load_gemini_sessions, _process_pending_resets
 from daemon.tasks import load_tasks
 from daemon.prompts import ensure_template
 from daemon.queue import load_queue
@@ -986,6 +986,7 @@ def main():
         _ensure_launchd_exit_timeout()
         load_sessions()
         load_codex_sessions()
+        load_gemini_sessions()
         load_tasks()
         ensure_template()
 

@@ -25,7 +25,7 @@ from daemon.tasks import (
     get_current_task, get_task_description, set_current_task, list_tasks,
 )
 from daemon.prompts import get_prompt_file, build_system_prompt
-from daemon.claude_runner import run_claude, run_codex, rewrite_for_voice, SHUTDOWN_INTERRUPTED
+from daemon.claude_runner import run_claude, run_codex, run_gemini, rewrite_for_voice, SHUTDOWN_INTERRUPTED
 from daemon.queue import enqueue_message, dequeue_message
 from daemon.utils import resolve_files, cleanup_downloads, _split_text_chunks, _read_json, _write_json, with_sender
 from daemon.encryption import decrypt_message, get_encryptor
@@ -76,6 +76,7 @@ class Worker(threading.Thread):
             "active_projects": projects_list,
             "version": g.DAEMON_VERSION,   # 데몬 git HEAD — stale 고객 식별용
             "codex_available": g.detect_codex_available(),  # 웹 헤더 Codex 선택지 활성화 여부
+            "gemini_available": g.detect_gemini_available(),  # 제3 엔진(Gemini CLI) 설치+키 여부 (2026-10-14)
         }
         if project:
             payload["project"] = project
@@ -165,8 +166,9 @@ class Worker(threading.Thread):
             save_session_context(project)
             reset_session(project)
             # Also reset Codex session if exists
-            from daemon.sessions import reset_codex_session
+            from daemon.sessions import reset_codex_session, reset_gemini_session
             reset_codex_session(project)
+            reset_gemini_session(project)
             self.reply(f"세션을 초기화했습니다. 이전 맥락이 저장되었습니다. (작업: {current_task_name})", reply_to=[msg_id], project=project)
             dequeue_message(msg_id)
             return
@@ -389,6 +391,8 @@ class Worker(threading.Thread):
             )
         elif _engine == "codex":
             response, sid, tool_lines, timed_out = run_codex(prompt_text, project)
+        elif _engine == "gemini":
+            response, sid, tool_lines, timed_out = run_gemini(prompt_text, project)
         else:
             # 한 턴에 시각이 다른 발화가 여러 개 나올 수 있다(백그라운드 작업 완료로 턴 재개).
             # 각 발화를 따로 받아 개별 메시지로 보내면 각자의 타임스탬프가 찍힌다.

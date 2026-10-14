@@ -75,6 +75,36 @@ def _find_codex_cmd() -> str:
 
 CODEX_CMD = _find_codex_cmd()
 
+# ─── Resolve gemini CLI path (제3 엔진, 2026-10-14) ─────────────
+def _find_gemini_cmd() -> str:
+    found = shutil.which("gemini", path=_extended_path())
+    if found:
+        return found
+    if IS_WINDOWS:
+        npm_gemini = Path.home() / "AppData" / "Roaming" / "npm" / "gemini.cmd"
+        if npm_gemini.exists():
+            return str(npm_gemini)
+    return "gemini"
+
+GEMINI_CMD = _find_gemini_cmd()
+
+# ─── Gemini 가용성(설치+API 키) 감지 — 5분 캐시 ──────────────────
+_gemini_avail_cache = {"ts": 0.0, "val": False}
+def detect_gemini_available() -> bool:
+    """gemini CLI 설치+키 여부. 설치=`gemini --version` 성공, 키=env/config 의 GEMINI_API_KEY."""
+    now = time.time()
+    if now - _gemini_avail_cache["ts"] < 300 and _gemini_avail_cache["ts"] > 0:
+        return _gemini_avail_cache["val"]
+    val = False
+    try:
+        r = subprocess.run([GEMINI_CMD, "--version"], capture_output=True, text=True, timeout=15)
+        if r.returncode == 0:
+            val = bool(os.environ.get("GEMINI_API_KEY") or config.get("gemini_api_key"))
+    except Exception:
+        val = False
+    _gemini_avail_cache.update(ts=now, val=val)
+    return val
+
 # ─── Codex 가용성(설치+인증) 감지 — 5분 캐시 ────────────────────
 # 웹 헤더가 이 값으로 Codex 모델 선택지를 활성/비활성("코덱스 미설치") 표시한다.
 _codex_avail_cache = {"ts": 0.0, "val": False}
@@ -136,9 +166,11 @@ WORKFLOWS_DIR = DAEMON_DIR / "workflows"
 DOCS_STATE_PATH = DAEMON_DIR / "docs_state.json"  # legacy, kept for cleanup
 RESTART_TRIGGER_PATH = DAEMON_DIR / "restart_trigger.json"
 CODEX_SESSIONS_PATH = DAEMON_DIR / "codex_sessions.json"
+GEMINI_SESSIONS_PATH = DAEMON_DIR / "gemini_sessions.json"
 
 # ─── Constants ──────────────────────────────────────────────────
 MAX_CONTEXT_OVERFLOW_RETRIES = 2
+DEFAULT_GEMINI_MODEL = "gemini-4-argon"   # engine=gemini 인데 모델 미지정/비-gemini 코드일 때
 ACK_MESSAGE = "접수했습니다. 처리 중..."
 SESSION_MANAGER_PROJECT = "session-manager"
 SKILLS_DIR = Path.home() / ".claude" / "skills"
