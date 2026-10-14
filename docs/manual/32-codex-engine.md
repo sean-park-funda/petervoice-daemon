@@ -9,8 +9,8 @@ Peter Voice 데몬은 **Claude Code CLI**, **OpenAI Codex CLI**, 그리고 2026-
 
 | 엔진 | CLI | 모델 기본값 | 적합한 경우 |
 |------|-----|-----------|-----------|
-| `claude` | `@anthropic-ai/claude-code` | claude-sonnet-4-6 | 기본값, 코드 이해/수정 |
-| `codex` | `@openai/codex` | OpenAI 기본값 | 클라우드 유저 기본값 |
+| `claude` | `@anthropic-ai/claude-code` | config `claude_model`, 없으면 `claude-opus-5-5`(러너 폴백) | 기본값, 코드 이해/수정 |
+| `codex` | `@openai/codex` | OpenAI 기본값 | 맥 데몬 전용. 웹은 클라우드 유저의 새 프로젝트에 `codex` 를 기본값으로 저장하지만(2026-06-10 a7b37d6) **클라우드 데몬은 engine 을 보지 않고 항상 Claude 로 실행**한다 — 설정값과 실제 엔진이 다름(2026-10-15 확인) |
 | `gemini` | `@google/gemini-cli` | gemini-4-argon | 맥미니(셀프호스팅) 전용 파일럿. 클라우드 데몬은 미지원 |
 
 ## 설정 방법

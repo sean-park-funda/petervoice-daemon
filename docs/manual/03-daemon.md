@@ -274,7 +274,7 @@ DocsSyncer는 제거되었다. docs는 DB 싱크 없이 Home Portal API가 로�
   ↓ 프로젝트 busy 확인
   ↓
 "[heartbeat] HEARTBEAT.md를 확인하고 할 일이 있으면 처리해줘"
-  → POST /api/bot/reply로 주입
+  → POST /api/bot/message로 주입 (inject_system_message, api.py)
   ↓
 next_run_at 갱신, run_count 증가
 ```
