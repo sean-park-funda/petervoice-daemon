@@ -89,14 +89,19 @@ def local_access_token(config_dir: str | None = None) -> str | None:
     """이 머신의 기본(또는 config_dir) 계정 액세스 토큰.
     macOS 는 키체인이 정본(파일은 stale 로 남는다), 리눅스는 CLAUDE_CONFIG_DIR/.credentials.json."""
     if sys.platform == "darwin" and not config_dir:
-        try:
-            r = subprocess.run(["security", "find-generic-password", "-s", KEYCHAIN_SERVICE, "-w"],
-                               capture_output=True, text=True, timeout=10)
-            tok = token_from_credentials_json(r.stdout.strip()) if r.returncode == 0 else None
-            if tok:
-                return tok
-        except Exception:
-            pass
+        # CLI 는 acct=$USER 항목에 쓴다. -a 없이 찾으면 같은 이름의 낡은 항목(acct=unknown — USER 없는
+        # 환경에서 한 번 로그인된 흔적)을 먼저 집어 API 가 매번 실패하고 15분마다 CLI 폴백이 돌았다
+        # (2026-10-14 Sean 맥 실측: 10/06 만료 토큰을 읽어 하루 96회 `claude -p /usage`).
+        user = os.environ.get("USER") or os.environ.get("LOGNAME")
+        for extra in ([["-a", user]] if user else []) + [[]]:
+            try:
+                r = subprocess.run(["security", "find-generic-password", "-s", KEYCHAIN_SERVICE, *extra, "-w"],
+                                   capture_output=True, text=True, timeout=10)
+                tok = token_from_credentials_json(r.stdout.strip()) if r.returncode == 0 else None
+                if tok:
+                    return tok
+            except Exception:
+                pass
     base = Path(os.path.expanduser(config_dir)) if config_dir else Path(os.path.expanduser("~/.claude"))
     try:
         return token_from_credentials_json((base / ".credentials.json").read_text())
