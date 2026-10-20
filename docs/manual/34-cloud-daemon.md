@@ -83,6 +83,17 @@
 - 격리: 컨테이너 간 트래픽 차단(브리지 iptables DROP), 방치된 agent-browser 크롬은 리퍼가 매시간 정리
 - 설계·검증: `docs/plans/2026-09-17-cloud-always-on-containers.md`
 
+## Claude 계정 한도 · 사용량 보고 (2026-10-21 이식)
+
+맥 데몬 `daemon/limits.py` 의 장치를 `cloud_daemon.py` 에 옮겼다 (이식 전 실측: 공용 호스트 저널 9/22~10/20 실패 턴 12건 중 11건이 한도 문구였는데 전부 "(처리 중 오류가 발생했어요)" 로 나갔고, 쿨다운이 없어 같은 유저가 1시간에 11번 헛스폰했다).
+
+- **감지**: `_parse_turn_result` 의 세 분기(exit≠0 · exit 0 + `is_error` · json 폴백) 모두에서 `detect_usage_limit` — 정규식은 limits.py 와 같다(`hit your <x> limit` = 세션/주간, `reached your <model> limit` = 모델별).
+- **안내**: 첫 문장은 맥과 같은 고정 앞머리 `⏸ Claude 계정 세션 한도에 도달` (모델별은 `⚠️ <모델> 모델 사용 한도에 도달`). 리셋 시각은 CLI 가 찍은 시간대(`(UTC)`·`(Asia/Seoul)`, 없으면 UTC)로 읽어 **KST** 로 보여준다. 호스트가 UTC 라 주간 한도는 `resets Sep 29, 3am (UTC)` 처럼 날짜가 붙는다.
+- **쿨다운**: **유저 단위**(`_limit_cooldowns[user_id]`) — 한 데몬이 여러 사람을 돌리므로 맥처럼 데몬 전체를 멈추지 않는다. 세션/주간 한도만 건다(모델별은 안내만, 폴백 모델 재시도 없음). 리셋 시각까지(기본 30분, 상한 6시간), 10분마다 1회 진짜로 찔러보는 카나리아, 정상 완료·재로그인(계정 이메일 변경)·`/usage` 조회가 세션·주간 모두 90% 미만이면 즉시 해제. 쿨다운 중 메시지는 CLI 를 띄우지 않고 `⏸ Claude 계정 사용 한도에 걸려 있습니다 — …` 로 답한다.
+- **턴 집계**: 상태 `limited` 는 `record_turn` 을 타지 않는다(auth 실패와 같은 미소비).
+- **사용량 보고**: 턴 끝에 맥 `claude_runner.py` 와 같은 필드로 `POST /api/usage` (유저 api_key, 백그라운드) — stream-json 의 assistant `message.model` 과 result `usage` 에서 읽는다. `token_usage` 는 턴 한도 집계와 무관하고 웹 `/api/usage` GET(사용량 화면)만 읽는다.
+- 로그: `[limits] user=N … 계정 한도 감지/쿨다운 시작/해제`, `[usage] report failed` (저널 `journalctl -u pv-cloud`).
+
 ## 운영
 
 - 상태 확인: /admin → 프로비저닝 탭 → "클라우드 데몬" 카드 (heartbeat 기반 생존 판정)

@@ -1230,7 +1230,15 @@ def with_sender(msg: dict, text: str) -> str:
 
 def run_claude_turn(user_id: int, project: str, prompt: str) -> tuple[str, str]:
     """한 턴 실행. returns (응답 텍스트, 상태).
-    상태: "ok" | "auth" (재로그인 필요) | "heavy_mem" (메모리 초과) | "heavy_time" (시간 초과)."""
+    상태: "ok" | "auth" (재로그인 필요) | "heavy_mem" (메모리 초과) | "heavy_time" (시간 초과)
+          | "limited" (Claude 계정 한도 — 턴 미소비)."""
+    # 계정 한도 쿨다운 중이면 CLI 를 아예 띄우지 않는다 (유저 단위 — 다른 유저는 영향 없음).
+    # 맥 claude_runner.py 와 같은 이유: 한도는 그 계정의 프로젝트들이 나눠 쓰는 자원이라
+    # 한 프로젝트가 계속 찔러대면 하트비트·릴레이까지 전부 헛스폰이 된다.
+    _cd = user_cooldown_notice(user_id)
+    if _cd:
+        logger.warning(f"[limits] user={user_id} project={project} 계정 한도 쿨다운 중 — 스폰 생략")
+        return (_cd, "limited")
     # T3: 컨테이너 모드 유저는 podman exec 경로
     if ctr.enabled_for(user_id):
         user = roster.get(user_id)
@@ -1413,6 +1421,8 @@ class _StreamCollector:
         self.is_error = False
         self.error_text = ""
         self.saw_result = False
+        self.model = ""          # assistant 이벤트의 message.model (사용량 보고용)
+        self.usage: dict = {}    # result 이벤트의 usage (input/output/cache 토큰)
         self._seg_start = 0
         self._pending_boundary = False
         self._saw_event = False
@@ -1434,6 +1444,7 @@ class _StreamCollector:
         et = ev.get("type", "")
         changed = False
         if et == "assistant":
+            self.model = (ev.get("message") or {}).get("model") or self.model
             for block in (ev.get("message") or {}).get("content", []) or []:
                 bt = block.get("type")
                 if bt == "tool_use":
@@ -1458,6 +1469,8 @@ class _StreamCollector:
             self.saw_result = True
             if ev.get("session_id"):
                 self.session_id = ev["session_id"]
+            if ev.get("usage"):
+                self.usage = dict(ev["usage"])
             rt = (ev.get("result") or "")
             if ev.get("is_error"):
                 self.is_error = True
@@ -1545,6 +1558,221 @@ def _run_streaming(wrapped: list[str], user_id: int, project: str, timeout: int)
     return (rc, "".join(out_lines), "".join(err_buf))
 
 
+# ── Claude 계정 사용 한도 — 맥 daemon/limits.py 의 감지·안내·쿨다운 이식 (2026-10-21) ─────
+# 정규식과 안내 첫 문장("⏸ Claude 계정 세션 한도에 도달")은 limits.py 와 같게 둔다 — 담당 집계가
+# 본문 없이 고정 앞머리로 센다. 클라우드만 다른 점:
+#   · 쿨다운은 **유저(=그 유저의 Claude 계정) 단위**. 한 데몬이 여러 사람을 돌리므로 전체를 멈추지 않는다.
+#   · 리셋 시각은 CLI 가 찍은 시간대("(UTC)"·"(Asia/Seoul)")로 해석해 **KST** 로 보여준다. 호스트가 UTC 라
+#     문구가 "resets Sep 29, 3am (UTC)" 처럼 날짜를 포함하기도 한다(주간 한도).
+#   · 모델별 한도는 안내만 한다(맥의 폴백 모델 재시도는 이식하지 않음 — 유저가 설정 > 모델에서 바꾼다).
+# 이식 전 실측(공용 호스트 저널 9/22~10/20): 실패 턴 12건 중 11건이 한도 문구였고 전부
+# "(처리 중 오류가 발생했어요)" 로 나갔다. 쿨다운이 없어 같은 유저가 1시간에 11번 헛스폰했다.
+_MODEL_LIMIT_RE = re.compile(r"reached your ([A-Za-z0-9 .\-]{1,30}?) limit", re.I)
+_SESSION_LIMIT_RE = re.compile(r"hit your ([a-z]+) limit", re.I)
+_RESET_RE = re.compile(r"resets\s+([^·\n]{1,40})", re.I)
+# "Sep 29, 3am (UTC)" · "4:10pm (Asia/Seoul)" · "3am"
+_RESET_TIME_RE = re.compile(
+    r"(?:([A-Za-z]{3})\.?\s+(\d{1,2}),?\s+)?(\d{1,2})(?::(\d{2}))?\s*([ap])\.?m\b"
+    r"(?:\s*\(([A-Za-z_/+\-0-9]+)\))?", re.I)
+_MONTHS = {m: i for i, m in enumerate(
+    ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"], 1)}
+KST = timezone(timedelta(hours=9))
+LIMIT_COOLDOWN_PROBE_SEC = 600        # 쿨다운 중에도 이 간격으로 한 번은 진짜로 찔러본다(조기 복구 카나리아)
+LIMIT_COOLDOWN_DEFAULT_SEC = 1800     # 리셋 시각을 못 읽었을 때
+LIMIT_COOLDOWN_MAX_SEC = 6 * 3600     # 파싱이 틀려도 이 이상은 절대 멈추지 않는다 (주간 한도도 6시간마다 재확인)
+USAGE_CLEAR_PCT = 90                  # 사용량 조회가 이 아래면 "한도"라는 판단이 틀린 것으로 본다
+_limit_lock = threading.Lock()
+_limit_cooldowns: dict[int, dict] = {}   # user_id → {until, next_probe, reason, resets_kst, email}
+
+
+def detect_usage_limit(text: str) -> dict | None:
+    """CLI 오류 원문에서 계정 한도를 판별한다. 아니면 None. (limits.py 와 같은 규칙)"""
+    if not text:
+        return None
+    resets = ""
+    rm = _RESET_RE.search(text)
+    if rm:
+        resets = rm.group(1).strip()
+    mm = _MODEL_LIMIT_RE.search(text)
+    if mm:
+        return {"kind": "model", "label": mm.group(1).strip(), "resets": resets}
+    sm = _SESSION_LIMIT_RE.search(text)
+    if sm:
+        return {"kind": "session", "label": sm.group(1).strip(), "resets": resets}
+    return None
+
+
+def _parse_reset_dt(reset_text: str) -> datetime | None:
+    """"Sep 29, 3am (UTC)" / "4:10pm (Asia/Seoul)" / "3am" → aware datetime. 못 읽으면 None.
+    시간대 표기가 없으면 UTC(호스트·컨테이너 TZ)로 본다."""
+    m = _RESET_TIME_RE.search(reset_text or "")
+    if not m:
+        return None
+    mon, day, hh, mi, ap, tzname = m.groups()
+    tz = timezone.utc
+    if tzname and tzname.upper() != "UTC":
+        try:
+            from zoneinfo import ZoneInfo
+            tz = ZoneInfo(tzname)
+        except Exception:
+            tz = timezone.utc
+    hour = int(hh) % 12 + (12 if ap.lower() == "p" else 0)
+    now = datetime.now(tz)
+    try:
+        if mon and day:
+            month = _MONTHS.get(mon.lower())
+            if not month:
+                return None
+            target = now.replace(month=month, day=int(day), hour=hour, minute=int(mi or 0),
+                                 second=0, microsecond=0)
+            if target < now - timedelta(days=180):    # 해 넘김 (12월에 "Jan 3"). 그 외 과거 날짜는 그대로 둔다
+                target = target.replace(year=now.year + 1)
+        else:
+            target = now.replace(hour=hour, minute=int(mi or 0), second=0, microsecond=0)
+            if target <= now:
+                target += timedelta(days=1)
+    except ValueError:
+        return None
+    return target
+
+
+def _fmt_kst(dt: datetime | None, fallback: str = "") -> str:
+    if not dt:
+        return fallback
+    k = dt.astimezone(KST)
+    return f"{k.month}/{k.day} {k.strftime('%H:%M')} KST"
+
+
+def usage_limit_notice(limit: dict) -> str:
+    """한도로 턴이 끝났을 때 사용자 안내. 첫 문장은 맥(limits.py)과 같은 고정 앞머리."""
+    when = _fmt_kst(_parse_reset_dt(limit.get("resets", "")), limit.get("resets") or "")
+    if limit["kind"] == "model":
+        head = f"⚠️ {limit['label']} 모델 사용 한도에 도달했습니다" + (f" (리셋: {when})" if when else "") + "."
+        return head + "\n다른 모델로 전환하거나 한도 리셋을 기다려야 합니다 (설정 > 모델)."
+    note = "주간 한도 · " if (limit.get("label") or "").lower().startswith("week") else ""
+    head = "⏸ Claude 계정 세션 한도에 도달했습니다" + (f" ({note}리셋: {when})" if when else "") + "."
+    return head + "\n리셋 전까지는 모델을 바꿔도 실행되지 않습니다. 리셋 후 다시 요청해주세요."
+
+
+def _limit_slot(user_id: int) -> dict:
+    return _limit_cooldowns.setdefault(
+        int(user_id), {"until": 0.0, "next_probe": 0.0, "reason": "", "resets_kst": "", "email": None})
+
+
+def start_user_cooldown(user_id: int, reason: str, resets: str = "") -> float:
+    """유저 단위 한도 쿨다운 시작. 종료 epoch 반환. (다른 유저의 턴에는 영향 없음)"""
+    dt = _parse_reset_dt(resets)
+    now = time.time()
+    until = dt.timestamp() if (dt and dt.timestamp() > now) else now + LIMIT_COOLDOWN_DEFAULT_SEC
+    until = min(until, now + LIMIT_COOLDOWN_MAX_SEC)
+    with _limit_lock:
+        slot = _limit_slot(user_id)
+        if until > slot["until"]:
+            slot.update({"until": until, "reason": reason, "resets_kst": _fmt_kst(dt, resets),
+                         "next_probe": now + LIMIT_COOLDOWN_PROBE_SEC,
+                         "email": _claude_account_email(user_id)})   # 바뀌면 = 재로그인 → 즉시 해제
+        else:
+            until = slot["until"]
+    logger.warning(f"[limits] user={user_id} 계정 한도 쿨다운 시작 — {reason}"
+                   f"{f' (resets {resets})' if resets else ''}, {int((until - now) / 60)}분간 CLI 스폰 생략")
+    return until
+
+
+def clear_user_cooldown(user_id: int, why: str = "정상 응답 확인") -> None:
+    with _limit_lock:
+        slot = _limit_slot(user_id)
+        if slot["until"]:
+            logger.info(f"[limits] user={user_id} 계정 한도 쿨다운 해제 ({why})")
+            slot.update({"until": 0.0, "next_probe": 0.0, "reason": "", "resets_kst": "", "email": None})
+
+
+def clear_user_cooldown_if_stale(user_id: int, limits: dict | None) -> None:
+    """사용량 조회(/usage)가 세션·주간 모두 한도 근처가 아니면 쿨다운 판단이 틀린 것 — 해제."""
+    if not limits:
+        return
+    s, w = limits.get("session_pct"), limits.get("week_pct")
+    if s is None and w is None:
+        return
+    with _limit_lock:
+        active = bool(_limit_slot(user_id)["until"])
+    if active and (s is None or s < USAGE_CLEAR_PCT) and (w is None or w < USAGE_CLEAR_PCT):
+        clear_user_cooldown(user_id, f"사용량 조회 session={s}% week={w}%")
+
+
+def user_cooldown_notice(user_id: int) -> str | None:
+    """쿨다운 중이면 사용자에게 보낼 안내(=CLI 스폰 생략). None 이면 실행해도 된다.
+    쿨다운 중이라도 LIMIT_COOLDOWN_PROBE_SEC 마다 한 번은 None 을 돌려줘 실제로 찔러본다."""
+    now = time.time()
+    with _limit_lock:
+        slot = _limit_slot(user_id)
+        until = slot["until"]
+        if not until or now >= until:
+            if until:
+                slot.update({"until": 0.0, "next_probe": 0.0, "reason": "", "resets_kst": "", "email": None})
+            return None
+        started_with = slot["email"]
+    if started_with:
+        current = _claude_account_email(user_id)
+        if current and current != started_with:
+            clear_user_cooldown(user_id, f"계정 변경 {started_with} → {current}")
+            return None
+    with _limit_lock:
+        slot = _limit_slot(user_id)
+        until = slot["until"]
+        if not until or now >= until:
+            return None
+        if now >= slot["next_probe"]:
+            slot["next_probe"] = now + LIMIT_COOLDOWN_PROBE_SEC
+            return None
+        reason, resets_kst = slot["reason"], slot["resets_kst"]
+    if resets_kst:
+        return (f"⏸ Claude 계정 사용 한도에 걸려 있습니다 — {reason} (리셋: {resets_kst}).\n"
+                "리셋 뒤 다시 요청해주세요. 이 메시지는 처리되지 않았습니다.")
+    mins = max(1, int((until - now) / 60))
+    return (f"⏸ Claude 계정 사용 한도에 걸려 있습니다 — {reason}.\n"
+            f"약 {mins}분 뒤 자동으로 다시 시도합니다. 이 메시지는 처리되지 않았으니 그때 다시 요청해주세요.")
+
+
+def _limit_result(user_id: int, project: str, limit: dict, where: str,
+                  col: "_StreamCollector | None" = None) -> tuple[str, str]:
+    """한도 감지 공통 처리: 로그 → (세션 한도면) 유저 쿨다운 → 사용량 보고 → 안내. 상태 'limited' 는
+    워커가 턴으로 세지 않는다(auth 와 같은 취급 — 유저는 아무 것도 받지 못했다)."""
+    logger.warning(f"[limits] user={user_id} project={project} 계정 한도 감지 ({where}: "
+                   f"{limit['kind']}:{limit['label']}{', resets ' + limit['resets'] if limit.get('resets') else ''})")
+    if limit["kind"] == "session":
+        start_user_cooldown(user_id, "세션 한도", limit.get("resets", ""))
+    _report_usage(user_id, project, col)
+    return (usage_limit_notice(limit), "limited")
+
+
+def _report_usage(user_id: int, project: str, col: "_StreamCollector | None") -> None:
+    """턴의 토큰 사용량을 맥(claude_runner.py)과 같은 필드로 /api/usage 에 기록 (유저 api_key, 백그라운드).
+    2026-10-21 이식 — 그전엔 클라우드 유저의 token_usage 가 0행이었다. 턴 한도 집계(record_turn)와는 무관."""
+    if not col or not col.model or not col.usage:
+        return
+    user = roster.get(user_id)
+    api_key = (user or {}).get("apiKey")
+    if not api_key:
+        return
+    u = col.usage
+    body = {
+        "project": project,
+        "model": col.model,
+        "input_tokens": int(u.get("input_tokens") or 0),
+        "output_tokens": int(u.get("output_tokens") or 0),
+        "cache_read_tokens": int(u.get("cache_read_input_tokens") or 0),
+        "cache_write_tokens": int(u.get("cache_creation_input_tokens") or 0),
+    }
+
+    def _post():
+        try:
+            if user_api(api_key, "POST", "/api/usage", body) is None:
+                logger.warning(f"[usage] report failed user={user_id} project={project}")
+        except Exception as e:
+            logger.warning(f"[usage] report error user={user_id}: {e}")
+    threading.Thread(target=_post, daemon=True, name=f"usage-report-{user_id}").start()
+
+
 def _collect_stream(out: str) -> _StreamCollector | None:
     """stdout 전체를 stream-json 으로 해석. 이벤트가 하나도 없으면 None (구형 json 출력)."""
     col = _StreamCollector()
@@ -1625,6 +1853,10 @@ def _parse_turn_result(rc, out, err, user_id, project, prompt, sid) -> tuple[str
         combined = f"{out}\n{err}"
         if any(m.lower() in combined.lower() for m in auth_markers):
             return ("", "auth")
+        # 계정 사용 한도 — 세션 리셋도 재시도도 답이 아니다. 안내하고 (세션 한도면) 유저 쿨다운.
+        _limit = detect_usage_limit(combined)
+        if _limit:
+            return _limit_result(user_id, project, _limit, f"exit {rc}", _collect_stream(out))
         # 세션 리셋+재실행은 CLI 가 "그 세션을 못 찾는다" 고 말했을 때만.
         # 예전 조건("session" 문자열 포함)은 너무 넓어서, 운영자가 턴 유닛을 stop 한 경우(SIGTERM)에도
         # 세션을 지우고 맥락 없이 다시 돌렸다 (2026-08-25 jenn 브랜치 #4 맥락 유실 사고).
@@ -1655,6 +1887,7 @@ def _parse_turn_result(rc, out, err, user_id, project, prompt, sid) -> tuple[str
             text = salv.text.strip()
             if text and not salv.is_error:
                 _turn_tool_lines[(user_id, project)] = list(salv.tool_lines)
+                _report_usage(user_id, project, salv)
                 logger.warning(
                     f"claude exit {rc} salvaged {len(text)}B user={user_id} "
                     f"project={project} complete={salv.saw_result}")
@@ -1670,9 +1903,15 @@ def _parse_turn_result(rc, out, err, user_id, project, prompt, sid) -> tuple[str
         if col.is_error:
             if any(m.lower() in (col.error_text or err).lower() for m in auth_markers):
                 return ("", "auth")
+            _limit = detect_usage_limit(f"{col.error_text}\n{err}")
+            if _limit:
+                return _limit_result(user_id, project, _limit, "result error", col)
             if not col.text.strip():
                 logger.error(f"claude result error user={user_id}: {col.error_text[:300]}")
                 return ("(처리 중 오류가 발생했어요. 다시 시도해주세요.)", "ok")
+        else:
+            clear_user_cooldown(user_id)   # 정상 완료 = 한도가 풀렸다는 뜻 (카나리아 통과 시 즉시 해제)
+        _report_usage(user_id, project, col)
         return (col.text.strip() or "(응답이 비어 있어요)", "ok")
     try:
         payload = json.loads(out)
@@ -1683,6 +1922,11 @@ def _parse_turn_result(rc, out, err, user_id, project, prompt, sid) -> tuple[str
         if payload.get("is_error"):
             if any(m.lower() in (text or err).lower() for m in auth_markers):
                 return ("", "auth")
+            _limit = detect_usage_limit(f"{text}\n{err}")
+            if _limit:
+                return _limit_result(user_id, project, _limit, "json error")
+        else:
+            clear_user_cooldown(user_id)
         return (text or "(응답이 비어 있어요)", "ok")
     except json.JSONDecodeError:
         return (out[:4000] or "(응답이 비어 있어요)", "ok")
@@ -1993,6 +2237,7 @@ def collect_and_store_usage(user_id: int, api_key: str, allow_wake: bool = False
     if not limits:
         return False
     limits["account"] = _claude_account_email(user_id)
+    clear_user_cooldown_if_stale(user_id, limits)   # 한도 근처가 아니면 쿨다운 오판 → 해제
     if user_id not in _usage_ok:
         _usage_ok.add(user_id)
         try:
@@ -2369,6 +2614,7 @@ class CloudWorker:
             with login_lock:
                 login_sessions.pop(user_id, None)
             if ok:
+                clear_user_cooldown(user_id, "재로그인")   # 새 계정의 한도는 별개
                 self.reply(api_key,
                            "✅ 클로드 계정이 연결됐어요! 이제 뭐든 시켜보세요.",
                            [msg_id], project)
@@ -2449,7 +2695,7 @@ class CloudWorker:
         finally:
             self.set_working(api_key, False, project)
         collect_usage_after_turn(user_id, api_key)  # 컨테이너가 살아있는 동안 사용량 갱신
-        # 턴 소비 기록 — 실제로 실행된 경우만 (auth 실패는 미소비)
+        # 턴 소비 기록 — 실제로 실행된 경우만 (auth 실패·계정 한도(limited)는 미소비)
         if status in ("ok", "heavy_mem", "heavy_time"):
             record_turn(user_id)
             self.maybe_warn_quota(api_key, user_id, project, msg_id)
