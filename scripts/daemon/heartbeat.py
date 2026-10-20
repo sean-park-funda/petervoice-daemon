@@ -214,6 +214,13 @@ class HeartbeatThread(threading.Thread):
                 logger.info(f"[heartbeat] {project} warning cleared")
 
         if task.get("active_hours") and not self._in_active_hours(task["active_hours"]):
+            # 창 밖 — 다음 창이 열리는 시각으로 미루고 한 줄 남긴다. 전에는 로그 없이 돌아가(매 폴링마다
+            # due 로 다시 떴다) 하루를 건너뛴 날이 어디에도 남지 않았다 (2026-10-21 evolution 10-20 결번 진단).
+            nxt = self._next_window_start(task["active_hours"])
+            if nxt:
+                self._update_task(task["id"], {"next_run_at": nxt.isoformat()})
+                logger.info(f"[heartbeat] {project} outside active hours {task['active_hours']} → skipped, "
+                            f"next window {nxt.astimezone().strftime('%m-%d %H:%M')}")
             return
 
         if task.get("max_runs") and task["run_count"] >= task["max_runs"]:
@@ -238,7 +245,7 @@ class HeartbeatThread(threading.Thread):
 
         # Skip inject if no valid HEARTBEAT.md
         if warning and "파일 없음" in warning:
-            next_run = datetime.now(timezone.utc) + timedelta(minutes=interval)
+            next_run = self._next_run_from_schedule(task, interval)
             self._update_task(task["id"], {
                 "next_run_at": next_run.isoformat(),
             })
@@ -252,7 +259,7 @@ class HeartbeatThread(threading.Thread):
             return
 
         self._pending[project] = (msg_id, time.time())
-        next_run = datetime.now(timezone.utc) + timedelta(minutes=interval)
+        next_run = self._next_run_from_schedule(task, interval)
         self._update_task(task["id"], {
             "next_run_at": next_run.isoformat(),
             "run_count": task["run_count"] + 1,
@@ -278,3 +285,54 @@ class HeartbeatThread(threading.Thread):
                 return now >= start or now <= end
         except Exception:
             return True
+
+    @staticmethod
+    def _parse_ts(value) -> datetime | None:
+        """API 의 ISO 시각 문자열 → aware UTC datetime. 못 읽으면 None."""
+        if not value or not isinstance(value, str):
+            return None
+        try:
+            s = value.strip()
+            if s.endswith("Z"):
+                s = s[:-1] + "+00:00"
+            dt = datetime.fromisoformat(s)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
+        except (ValueError, TypeError):
+            return None
+
+    @classmethod
+    def _next_run_from_schedule(cls, task: dict, interval: int, now: datetime | None = None) -> datetime:
+        """다음 실행 시각 = **예정 시각(next_run_at) + interval**. 이미 지난 칸은 건너뛰고 미래의 첫 칸을
+        잡는다(밀린 회차를 연달아 돌리지 않는다). 예정 시각이 없으면 지금 기준.
+
+        2026-10-21 수정 — 전에는 '깬 시각 + interval' 이라 폴링 지연(수 초~1분)이 매일 쌓여 일일 태스크가
+        하루 약 30초씩 밀렸고, 좁은 active_hours 창을 쓰는 태스크는 창을 넘긴 날 조용히 하루를 건너뛰었다
+        (evolution 05:00–06:00: 10-19 05:59:26 → 10-20 결번 → 10-21 05:00:55)."""
+        now = now or datetime.now(timezone.utc)
+        step = timedelta(minutes=interval)
+        base = cls._parse_ts(task.get("next_run_at"))
+        if base is None or base > now:
+            base = now
+        nxt = base + step
+        if nxt <= now:
+            nxt += step * (int((now - nxt) // step) + 1)
+            # 한 칸 넘게 밀려 따라잡는 경우 코앞의 칸은 건너뛴다 — 방금 돌았는데 곧바로 또 도는 것을 막는다
+            if nxt - now < step / 2:
+                nxt += step
+        return nxt
+
+    @staticmethod
+    def _next_window_start(hours_str: str) -> datetime | None:
+        """active_hours 창 밖일 때 다음으로 창이 열리는 시각(UTC). _in_active_hours 와 같은 로컬 시각 기준.
+        파싱 실패면 None (호출부는 예전처럼 그냥 돌아간다)."""
+        try:
+            start_str, _ = hours_str.split("-")
+            now = datetime.now()
+            start = now.replace(hour=int(start_str[:2]), minute=int(start_str[3:]), second=0, microsecond=0)
+            if start <= now:
+                start += timedelta(days=1)
+            return start.astimezone(timezone.utc)
+        except Exception:
+            return None

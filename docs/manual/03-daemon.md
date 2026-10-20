@@ -269,14 +269,14 @@ DocsSyncer는 제거되었다. docs는 DB 싱크 없이 Home Portal API가 로�
 
 ```
 매 60초 → GET /api/bot/tasks (API 프록시)
-  ↓ 활성 시간대 확인 (active_hours)
+  ↓ 활성 시간대 확인 (active_hours) — 창 밖이면 next_run_at 을 다음 창 시작으로 미루고 로그 1줄
   ↓ max_runs 확인
   ↓ 프로젝트 busy 확인
   ↓
 "[heartbeat] HEARTBEAT.md를 확인하고 할 일이 있으면 처리해줘"
   → POST /api/bot/message로 주입 (inject_system_message, api.py)
   ↓
-next_run_at 갱신, run_count 증가
+next_run_at = 예정 시각 + interval (깬 시각 기준 아님, 2026-10-21), run_count 증가
 ```
 
 ## ManagerThread — 자율 점검

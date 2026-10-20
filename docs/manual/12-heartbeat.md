@@ -96,12 +96,17 @@ Claude Code CLI 실행
 매 60초마다:
 1. `status='active'` AND `next_run_at <= now()` 태스크 조회
 2. 각 태스크에 대해:
-   - **활성 시간 확인**: active_hours 범위 밖이면 스킵
+   - **활성 시간 확인**: active_hours 범위 밖이면 스킵 — `next_run_at` 을 **다음 창 시작 시각**으로 미루고 로그 1줄
+     (`outside active hours … → skipped, next window MM-DD HH:MM`). 2026-10-21 전에는 로그 없이 돌아가 매 폴링마다 due 로 다시 떴고,
+     건너뛴 날이 어디에도 남지 않았다
    - **최대 실행 확인**: run_count >= max_runs이면 `status='done'`
    - **프로젝트 busy 확인**: 이미 작업 중이면 `min(interval_min, 5)`분 연기 (1분 간격이면 1분 뒤 다시 확인 — 긴 단계가 끝난 직후 다음 단계가 뜬다. 2026-10-12 전엔 고정 5분)
    - **직전 주입 확인**: 직전 하트비트 메시지를 워커가 아직 집지 않았으면(동시 처리 슬롯 포화) 1분 연기 — 짧은 간격에서 메시지가 쌓여 연속 실행되는 것을 막는다 (`_previous_wakeup_queued`, 10분 TTL)
    - **메시지 주입**: `inject_system_message(project, msg, prefix="[heartbeat]")`
-   - **스케줄 갱신**: `next_run_at = now + interval_min` (하한 1분 — 폴링 주기가 60초라 그 아래는 의미가 없다)
+   - **스케줄 갱신**: `next_run_at = 예정 시각(next_run_at) + interval_min` — 깬 시각이 아니라 **예정 시각 기준**이라 폴링 지연이
+     쌓이지 않는다. 이미 지난 칸은 건너뛰고 미래의 첫 칸을 잡는다(밀린 회차를 연달아 돌리지 않음). 하한 1분(폴링 주기 60초).
+     (2026-10-21 수정 — 전에는 `now + interval` 이라 일일 태스크가 하루 약 30초씩 밀렸고, 좁은 active_hours 창을 쓰는 태스크는
+     창을 넘긴 날 조용히 하루를 건너뛰었다: evolution 05:00–06:00 이 10-19 05:59:26 → 10-20 결번 → 10-21 05:00:55)
    - **카운터 증가**: `run_count += 1` (연기된 회차는 세지 않는다)
 
 ### 메시지 주입 (inject_system_message)
