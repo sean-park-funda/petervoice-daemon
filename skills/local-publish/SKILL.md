@@ -1,7 +1,7 @@
 ---
 name: local-publish
 description: 현재 프로젝트를 맥미니 또는 피터보이스 클라우드(상시 컨테이너)에서 빌드·실행하고 인터넷에 퍼블리싱. "퍼블리싱해줘", "사이트 올려줘", "로컬호스팅", "publish this", "사이트 내려줘", "재빌드" 등에 반응. Cloudflare Tunnel 기반 (맥=launchd, 클라우드=pv-service/pv-tunnel).
-pv_version: "1.2.1"
+pv_version: "1.2.2"
 ---
 
 # Local Publish — 로컬 퍼블리싱 (맥미니 · 피터보이스 클라우드)
@@ -36,7 +36,7 @@ command -v pv-tunnel >/dev/null && echo CLOUD_CONTAINER || echo MAC_OR_SELFHOST
 ```bash
 # 경로는 맥미니마다 다를 수 있음
 PUBLISH_SCRIPT=""
-for p in "$HOME/Projects/peter-voice/scripts/publish.py" "$HOME/peter-voice/scripts/publish.py"; do
+for p in "$HOME/peter-voice/scripts/publish.py" "$HOME/Projects/peter-voice/peter-voice-daemon/scripts/publish.py" "$HOME/Projects/peter-voice/scripts/publish.py"; do
   if [ -f "$p" ]; then PUBLISH_SCRIPT="$p"; break; fi
 done
 echo "${PUBLISH_SCRIPT:-NOT_FOUND}"
@@ -178,6 +178,9 @@ python3 -c "import json; c=json.load(open('$HOME/.claude-daemon/config.json')); 
 ## 재빌드 (코드 수정 후)
 ```bash
 python3 "$PUBLISH_SCRIPT" rebuild <project_id>
+```
+재빌드는 새 인스턴스가 포트를 잡은 것을 확인한 뒤 옛 서버 프로세스를 끝낸다(2026-10-24 — 전에는 옛 next-server 가 남아 몇 분간 옛 화면을 줬다). 결과 JSON 의 `restart.listening` 이 false 면 launchd 로그(`~/.petervoice-sites/<id>/logs/stderr.log`)를 본다.
+```bash
 ```
 유저에게 "새로고침하면 반영됩니다" 안내.
 

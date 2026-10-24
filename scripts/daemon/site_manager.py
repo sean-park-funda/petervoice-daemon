@@ -6,9 +6,12 @@ Cloudflare Tunnel 라우팅은 서버 API를 통해 처리.
 import json
 import os
 import plistlib
+import re
+import signal
 import socket
 import subprocess
 import shutil
+import time
 from pathlib import Path
 
 from daemon.globals import config, logger
@@ -74,6 +77,154 @@ def _plist_label(project_id: str) -> str:
 
 def _plist_path(project_id: str) -> Path:
     return PLIST_DIR / f"{_plist_label(project_id)}.plist"
+
+
+# ── 옛 인스턴스 정리 (2026-10-24 ox-plan 실측: 재빌드 뒤 옛 next-server 가 남아 몇 분간 옛 화면을 줬다) ──
+# launchd 잡의 메인 프로세스는 `npx`(npm exec)이고 실제 서버(next-server 등)는 그 자식이다. kickstart -k·bootout 은
+# 메인만 확실히 끝내고, 자식 서버는 SIGTERM 을 받아 **리스너만 닫은 채**(LISTEN 없음·ppid 1) cloudflared 가 물고 있던
+# keep-alive 연결로 옛 빌드를 계속 응답한다. 그래서 재시작 전에 옛 프로세스를 적어 두고, 새 인스턴스가 포트를 잡은 뒤 옛 것을 끝낸다.
+
+# macOS 기본 PATH(launchd·데몬)엔 /usr/sbin 이 없어 `lsof` 가 안 잡힌다 — 절대 경로로 고정
+LSOF = shutil.which("lsof") or "/usr/sbin/lsof"
+
+
+def _job_main_pid(label: str):
+    """실행 중인 launchd 잡의 메인 pid (없으면 None)"""
+    try:
+        r = subprocess.run(["launchctl", "print", f"gui/{os.getuid()}/{label}"], capture_output=True, text=True, timeout=10)
+    except Exception:
+        return None
+    m = re.search(r"^\s*pid = (\d+)", r.stdout, re.M)
+    return int(m.group(1)) if m else None
+
+
+def _process_tree(root: int) -> set:
+    """root 와 그 자손 pid 전부 (ps 한 번)"""
+    try:
+        r = subprocess.run(["ps", "-axo", "pid=,ppid="], capture_output=True, text=True, timeout=10)
+    except Exception:
+        return {root}
+    children: dict = {}
+    for line in r.stdout.splitlines():
+        parts = line.split()
+        if len(parts) != 2 or not (parts[0].isdigit() and parts[1].isdigit()):
+            continue
+        children.setdefault(int(parts[1]), []).append(int(parts[0]))
+    out, stack = set(), [root]
+    while stack:
+        pid = stack.pop()
+        if pid in out:
+            continue
+        out.add(pid)
+        stack.extend(children.get(pid, []))
+    return out
+
+
+def _listening_pids(port: int) -> set:
+    """이 포트를 LISTEN 하는 pid 들"""
+    try:
+        r = subprocess.run([LSOF, "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-t"], capture_output=True, text=True, timeout=10)
+    except Exception:
+        return set()
+    return {int(x) for x in r.stdout.split() if x.isdigit()}
+
+
+def _site_pids_by_cwd(project_dir: str) -> set:
+    """작업 디렉터리가 project_dir 인 next-server 프로세스 — 이전 재시작이 남긴 고아(잡 트리 밖, ppid 1)를 잡는다.
+    ps 제목이 `next-server` 인 것만 고른다(같은 폴더의 에이전트 셸·dev 서버·빌드를 건드리지 않으려고). lsof 의 COMMAND 는
+    실행 파일명(`node`)이라 제목으로 못 거르므로, 후보 pid 를 ps 로 먼저 고르고 그 pid 들의 cwd 만 lsof 로 본다."""
+    try:
+        ps = subprocess.run(["ps", "-axo", "pid=,command="], capture_output=True, text=True, timeout=10).stdout
+    except Exception:
+        return set()
+    cands = []
+    for line in ps.splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) == 2 and parts[0].isdigit() and parts[1].startswith("next-server"):
+            cands.append(int(parts[0]))
+    if not cands:
+        return set()
+    try:
+        r = subprocess.run([LSOF, "-a", "-p", ",".join(map(str, cands)), "-d", "cwd", "-Fpn"], capture_output=True, text=True, timeout=20)
+    except Exception:
+        return set()
+    target = os.path.realpath(project_dir)
+    out, pid = set(), None
+    for line in r.stdout.splitlines():
+        if line[:1] == "p":
+            pid = int(line[1:]) if line[1:].isdigit() else None
+        elif line[:1] == "n" and pid:
+            try:
+                if os.path.realpath(line[1:]) == target:
+                    out.add(pid)
+            except Exception:
+                pass
+    return out
+
+
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def _kill_processes(pids, grace_sec: float = 5.0) -> int:
+    """SIGTERM → grace → SIGKILL. 돌려주는 값은 신호를 보낸 프로세스 수."""
+    targets = [p for p in pids if p > 1 and p != os.getpid() and _alive(p)]
+    for p in targets:
+        try:
+            os.kill(p, signal.SIGTERM)
+        except Exception:
+            pass
+    deadline = time.time() + grace_sec
+    while time.time() < deadline and any(_alive(p) for p in targets):
+        time.sleep(0.2)
+    for p in targets:
+        if _alive(p):
+            try:
+                os.kill(p, signal.SIGKILL)
+            except Exception:
+                pass
+    return len(targets)
+
+
+def _snapshot_site_pids(label: str, port: int, project_dir: str) -> set:
+    """재시작 직전, 옛 인스턴스로 볼 pid 들 = 잡 프로세스 트리 + 포트 리스너 + 같은 폴더의 next-server 고아"""
+    pids = set()
+    main = _job_main_pid(label)
+    if main:
+        pids |= _process_tree(main)
+    pids |= _listening_pids(port)
+    pids |= _site_pids_by_cwd(project_dir)
+    pids.discard(os.getpid())
+    return pids
+
+
+def _reap_old_instance(label: str, port: int, old_pids: set, wait_sec: float = 30.0) -> dict:
+    """새 인스턴스가 포트를 잡을 때까지(최대 wait_sec) 기다린 뒤 옛 pid 를 끝낸다.
+    새 인스턴스가 안 떠도 옛 것은 끝낸다 — 리스너를 닫은 옛 서버는 어차피 새 요청을 못 받고, 옛 서버가 포트를 쥐고 있던 경우라면
+    끝내야 KeepAlive 가 새 인스턴스를 띄울 수 있다."""
+    new_main, new_tree = None, set()
+    deadline = time.time() + wait_sec
+    while time.time() < deadline:
+        new_main = _job_main_pid(label)
+        if new_main and new_main not in old_pids:
+            new_tree = _process_tree(new_main)
+            if _listening_pids(port) & new_tree:
+                break
+        time.sleep(0.5)
+    stale = {p for p in old_pids if p not in new_tree}
+    reaped = _kill_processes(stale)
+    listening = bool(_listening_pids(port) & new_tree) if new_tree else False
+    if reaped:
+        logger.info(f"[site_manager] {label}: reaped {reaped} old process(es) after restart (new pid {new_main}, listening={listening})")
+    if not listening:
+        logger.warning(f"[site_manager] {label}: new instance is not listening on :{port} yet — check launchd logs")
+    return {"new_pid": new_main if new_main not in old_pids else None, "listening": listening, "reaped": reaped}
 
 
 def _find_npm_or_npx() -> str:
@@ -220,6 +371,9 @@ def _create_launchd_plist(project_id: str, project_dir: str, port: int, framewor
 
     plist_path = _plist_path(project_id)
 
+    # 재퍼블리시면 옛 인스턴스(잡 트리·포트 리스너·같은 폴더 고아)를 적어 둔다 — bootout 은 메인 프로세스만 확실히 끝낸다
+    old_pids = _snapshot_site_pids(label, port, project_dir)
+
     # 기존 plist가 있으면 먼저 언로드
     if plist_path.exists():
         subprocess.run(
@@ -235,18 +389,31 @@ def _create_launchd_plist(project_id: str, project_dir: str, port: int, framewor
         capture_output=True
     )
     logger.info(f"[site_manager] launchd loaded: {label} on port {port}")
+    return _reap_old_instance(label, port, old_pids)
 
 
-def _unload_launchd(project_id: str):
-    """launchd plist 언로드 및 삭제"""
+def _unload_launchd(project_id: str, port: int = None, project_dir: str = None):
+    """launchd plist 언로드 및 삭제 (+ 남은 서버 프로세스 정리 — 언퍼블리시 뒤에도 옛 서버가 keep-alive 로 응답하지 않게)"""
     plist_path = _plist_path(project_id)
+    label = _plist_label(project_id)
+    old_pids = set()
+    main = _job_main_pid(label)
+    if main:
+        old_pids |= _process_tree(main)
+    if port:
+        old_pids |= _listening_pids(port)
+    if project_dir:
+        old_pids |= _site_pids_by_cwd(project_dir)
     if plist_path.exists():
         subprocess.run(
             ["launchctl", "bootout", f"gui/{os.getuid()}", str(plist_path)],
             capture_output=True
         )
         plist_path.unlink()
-        logger.info(f"[site_manager] launchd unloaded: {_plist_label(project_id)}")
+        logger.info(f"[site_manager] launchd unloaded: {label}")
+    reaped = _kill_processes(old_pids)
+    if reaped:
+        logger.info(f"[site_manager] {label}: reaped {reaped} leftover process(es) after unload")
 
 
 def publish(project_id: str, project_dir: str, username: str = None) -> dict:
@@ -327,8 +494,8 @@ def unpublish(project_id: str, username: str = None) -> dict:
     if not site:
         return {"error": f"퍼블리시된 사이트 없음: {project_id}"}
 
-    # launchd 언로드
-    _unload_launchd(project_id)
+    # launchd 언로드 (+ 남은 서버 프로세스 정리)
+    _unload_launchd(project_id, port=site.get("port"), project_dir=site.get("project_dir"))
 
     # Cloudflare 라우팅 제거
     tunnel_id = config.get("cloudflare_tunnel_id", "")
@@ -365,15 +532,17 @@ def rebuild(project_id: str) -> dict:
     if not _build_project(project_dir, framework):
         return {"error": "빌드 실패"}
 
-    # launchd 재시작
+    # launchd 재시작 — kickstart -k 는 메인(npx)만 끝내므로, 옛 인스턴스를 적어 뒀다가 새 인스턴스가 포트를 잡은 뒤 정리한다
     label = _plist_label(project_id)
+    old_pids = _snapshot_site_pids(label, port, project_dir)
     subprocess.run(
         ["launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{label}"],
         capture_output=True
     )
+    restart = _reap_old_instance(label, port, old_pids)
 
-    logger.info(f"[site_manager] Rebuilt {project_id} on :{port}")
-    return {"ok": True, "port": port, "url": site.get("url", "")}
+    logger.info(f"[site_manager] Rebuilt {project_id} on :{port} (new pid {restart['new_pid']}, reaped {restart['reaped']})")
+    return {"ok": True, "port": port, "url": site.get("url", ""), "restart": restart}
 
 
 def status() -> list:

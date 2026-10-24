@@ -232,3 +232,10 @@ peter-voice-daemon/ (petervoice-daemon)
 │   └── daemon/
 │       └── site_manager.py     — 빌드, 포트, launchd 관리
 ```
+
+## 재빌드·언퍼블리시 때 옛 인스턴스 정리 (2026-10-24)
+launchd 잡의 메인 프로세스는 `npx`(npm exec)이고 실제 서버(`next-server`)는 그 자식이다. `launchctl kickstart -k`·`bootout` 은 메인만 확실히
+끝내고, 자식 서버는 SIGTERM 을 받아 리스너만 닫은 채(LISTEN 없음·ppid 1) cloudflared 가 물고 있던 keep-alive 연결로 몇 분간 **옛 빌드를 계속
+응답**했다(ox-plan 실측: 배포 뒤 같은 주소 8/8 옛 화면). `site_manager` 는 이제 재시작 전에 옛 pid(잡 트리 + 포트 리스너 + 같은 폴더의
+next-server 고아)를 적어 두고, 새 인스턴스가 포트를 잡은 뒤(최대 30초) 옛 것을 SIGTERM→SIGKILL 로 끝낸다. 언퍼블리시도 같은 정리를 한다.
+결과는 `rebuild` 의 반환 JSON `restart: {new_pid, listening, reaped}` 로 보인다.
