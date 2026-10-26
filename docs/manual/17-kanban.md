@@ -487,3 +487,21 @@ components/
 4. 데몬의 `sessions.json` 키도 `"kanban:{card_id}:default"` → `"branch:{branch_id}:default"`로 변환 필요
 
 마이그레이션 SQL: `supabase/migrations/20260405100000_branches.sql`
+
+## 결정 카드 · 결정함 (2026-10-26)
+
+대표(유저)의 결정이 필요한 일은 채팅·하트비트에 되풀이하지 말고 **결정 카드 한 장**을 만든다. 유저는 사이드바 맨 위 「결정 대기 N건」 → `/decisions` 에서 전 프로젝트의 결정을 한 화면에 보고, 선택지를 누르면 그 담당 세션에 **유저 메시지**로 「결정: …」이 들어가며 카드가 닫힌다(사람 입력이므로 릴레이 깊이·건수도 0 으로 돌아간다).
+
+```bash
+curl -s -X POST "$API_URL/api/kanban" -H "X-Api-Key: $API_KEY" -H "Content-Type: application/json" -d '{
+  "project_id": "<프로젝트ID>", "title": "<질문 한 줄>", "create_branch": false, "labels": ["결정"],
+  "description": "<배경 2~4줄. 왜 지금 결정이 필요한지, 각 선택지의 결과>",
+  "meta": { "decision": {
+    "question": "<질문 한 줄>", "options": ["A …", "B …"], "default": "B …", "default_after": "YYYY-MM-DD",
+    "session": "branch:<내 내부 id> 또는 <프로젝트ID>", "link": "/?project=<프로젝트ID>&branch=<N>" } } }'
+```
+- `options` 1~6개, `default` 는 선택지 중 하나(없어도 됨), `default_after` 는 기본값이 있을 때만. `session` 은 답을 받을 내 세션.
+- **같은 질문은 한 장만**: 제목이 같은 열린 카드가 있으면 API 가 그 카드를 돌려준다(`existing: true`). 담당(세션)당 열린 결정 카드 **3장까지**(429 `decision_cap`). 일이 막히는 결정만 올린다.
+- 칸반을 끈 프로젝트에서도 결정 카드는 만들어진다.
+- 답이 오면(카드 또는 채팅) 카드를 닫는다: `PATCH $API_URL/api/kanban/<id>/status {"status":"done"}`. `default_after` 가 지났는데 답이 없으면 기본값으로 진행하고 같은 방법으로 닫는다. 유저가 카드에서 「기본값 끄기」를 누르면 `meta.decision.default` 가 비워지므로 계속 기다린다.
+- 열린 카드 보기: `GET $API_URL/api/decisions` (내 전 프로젝트, 오래된 순). 손이 필요한 일(인증번호·결제)은 이 카드가 아니라 「[손 필요] 카톡 알림」이다.
