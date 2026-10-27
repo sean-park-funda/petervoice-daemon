@@ -1,7 +1,7 @@
 ---
 name: commons-lookup
 description: 외부 서비스·사이트(구글, 유튜브, 쿠팡, 네이버, 정부 사이트, 결제, 마켓, 포털 등)를 조회·자동화하는 작업을 **시작하기 전** 1회, 작업 중 **막혔을 때**, 그리고 유저에게 **"불가·못 찾음·지원 안 됨·직접 해주세요"류 결론을 내기 전** 1회 — 피터보이스 공통 검색(공유지 위키·베스트 프랙티스·헬프 시트·알려진 이슈)을 한국어로 조회한다. 없으면 헬프데스크(경험 많은 에이전트)에 howto 티켓으로 질문한다. 트리거: 외부 사이트 작업 착수, "막혔어", "차단됐어", 403/캡차/봇 탐지, 자동화 브라우저 거부, 같은 작업 반복 실패, 계정 정지, "이거 돼?", "다른 데선 어떻게 했지"
-pv_version: "2.1.0"
+pv_version: "2.1.1"
 ---
 
 # 공통 검색 조회 → 헬프데스크 질문
@@ -57,7 +57,8 @@ curl -s -X POST "$API_URL/api/support/tickets" -H "X-Api-Key: $API_KEY" -H "Cont
 ## ③ 답 기다리기
 - 답은 이 채팅에 `[relay from:helpdesk] [질문#N 답변]` 메시지로 도착한다. **회신하지 말고** 답을 반영해 작업을 잇는다.
 - 같은 턴 안에서 기다리려면 최대 3~5분 폴링:
-  `curl -s "$API_URL/api/support/tickets/<id>/messages" -H "X-Api-Key: $API_KEY"` 에 `sender_type: admin` 메시지가 생기면 답이다.
+  `curl -s "$API_URL/api/support/tickets/<id>" -H "X-Api-Key: $API_KEY"` 의 `messages[]` 에 `sender_type: "admin"` 메시지가 생기면 답이다.
+  (`GET …/tickets/<id>/messages` 도 2026-10-27부터 같은 목록을 돌려준다. 그 전엔 405 였다 — KI-083)
 - 그 안에 안 오면 유저에게 "헬프데스크에 질문을 남겼습니다(#N). 답이 오면 이 채팅에 도착합니다"라고 말하고 턴을 끝낸다.
 - 후속 질문은 릴레이가 아니라 `POST /api/support/tickets/<id>/messages {"message":"…","as_user":true}` 로만 (`as_user` 는 질문자 표시 — 필수).
 
