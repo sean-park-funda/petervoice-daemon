@@ -137,11 +137,32 @@ def resolve_real_project(project: str) -> str:
     return project
 
 
+def use_branch_directory(project: str, branch_dir: str) -> str:
+    """브랜치 전용 작업 폴더를 준비해 돌려준다 (호출부가 이미 브랜치를 조회했을 때 — 재조회 없이)."""
+    if not os.path.isdir(branch_dir):
+        logger.warning(f"[project] {project} directory missing, creating: {branch_dir}")
+    os.makedirs(branch_dir, exist_ok=True)
+    _ensure_pretooluse_hook(branch_dir)
+    return branch_dir
+
+
 def get_project_dir(project: str) -> str:
     from daemon.globals import DAEMON_DIR
-    # 0) branch:/kanban: 세션은 부모 프로젝트 디렉토리를 쓴다
-    #    (해석 실패 시 원래 값 유지 → 기존 동작 폴백)
-    project = resolve_real_project(project)
+    # 0) branch:/kanban: 세션은 부모 프로젝트 디렉토리를 쓴다 (해석 실패 시 원래 값 유지 → 기존 동작 폴백)
+    #    단, 자기 작업 폴더(branches.directory)가 있는 브랜치는 그 폴더를 쓴다 — 프로젝트를 브랜치로 넣으면
+    #    (demote, 지원#84) `<부모 폴더>/branches/<옛 프로젝트 ID>` 에 자기 파일과 클로드 대화 기록이 있다.
+    if project.startswith("branch:"):
+        try:
+            from daemon.branches import fetch_branch
+            data = fetch_branch(int(project.split(":")[1])) or {}
+        except Exception as e:
+            logger.warning(f"[project] resolve failed for {project}: {e}")
+            data = {}
+        if data.get("directory"):
+            return use_branch_directory(project, data["directory"])
+        project = data.get("project_id") or project
+    else:
+        project = resolve_real_project(project)
     # 1) API에서 directory 조회
     directory = _fetch_project_directory(project)
     if directory:

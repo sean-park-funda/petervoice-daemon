@@ -32,7 +32,7 @@ from daemon.utils import _strip_ansi, count_dirty_files, mark_interrupted
 from daemon.api import api_request
 from daemon.supabase import (
     resolve_user_id, _fetch_project_settings, _fetch_recent_conversation,
-    get_project_dir, fetch_prompt_from_supabase, check_stop_requested, clear_stop_requested,
+    get_project_dir, use_branch_directory, fetch_prompt_from_supabase, check_stop_requested, clear_stop_requested,
     get_stop_request,
 )
 from daemon.sessions import (
@@ -274,7 +274,9 @@ def run_claude(
         branch_id = int(project.split(":")[1])
         branch_data = fetch_branch(branch_id)
         real_project = branch_data.get("project_id", "general") if branch_data else "general"
-        project_dir = get_project_dir(real_project)
+        # 자기 작업 폴더가 있는 브랜치(프로젝트에서 넣은 것)는 그 폴더에서 돈다 — get_project_dir 가 처리
+        project_dir = (use_branch_directory(project, branch_data["directory"])
+                       if (branch_data or {}).get("directory") else get_project_dir(real_project))
     elif is_kanban:
         from daemon.kanban import build_kanban_prompt, _fetch_kanban_card
         kanban_card_id = int(project.split(":")[1])
@@ -1179,7 +1181,9 @@ def run_codex(prompt: str, project: str, _retry_count: int = 0) -> tuple[str, st
         branch_id = int(project.split(":")[1])
         branch_data = fetch_branch(branch_id)
         real_project = branch_data.get("project_id", "general") if branch_data else "general"
-        project_dir = get_project_dir(real_project)
+        # 자기 작업 폴더가 있는 브랜치(프로젝트에서 넣은 것)는 그 폴더에서 돈다 — get_project_dir 가 처리
+        project_dir = (use_branch_directory(project, branch_data["directory"])
+                       if (branch_data or {}).get("directory") else get_project_dir(real_project))
     elif is_kanban:
         from daemon.kanban import build_kanban_prompt, _fetch_kanban_card
         kanban_card_id = int(project.split(":")[1])
@@ -1553,7 +1557,8 @@ def _engine_context(project: str) -> dict:
     else:
         real = project
     ctx["settings_project"] = real
-    ctx["project_dir"] = get_project_dir(real)
+    ctx["project_dir"] = (use_branch_directory(project, ctx["branch_data"]["directory"])
+                          if (ctx.get("branch_data") or {}).get("directory") else get_project_dir(real))
     ctx["proj_settings"] = _fetch_project_settings(real)
     return ctx
 

@@ -3,6 +3,8 @@
 Fetches branch data via API and builds prompts for branch sessions.
 """
 
+import os
+
 from daemon.globals import config, SECRETS_ENV_PATH, logger
 from daemon.api import api_request
 from daemon.supabase import fetch_prompt_from_supabase
@@ -140,7 +142,7 @@ def build_branch_prompt(branch: dict) -> str:
     heartbeat_hint = (
         f"\n## 내 반복 작업(하트비트) 등록\n"
         f"이 브랜치가 주기적으로 스스로 일하게 하려면 **프로젝트 메인이 아니라 이 브랜치로** 등록하세요.\n"
-        f"1. 부모 프로젝트 작업 디렉토리에 `docs/HEARTBEAT-branch-{branch_id}.md` 작성 (체크리스트 형식, `- [ ]` 항목 필수)\n"
+        f"1. {'내 작업 폴더' if branch.get('directory') else '부모 프로젝트 작업 디렉토리'}에 `docs/HEARTBEAT-branch-{branch_id}.md` 작성 (체크리스트 형식, `- [ ]` 항목 필수)\n"
         f"   — 메인의 `docs/HEARTBEAT.md`와 **다른 파일**입니다. 메인 파일을 건드리지 마세요.\n"
         f"2. 등록: `POST $API_URL/api/tasks` body `{{\"project\": \"branch:{branch_id}\", \"interval_min\": 30, \"max_runs\": 20}}`\n"
         f"   (interval_min 은 1 이상의 정수(분) — 긴 작업의 단계 잇기는 1~5, 느긋한 점검은 30~60. max_runs 필수. 메인과 별개로 등록되며 서로 간섭하지 않습니다)\n"
@@ -199,10 +201,25 @@ def build_branch_prompt(branch: dict) -> str:
             f"부모 브랜치: #{ancestors[-1].get('branch_number')} {ancestors[-1].get('title','')} (내부ID: {ancestors[-1].get('id')}, 릴레이 to_branch_id)\n"
             if ancestors else ""
         )
+        folder_line = ""
+        if branch.get("directory"):
+            # 프로젝트에서 넣은 브랜치(demote, 지원#84) — 부모 폴더가 아니라 자기 폴더에서 돈다.
+            # 팀 지식 그래프는 부모 프로젝트 폴더에서 하위(branches/)까지 포함해 만든다.
+            try:
+                from daemon.supabase import get_project_dir
+                parent_dir = get_project_dir(project_id)
+            except Exception:
+                parent_dir = ""
+            parent_graph = os.path.join(parent_dir, "graphify-out", "graph.json") if parent_dir else ""
+            folder_line = (
+                f"작업 폴더: `{branch['directory']}` (이 브랜치 전용 — 부모 프로젝트 폴더와 별개. 문서·산출물은 이 폴더의 `docs/`)\n"
+                + (f"팀 지식 그래프: `graphify query \"…\" --graph {parent_graph}` (부모가 하위 폴더까지 포함해 만든 그래프 — 이 폴더의 graphify-out 보다 우선)\n"
+                   if parent_graph and os.path.exists(parent_graph) else "")
+            )
         branch_rules = f"""# 브랜치 #{branch_num}: {branch.get('title', '')} (내부ID: {branch_id})
 소속 프로젝트: {project_id}
 경로: {' › '.join(path_parts)}
-{parent_line}
+{parent_line}{folder_line}
 ## 규칙
 - 이 브랜치의 작업에 집중하세요.
 - 커밋 메시지 앞에 [branch-{branch_id}]를 붙이세요.

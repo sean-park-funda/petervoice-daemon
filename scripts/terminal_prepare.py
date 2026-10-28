@@ -130,7 +130,12 @@ def main() -> int:
             branch_id = project_arg.split(":", 1)[1]
             branch_data = fetch_branch(branch_id)
             real_project = (branch_data or {}).get("project_id", "general")
-            result["dir"] = get_project_dir(real_project)
+            # 자기 작업 폴더가 있는 브랜치(프로젝트에서 넣은 것)는 그 폴더 — 채팅 세션과 같은 곳에서 연다
+            if (branch_data or {}).get("directory"):
+                from daemon.supabase import use_branch_directory
+                result["dir"] = use_branch_directory(project_arg, branch_data["directory"])
+            else:
+                result["dir"] = get_project_dir(real_project)
             if branch_data:
                 combined = build_branch_prompt(branch_data)
                 ctx = build_branch_context(branch_data)
