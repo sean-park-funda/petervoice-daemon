@@ -120,8 +120,11 @@ def path_variants(old: str, new: str) -> list[tuple[re.Pattern, str]]:
         pairs.append(("$HOME" + old[len(home):], "$HOME" + new[len(home):]))
     # 뒤가 이름 문자로 이어지면(honeypick → honeypick-lead, honeypick.bak) 다른 경로다 — 건드리지 않는다.
     # 문장 끝 마침표(…/honeypick.)는 경로 끝으로 본다. 앞이 경로 문자면(/mnt/x/Users/…) 다른 경로다.
-    return [(re.compile(r"(?:(?<=file://)|(?<![\w/.\-$~]))" + re.escape(o) + r"(?![A-Za-z0-9_\-]|\.[A-Za-z0-9_\-])"), n)
+    pats = [(re.compile(r"(?:(?<=file://)|(?<![\w/.\-$~]))" + re.escape(o) + r"(?![A-Za-z0-9_\-]|\.[A-Za-z0-9_\-])"), n)
             for o, n in pairs]
+    # 클로드 대화기록 폴더 이름(`~/.claude/projects/-Users-…-honeypick/`)을 적어 둔 프롬프트·문서도 있다 — 같이 옮겼으므로 같이 바꾼다
+    pats.append((re.compile(re.escape(enc(old)) + r"(?![A-Za-z0-9\-])"), enc(new)))
+    return pats
 
 
 def scan_text_files(root: Path, pats) -> list[Path]:
