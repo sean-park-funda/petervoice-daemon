@@ -1568,7 +1568,13 @@ def _run_streaming(wrapped: list[str], user_id: int, project: str, timeout: int)
 # 이식 전 실측(공용 호스트 저널 9/22~10/20): 실패 턴 12건 중 11건이 한도 문구였고 전부
 # "(처리 중 오류가 발생했어요)" 로 나갔다. 쿨다운이 없어 같은 유저가 1시간에 11번 헛스폰했다.
 _MODEL_LIMIT_RE = re.compile(r"reached your ([A-Za-z0-9 .\-]{1,30}?) limit", re.I)
-_SESSION_LIMIT_RE = re.compile(r"hit your ([a-z]+) limit", re.I)
+# CLI 2.1.312(2026-10-29)부터 5시간 창 문구가 "session limit" → "5-hour limit" 로 바뀌었다(라벨 표 five_hour/seven_day/
+# seven_day_opus/…: "5-hour limit"·"weekly limit"·"Opus limit"·"Sonnet limit"·"Fable limit"·"usage credit limit").
+# 옛 `[a-z]+` 는 숫자·하이픈을 못 받아 5시간 한도를 통째로 놓쳤다(evolution 10-29 통보). 라벨은 선택이다 —
+# 기업 프록시가 429 에 representative-claim 을 붙이면 클라이언트가 "You've hit your limit" 한 줄로 바꿔 쓴다.
+_SESSION_LIMIT_RE = re.compile(r"hit your(?: ([a-z0-9][a-z0-9 .\-]{0,24}?))? limit", re.I)
+# 같은 틀로 오는 모델별 주간 한도("hit your Opus limit")는 세션 한도가 아니다 — 다른 모델은 살아 있으니 모델 한도로 분류한다.
+_MODEL_LABEL_RE = re.compile(r"^(opus|sonnet|haiku|fable|mythos)\b", re.I)
 _RESET_RE = re.compile(r"resets\s+([^·\n]{1,40})", re.I)
 # "Sep 29, 3am (UTC)" · "4:10pm (Asia/Seoul)" · "3am"
 _RESET_TIME_RE = re.compile(
@@ -1598,7 +1604,9 @@ def detect_usage_limit(text: str) -> dict | None:
         return {"kind": "model", "label": mm.group(1).strip(), "resets": resets}
     sm = _SESSION_LIMIT_RE.search(text)
     if sm:
-        return {"kind": "session", "label": sm.group(1).strip(), "resets": resets}
+        label = (sm.group(1) or "").strip()
+        kind = "model" if _MODEL_LABEL_RE.match(label) else "session"
+        return {"kind": kind, "label": label, "resets": resets}
     return None
 
 

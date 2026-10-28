@@ -340,7 +340,7 @@ def cap_notice(label: str) -> str:
 #
 #   ① "You've reached your Fable 5 limit. Switch to another model, ..."
 #      → 모델별 주간 쿼터. **다른 모델은 살아있다** → 폴백 모델로 1회 재시도하면 살아난다.
-#   ② "You've hit your session limit · resets 4:10am (Asia/Seoul)"
+#   ② "You've hit your session limit · resets 4:10am (Asia/Seoul)"  (CLI 2.1.312 부터 "5-hour limit")
 #      → 계정 전체(5시간 창). 모델을 바꿔도 소용없다 → 리셋까지 스폰 자체를 멈춘다.
 #
 # 2026-08-16~18 실사고: 두 문구 모두 어느 에러 분기에도 안 걸려 하트비트가 조용히 죽었고
@@ -348,7 +348,13 @@ def cap_notice(label: str) -> str:
 # 18분간 201회를 헛스폰했다. 계정 한도는 공유 자원이라 한 프로젝트의 폭주가 다른 프로젝트의
 # 자율 루프를 죽인다 → 감지는 프로젝트별이지만 쿨다운은 **데몬 전역**이어야 한다.
 _MODEL_LIMIT_RE = re.compile(r"reached your ([A-Za-z0-9 .\-]{1,30}?) limit", re.I)
-_SESSION_LIMIT_RE = re.compile(r"hit your ([a-z]+) limit", re.I)
+# CLI 2.1.312(2026-10-29)부터 5시간 창 문구가 "session limit" → "5-hour limit" 로 바뀌었다(라벨 표 five_hour/seven_day/
+# seven_day_opus/…: "5-hour limit"·"weekly limit"·"Opus limit"·"Sonnet limit"·"Fable limit"·"usage credit limit").
+# 옛 `[a-z]+` 는 숫자·하이픈을 못 받아 5시간 한도를 통째로 놓쳤다(evolution 10-29 통보). 라벨은 선택이다 —
+# 기업 프록시가 429 에 representative-claim 을 붙이면 클라이언트가 "You've hit your limit" 한 줄로 바꿔 쓴다.
+_SESSION_LIMIT_RE = re.compile(r"hit your(?: ([a-z0-9][a-z0-9 .\-]{0,24}?))? limit", re.I)
+# 같은 틀로 오는 모델별 주간 한도("hit your Opus limit")는 세션 한도가 아니다 — 다른 모델은 살아 있으니 모델 한도로 분류한다.
+_MODEL_LABEL_RE = re.compile(r"^(opus|sonnet|haiku|fable|mythos)\b", re.I)
 _RESET_RE = re.compile(r"resets\s+([^·\n]{1,40})", re.I)
 
 # 쿨다운 중에도 이 간격으로 한 번은 진짜로 찔러본다 — 리셋 시각 파싱이 틀렸거나 한도가 일찍
@@ -434,7 +440,9 @@ def detect_usage_limit(text: str) -> dict | None:
         return {"kind": "model", "label": mm.group(1).strip(), "resets": resets}
     sm = _SESSION_LIMIT_RE.search(text)
     if sm:
-        return {"kind": "session", "label": sm.group(1).strip(), "resets": resets}
+        label = (sm.group(1) or "").strip()
+        kind = "model" if _MODEL_LABEL_RE.match(label) else "session"
+        return {"kind": kind, "label": label, "resets": resets}
     return None
 
 
