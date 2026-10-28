@@ -2319,13 +2319,18 @@ const server = http.createServer((req, res) => {
     }).catch(e => json({ error: "업로드 실패: " + e.message }, 400));
   }
   // POST /api/meetings/live — 실시간 자막 전사로 바로 회의록 (오디오 업로드·화자 라벨 없음, 2026-10-07).
-  // body: { meetingId, project, dir, title, duration, liveTranscript }. 클라우드: dir 필수
+  // body: { meetingId, project, dir, title, duration, liveTranscript, liveRoom? }. 클라우드: dir 필수
+  // liveRoom = { folder: "docs/meetings/<stamp>-라이브회의/", clerk: "branch:<id>", clerkNumber } (라이브회의일 때만)
   else if (pathname === "/api/meetings/live" && req.method === "POST") {
     if (!meetingStore || !processLiveMeeting) return json({ error: "meeting 모듈 없음" }, 503);
     readBody().then(async (body) => {
       const meetingId = String(body.meetingId || "").replace(/[^a-zA-Z0-9_-]/g, "");
       const transcript = String(body.liveTranscript || "").trim();
       if (!meetingId || !transcript) return json({ error: "meetingId, liveTranscript 필요" }, 400);
+      const lr = body.liveRoom && typeof body.liveRoom === "object" ? body.liveRoom : null;
+      const liveRoom = lr && typeof lr.folder === "string" && /^docs\/meetings\/[^/]+\/$/.test(lr.folder) && !lr.folder.includes("..")
+        ? { folder: lr.folder, clerk: /^branch:\d+$/.test(String(lr.clerk || "")) ? String(lr.clerk) : null, clerk_number: parseInt(lr.clerkNumber) || null }
+        : null;
       const ctx = await meetingCtx(body.dir || url.searchParams.get("dir"));
       if (ctx.error) return json({ error: ctx.error }, 403);
       if (!ctx.docsDir) return json({ error: "dir 필요 (문서 저장 경로)" }, 400);
@@ -2342,6 +2347,8 @@ const server = http.createServer((req, res) => {
         live_transcript: transcript,
         source: "live",
         docs_dir: ctx.docsDir,
+        // 라이브회의(2026-10-28): 회의 중 조사 폴더 — 회의록 요청에 조사 결과를 넣게 한다
+        ...(liveRoom ? { live_room: liveRoom } : {}),
         ...(ctx.uid ? { cloud_uid: ctx.uid } : {}),
         status: "processing",
         phase: "live",

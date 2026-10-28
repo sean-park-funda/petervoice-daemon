@@ -45,6 +45,19 @@ async function resolveSonioxKey(config) {
 }
 
 /**
+ * 라이브회의(2026-10-28): 회의 중 서기가 조사원에게 맡긴 안건의 결과가 회의 폴더에 있다.
+ * 최종 회의록에 「조사 결과」 절로 넣게 한 문단을 붙인다. 라이브회의가 아니면 빈 문자열.
+ */
+function liveRoomNote(room) {
+  if (!room || !room.folder) return "";
+  return `\n\n라이브회의였습니다 — 회의 중 조사 결과가 \`${room.folder}topics/\` 에, 서기 메모가 ` +
+    `\`${room.folder}live-notes.md\` 에 있습니다` +
+    (room.clerk ? ` (서기 세션 ${room.clerk}${room.clerk_number ? `, 브랜치 #${room.clerk_number}` : ""})` : "") + `. ` +
+    `회의록에 「조사 결과」 절을 넣어 안건마다 결론 1~2줄과 문서 링크를 붙이세요. ` +
+    `아직 문서가 없거나 비어 있는 안건은 "조사 중"으로 적으세요.`;
+}
+
+/**
  * Ask the bot to turn the raw transcript into polished minutes.
  * Best-effort: posts a user message into the meeting's project session via
  * the PeterVoice API. The daemon picks it up and the bot writes the minutes doc.
@@ -103,7 +116,8 @@ async function triggerMinutes(config, meeting, transcriptDocRelPath, opts = {}) 
       `이미 그 파일이 있으면 새로 만들지 말고 덮어써 갱신하세요. ` +
       `구성: 제목, 일시, 참석자, 핵심 논의, 결정사항, 액션아이템(담당/기한). ` +
       `장황하지 않게, 회의에서 실제 오간 내용 중심으로. ${nameGuide}` +
-      `전사에 없는 내용을 지어내지 마세요.`
+      `전사에 없는 내용을 지어내지 마세요.` +
+      liveRoomNote(meeting.live_room)
     );
 
   try {
