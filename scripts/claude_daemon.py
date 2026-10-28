@@ -107,7 +107,7 @@ def _recover_after_restart(worker):
                     "이미 완료된 작업은 반복하지 말고, 중단 지점부터 이어서 진행한 뒤 결과를 보고하세요.]\n\n"
                     + msg.get("text", "")
                 )
-                worker._executor.submit(worker._process_message_safe, msg)
+                worker.submit(msg)
 
 
 def _find_cloudflared() -> str | None:
@@ -1129,7 +1129,7 @@ def main():
         # 여기서는 그보다 약간 긴 상한으로 in-flight가 0이 되기를 기다린다.
         # 유휴 상태(in-flight 0)면 대기 없이 즉시 종료된다.
         import time as _time
-        worker._executor.shutdown(wait=False, cancel_futures=True)
+        worker.shutdown_executors()
         _drain_sec = config.get("shutdown_drain_sec", 90)
         _deadline = _time.time() + _drain_sec + 15
         _inflight = worker.inflight_count()

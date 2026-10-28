@@ -39,6 +39,11 @@ class Worker(threading.Thread):
         self.bot_name = config.get("bot_name", "bot")
         max_workers = config.get("max_concurrent", 3)
         self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="msg")
+        # 라이브회의 서기 단락 전용 줄 (2026-10-28) — 회의 중 서기 턴은 짧지만(실측 10초) 늦으면
+        # 회의를 못 따라간다. 일반 줄(max_concurrent)이 다른 담당들로 차 있으면 단락이 그 뒤에
+        # 줄을 선다(실측: 12칸 포화로 97초 대기). 칸 2개면 동시 회의 2개까지 바로 처리.
+        self._live_executor = ThreadPoolExecutor(
+            max_workers=config.get("live_meeting_lanes", 2), thread_name_prefix="live")
         self._spawned_ids: set[int] = set()
         self._spawned_lock = threading.Lock()
         # 실제 처리 중인 턴 수 — 종료 드레인 시 main()이 0이 될 때까지 대기
@@ -453,6 +458,22 @@ class Worker(threading.Thread):
             except Exception as e:
                 logger.error(f"[{self.bot_name}] Timeout followup failed: {e}")
 
+    @staticmethod
+    def _is_live_meeting_paragraph(msg: dict) -> bool:
+        """웹 회의 화면이 서기 브랜치에 보내는 단락 메시지 (평문 머리말로 판별)."""
+        text = msg.get("text") or ""
+        return (str(msg.get("project") or "").startswith("branch:")
+                and text.startswith(("[라이브회의 단락 ", "[라이브회의 종료]")))
+
+    def submit(self, msg: dict):
+        """메시지를 처리 줄에 넣는다 — 라이브회의 단락은 전용 줄, 나머지는 일반 줄."""
+        ex = self._live_executor if self._is_live_meeting_paragraph(msg) else self._executor
+        ex.submit(self._process_message_safe, msg)
+
+    def shutdown_executors(self):
+        self._executor.shutdown(wait=False, cancel_futures=True)
+        self._live_executor.shutdown(wait=False, cancel_futures=True)
+
     def _get_project_lock(self, project: str) -> threading.Lock:
         with project_locks_lock:
             if project not in project_locks:
@@ -529,7 +550,7 @@ class Worker(threading.Thread):
                             continue
                         self._spawned_ids.add(msg_id)
                     spawned_any = True
-                    self._executor.submit(self._process_message_safe, msg)
+                    self.submit(msg)
 
                 # kanban messages now flow through messages table (project="kanban:{card_id}")
                 # No separate kanban_messages polling needed
