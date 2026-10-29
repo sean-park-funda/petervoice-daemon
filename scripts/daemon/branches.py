@@ -74,6 +74,82 @@ def fetch_branch(branch_id: int) -> dict | None:
     return result if result and "error" not in result else None
 
 
+# ── 새 브랜치 전용 작업 폴더 (2026-10-29 Sean 승인 — docs/plans/2026-10-29-branch-own-folders.md) ──
+# 이 시각 이후 만들어지고 아직 한 번도 세션이 없던 브랜치만 자기 폴더를 받는다. 이미 부모 폴더에서 일하던 브랜치는
+# 파일이 거기 있으므로 건드리지 않는다(기존 브랜치 이전은 별도 도구). 옛 데몬은 이 배정을 안 하므로 그 맥에선 지금처럼 돈다.
+BRANCH_FOLDERS_SINCE = "2026-10-29T00:00:00"
+
+_CHO = ["g", "kk", "n", "d", "tt", "r", "m", "b", "pp", "s", "ss", "", "j", "jj", "ch", "k", "t", "p", "h"]
+_JUNG = ["a", "ae", "ya", "yae", "eo", "e", "yeo", "ye", "o", "wa", "wae", "oe", "yo", "u", "wo", "we", "wi", "yu", "eu", "ui", "i"]
+_JONG = ["", "k", "k", "k", "n", "n", "n", "t", "l", "k", "m", "p", "l", "l", "p", "l", "m", "p", "p", "t", "t", "ng", "t", "t", "k", "t", "p", "t"]
+
+
+def branch_folder_slug(title: str, max_len: int = 28) -> str:
+    """제목 → 폴더용 영문 이름. 한글은 로마자(개정 로마자 단순형), 그 외 영숫자만. 없으면 ''."""
+    out = []
+    for ch in title or "":
+        code = ord(ch)
+        if 0xAC00 <= code <= 0xD7A3:
+            i = code - 0xAC00
+            out.append(_CHO[i // 588] + _JUNG[(i % 588) // 28] + _JONG[i % 28])
+        elif ch.isascii() and ch.isalnum():
+            out.append(ch.lower())
+        else:
+            out.append("-")
+    slug = "-".join(p for p in "".join(out).split("-") if p)
+    return slug[:max_len].rstrip("-")
+
+
+def _has_any_session(key: str) -> bool:
+    import json as _json
+    from daemon.globals import SESSIONS_PATH, CODEX_SESSIONS_PATH, GEMINI_SESSIONS_PATH
+    import daemon.globals as g
+    if any(k == key or k.startswith(key + ":") for k in list(g.sessions.keys())):
+        return True
+    for path in (SESSIONS_PATH, CODEX_SESSIONS_PATH, GEMINI_SESSIONS_PATH):
+        try:
+            if path.exists() and any(k == key or k.startswith(key + ":") for k in _json.loads(path.read_text())):
+                return True
+        except Exception:
+            return True  # 모르면 이미 일한 브랜치로 본다 (폴더를 바꾸지 않는 쪽이 안전)
+    return False
+
+
+def ensure_branch_folder(branch: dict | None) -> dict | None:
+    """새 브랜치의 첫 세션이면 `<부모 폴더>/branches/<id>-<영문이름>` 을 배정하고 DB 에 기록한다. branch 를 돌려준다."""
+    if not branch or branch.get("directory") or not branch.get("id"):
+        return branch
+    try:
+        if str(branch.get("created_at") or "") < BRANCH_FOLDERS_SINCE or branch.get("session_id"):
+            return branch
+        bid = int(branch["id"])
+        if _has_any_session(f"branch:{bid}"):
+            return branch
+        from daemon.supabase import _fetch_project_settings
+        settings = _fetch_project_settings(branch.get("project_id", ""))  # 팀 공유 프로젝트도 대상 — 팀원 문서탭은 포탈 토큰의 teamPortals["branch:<id>"] 로 연다
+        base = ""
+        if branch.get("parent_branch_id"):
+            base = (fetch_branch(int(branch["parent_branch_id"])) or {}).get("directory") or ""
+        base = (base or settings.get("directory") or "").rstrip("/")
+        if not base:
+            return branch
+        slug = branch_folder_slug(branch.get("title", ""))
+        directory = f"{base}/branches/{bid}-{slug}" if slug else f"{base}/branches/{bid}"
+        res = api_request(config.get("api_key", ""), "PATCH", "/api/bot/branch",
+                          body={"id": bid, "directory": directory}, timeout=5)
+        if not res or "error" in res:
+            logger.warning(f"[branch-folder] branch:{bid} 배정 실패 — 부모 폴더에서 진행: {res}")
+            return branch
+        os.makedirs(directory, exist_ok=True)
+        logger.info(f"[branch-folder] branch:{bid} → {directory}")
+        branch = dict(branch)
+        branch["directory"] = directory
+        return branch
+    except Exception as e:
+        logger.warning(f"[branch-folder] 배정 중 오류 — 부모 폴더에서 진행: {e}")
+        return branch
+
+
 def fetch_branch_ancestors(branch: dict, max_depth: int = 50) -> list:
     """루트 브랜치 → 부모 순서의 조상 목록 (자기 자신 제외). parent_branch_id 체인을 API 로 따라간다."""
     chain = []
@@ -213,6 +289,7 @@ def build_branch_prompt(branch: dict) -> str:
             parent_graph = os.path.join(parent_dir, "graphify-out", "graph.json") if parent_dir else ""
             folder_line = (
                 f"작업 폴더: `{branch['directory']}` (이 브랜치 전용 — 부모 프로젝트 폴더와 별개. 문서·산출물은 이 폴더의 `docs/`)\n"
+                + (f"부모 프로젝트 폴더: `{parent_dir}` (공용 파일·레포는 여기서 절대경로로 읽는다)\n" if parent_dir else "")
                 + (f"팀 지식 그래프: `graphify query \"…\" --graph {parent_graph}` (부모가 하위 폴더까지 포함해 만든 그래프 — 이 폴더의 graphify-out 보다 우선)\n"
                    if parent_graph and os.path.exists(parent_graph) else "")
             )

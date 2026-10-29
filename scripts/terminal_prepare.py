@@ -126,9 +126,9 @@ def main() -> int:
 
         combined = ""
         if project_arg.startswith("branch:"):
-            from daemon.branches import fetch_branch, build_branch_prompt, build_branch_context
+            from daemon.branches import fetch_branch, build_branch_prompt, build_branch_context, ensure_branch_folder
             branch_id = project_arg.split(":", 1)[1]
-            branch_data = fetch_branch(branch_id)
+            branch_data = ensure_branch_folder(fetch_branch(branch_id))  # 새 브랜치면 채팅과 같은 자기 폴더
             real_project = (branch_data or {}).get("project_id", "general")
             # 자기 작업 폴더가 있는 브랜치(프로젝트에서 넣은 것)는 그 폴더 — 채팅 세션과 같은 곳에서 연다
             if (branch_data or {}).get("directory"):

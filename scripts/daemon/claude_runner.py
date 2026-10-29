@@ -160,6 +160,20 @@ def _trigger_relogin(project: str, config_dir: str | None = None) -> str:
         return "(Claude 인증이 만료되었습니다. 관리자에게 재로그인을 요청해주세요.)"
 
 
+def _kanban_card_dir(card: dict | None) -> str | None:
+    """브랜치 보드의 카드(scope_branch_id)는 그 브랜치가 자기 폴더를 가지면 거기서 돈다. 아니면 None."""
+    sb = (card or {}).get("scope_branch_id")
+    if not sb:
+        return None
+    try:
+        from daemon.branches import fetch_branch
+        d = (fetch_branch(int(sb)) or {}).get("directory")
+        return use_branch_directory(f"branch:{sb}", d) if d else None
+    except Exception as e:
+        logger.warning(f"[kanban] scope branch dir lookup failed for card: {e}")
+        return None
+
+
 def _load_wiki_index(project: str) -> str:
     """Load wiki/index.md for auto-memory injection. Returns empty string if not found."""
     project_dir = get_project_dir(project)
@@ -270,9 +284,9 @@ def run_claude(
     is_branch = project.startswith("branch:")
     is_kanban = project.startswith("kanban:")
     if is_branch:
-        from daemon.branches import fetch_branch, build_branch_prompt, build_branch_context
+        from daemon.branches import fetch_branch, build_branch_prompt, build_branch_context, ensure_branch_folder
         branch_id = int(project.split(":")[1])
-        branch_data = fetch_branch(branch_id)
+        branch_data = ensure_branch_folder(fetch_branch(branch_id))  # 새 브랜치면 자기 폴더 배정
         real_project = branch_data.get("project_id", "general") if branch_data else "general"
         # 자기 작업 폴더가 있는 브랜치(프로젝트에서 넣은 것)는 그 폴더에서 돈다 — get_project_dir 가 처리
         project_dir = (use_branch_directory(project, branch_data["directory"])
@@ -282,7 +296,7 @@ def run_claude(
         kanban_card_id = int(project.split(":")[1])
         kanban_card = _fetch_kanban_card(kanban_card_id)
         real_project = kanban_card.get("project_id", "general") if kanban_card else "general"
-        project_dir = get_project_dir(real_project)
+        project_dir = _kanban_card_dir(kanban_card) or get_project_dir(real_project)
     else:
         project_dir = get_project_dir(project)
 
@@ -1177,9 +1191,9 @@ def run_codex(prompt: str, project: str, _retry_count: int = 0) -> tuple[str, st
     is_branch = project.startswith("branch:")
     is_kanban = project.startswith("kanban:")
     if is_branch:
-        from daemon.branches import fetch_branch, build_branch_prompt, build_branch_context
+        from daemon.branches import fetch_branch, build_branch_prompt, build_branch_context, ensure_branch_folder
         branch_id = int(project.split(":")[1])
-        branch_data = fetch_branch(branch_id)
+        branch_data = ensure_branch_folder(fetch_branch(branch_id))  # 새 브랜치면 자기 폴더 배정
         real_project = branch_data.get("project_id", "general") if branch_data else "general"
         # 자기 작업 폴더가 있는 브랜치(프로젝트에서 넣은 것)는 그 폴더에서 돈다 — get_project_dir 가 처리
         project_dir = (use_branch_directory(project, branch_data["directory"])
@@ -1189,7 +1203,7 @@ def run_codex(prompt: str, project: str, _retry_count: int = 0) -> tuple[str, st
         kanban_card_id = int(project.split(":")[1])
         kanban_card = _fetch_kanban_card(kanban_card_id)
         real_project = kanban_card.get("project_id", "general") if kanban_card else "general"
-        project_dir = get_project_dir(real_project)
+        project_dir = _kanban_card_dir(kanban_card) or get_project_dir(real_project)
     else:
         project_dir = get_project_dir(project)
 
@@ -1547,8 +1561,8 @@ def _engine_context(project: str) -> dict:
     ctx = {"is_branch": project.startswith("branch:"), "is_kanban": project.startswith("kanban:"),
            "branch_data": None, "kanban_card": None}
     if ctx["is_branch"]:
-        from daemon.branches import fetch_branch
-        ctx["branch_data"] = fetch_branch(int(project.split(":")[1]))
+        from daemon.branches import fetch_branch, ensure_branch_folder
+        ctx["branch_data"] = ensure_branch_folder(fetch_branch(int(project.split(":")[1])))
         real = ctx["branch_data"].get("project_id", "general") if ctx["branch_data"] else "general"
     elif ctx["is_kanban"]:
         from daemon.kanban import _fetch_kanban_card
@@ -1557,7 +1571,8 @@ def _engine_context(project: str) -> dict:
     else:
         real = project
     ctx["settings_project"] = real
-    ctx["project_dir"] = (use_branch_directory(project, ctx["branch_data"]["directory"])
+    _kdir = _kanban_card_dir(ctx.get("kanban_card")) if ctx.get("is_kanban") else None
+    ctx["project_dir"] = _kdir or (use_branch_directory(project, ctx["branch_data"]["directory"])
                           if (ctx.get("branch_data") or {}).get("directory") else get_project_dir(real))
     ctx["proj_settings"] = _fetch_project_settings(real)
     return ctx
