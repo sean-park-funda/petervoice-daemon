@@ -97,6 +97,20 @@
 ## 운영
 
 - 상태 확인: /admin → 프로비저닝 탭 → "클라우드 데몬" 카드 (heartbeat 기반 생존 판정)
+
+## 반복 작업(HeartBeat)은 아직 실행되지 않는다 (2026-10-31 기준)
+`cloud_daemon.py` 에는 맥 데몬의 `daemon/heartbeat.py` 에 해당하는 실행기가 없다. 유저·에이전트가 `POST /api/tasks` 로 등록하면 행은 생기지만
+깨우는 주체가 없어 `next_run_at` 이 그대로 멈춘다(박스 DB 10/31: 클라우드 유저 작업 9건 run_count 합 0). 그래서
+- 환경 프롬프트 3종(컨테이너·공유·전용 서버)이 에이전트에게 「클라우드에서는 반복 작업이 아직 실행되지 않는다. 필요하면 Claude 앱의 예약 작업을 안내하거나 설치형을 안내한다」고 지시하고,
+- 웹 `POST /api/tasks` 는 공용 클라우드 유저에게 `notice: "등록됨 — 실행은 설치형에서만 됩니다…"` 를 함께 돌려주며,
+- `/pricing`·`llms.txt` 의 「자동화 N개」는 등록 상한으로만 적혀 있다(「설치형에서 실행 — 클라우드 실행은 준비 중」).
+실행기를 넣으면 위 세 곳을 같이 되돌린다. 출처: petervoice-biz 문구 정정 묶음 B-3(10/15 판정), peter-voice 2026-10-31 반영.
+
+## 연결 단계 안내문의 고정 앞머리 (2026-10-31)
+클로드 연결 단계의 봇 안내는 petervoice-biz `scripts/traffic_digest.py` 가 **첫 문장(앞머리)** 으로 건수를 센다. 바꾸면 집계가 끊기므로 상수로 떼어 두었다:
+`NEED_LOGIN_MESSAGE`(아직 클로드(Claude) 계정이 연결되지 않아…) · 링크 메시지 「아래 링크를 열어 클로드 계정으로 로그인한…」(GATE) · 성공 「✅ 클로드 계정이 연결됐어요」 ·
+갈래 A `LOGIN_NOT_CODE_HEAD` 「코드가 아닌 것 같아요.」(링크 뒤 코드 모양이 아닌 답) · 갈래 B `LOGIN_LINK_EXPIRED_HEAD` 「링크 유효시간이 지났어요.」(세션 없음/만료인데 코드 모양) ·
+`CONSULT_ACK_HEAD` 「상담 요청을 접수했어요.」('상담' → 헬프데스크 help 티켓 1건/유저). 앞머리를 바꿔야 하면 biz 에 한 줄 통보한다.
 - 호스트 SSH: `ssh -i ~/.claude-daemon/cloudhost/lightsail-default.pem ubuntu@3.36.88.139`
 - 로그: `sudo journalctl -u pv-cloud.service -f` / `pv-portal.service`
 - 배포: 데몬 레포 push → 호스트에서 `git pull` + `sudo systemctl restart pv-cloud.service pv-portal.service` (AutoUpdater 미적용 호스트)
