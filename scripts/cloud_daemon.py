@@ -57,7 +57,11 @@ shutdown_event = threading.Event()
 
 TURN_TIMEOUT_SEC = 30 * 60
 LOGIN_URL_TIMEOUT_SEC = 60
-LOGIN_CODE_TTL_SEC = 600   # 링크 뒤 코드 대기 — 1800 으로 올릴지는 25분 실측으로 정한다(문구 묶음 B-1, 2026-10-31)
+# 링크 뒤 코드 대기 10분 → 30분 (2026-10-31 문구 묶음 B-1). 근거: ① CLI 2.1.314 번들의 OAuth 흐름 클래스(waitForAuthorizationCode /
+# handleManualAuthCodeInput)에는 타임아웃이 없다 — "timed out after 5 minutes" 는 /design-login, "3 minutes" 는 AWS 로그인 문자열이다.
+# ② 인가 URL 은 PKCE challenge·state 모두 클라이언트 생성이라 서버 쪽 만료가 없다. ③ 맥(2.1.314)·공용 호스트(2.1.291)에서 격리 config 로
+# `claude auth login --claudeai` 를 띄워 25분 넘게 코드 입력 대기가 살아 있는 것을 실측했다(conversation-logs/2026-10-31-copy-bundle-b-*.md).
+LOGIN_CODE_TTL_SEC = 1800
 CODE_RE = re.compile(r"[A-Za-z0-9_\-]{20,}#[A-Za-z0-9_\-]{8,}")
 _URL_RE = re.compile(r"https?://[^\s\x00-\x1f\"']+")
 
