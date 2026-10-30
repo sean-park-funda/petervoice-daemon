@@ -45,6 +45,50 @@ _STATE_RE = re.compile(r"[?&]state=([^&\s]+)")
 _ONBOARD_MARKERS = ("choose", "theme", "select", "text style", "press enter", "dark mode", "light mode")
 
 
+def _norm_dir(d) -> str:
+    """CLAUDE_CONFIG_DIR 비교용 정규화 ("" = 기본 ~/.claude)."""
+    return os.path.expanduser(d).rstrip("/") if d else ""
+
+
+def expected_email(config_dir: str = None) -> str | None:
+    """이 폴더(자리)에 로그인돼야 할 계정 이메일. config.json 의 claude_seats 에 {"config_dir", "email"} 이 있는
+    머신(Sean 맥미니)만 값이 있고, 고객 머신은 늘 None 이라 동작이 그대로다.
+    2026-10-30: 「재로그인」이 지금 자리(claude2)에 로그인할 때 승인 브라우저가 sean@vibement.kr 이라 claude2 자리가
+    조용히 다른 계정이 됐다 → 로그인 화면에 맞는 계정을 미리 채우고(--email), 끝나면 대조한다."""
+    try:
+        from daemon.limits import _live_seat_settings
+        _, seats = _live_seat_settings()
+    except Exception:
+        return None
+    want = _norm_dir(config_dir)
+    for spec in (seats or {}).values():
+        if isinstance(spec, dict) and spec.get("email") and _norm_dir(spec.get("config_dir")) == want:
+            return spec["email"]
+    return None
+
+
+def _logged_in_email(config_dir: str = None) -> str | None:
+    """이 폴더에 지금 로그인된 계정 이메일 (`claude auth status` JSON → 실패 시 .claude.json). 자격증명은 읽지 않는다."""
+    import json
+    import subprocess
+    env = {k: v for k, v in os.environ.items() if k not in ("CLAUDECODE", "CLAUDE_CONFIG_DIR")}
+    if config_dir:
+        env["CLAUDE_CONFIG_DIR"] = os.path.expanduser(config_dir)
+    try:
+        r = subprocess.run([CLAUDE_CMD, "auth", "status"], capture_output=True, text=True, timeout=15, env=env)
+        email = (json.loads(r.stdout or "{}") or {}).get("email")
+        if email:
+            return email
+    except Exception:
+        pass
+    path = os.path.join(_norm_dir(config_dir), ".claude.json") if config_dir else os.path.expanduser("~/.claude.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            return ((json.load(f) or {}).get("oauthAccount") or {}).get("emailAddress")
+    except Exception:
+        return None
+
+
 def _sanitize(s: str) -> str:
     """제어문자(\r \x1b 등) 제거. URL/코드 정제 필수 (과거 \r 사고)."""
     # OSC 시퀀스(터미널 하이퍼링크 ESC]8;;URL ST …)를 먼저 통째로 제거한다.
@@ -139,6 +183,7 @@ class ReloginSession:
         self._code_value = None                 # 주입할 코드 (일시 보관, 사용 후 즉시 소거)
         self._on_event = None                   # 설정 UI 모드 콜백 (None=채팅 모드)
         self._config_dir = None                 # 로그인 대상 계정의 CLAUDE_CONFIG_DIR (default=None)
+        self._expected_email = None             # 그 자리에 로그인돼야 할 계정 (claude_seats 가 있는 머신만)
 
     # ── 채팅 안내 ────────────────────────────────────────────
     def _reply(self, text: str, project: str = None):
@@ -180,7 +225,7 @@ class ReloginSession:
         else:
             self._reply(self._url_message())
 
-    def _publish_result(self, ok: bool):
+    def _publish_result(self, ok: bool, warning: str = None):
         if ok:
             # 재로그인 직후 배너를 새 계정 값으로 즉시 갱신하고, 한도 쿨다운도 재판정한다
             # (다른 계정으로 갈아탔을 때 "배너는 새 계정인데 채팅은 막힘" 방지). API 프로브라 1초 내.
@@ -193,11 +238,14 @@ class ReloginSession:
             threading.Thread(target=_refresh, daemon=True, name="usage-after-login").start()
         if self._on_event:
             try:
-                self._on_event({"type": "done" if ok else "failed"})
+                self._on_event({"type": "done" if ok else "failed", **({"warning": warning} if warning else {})})
             except Exception as e:
                 logger.warning(f"[relogin] on_event(result) failed: {e}")
+            if warning:   # 설정 화면은 결과 상태만 받는다 — 계정이 엇갈린 건 채팅으로도 알린다
+                self._reply(warning)
         else:
             self._reply(
+                warning if ok and warning else
                 "✅ 재로그인 완료! 이제 정상적으로 사용하실 수 있어요." if ok else
                 "❌ 재로그인에 실패했어요. 코드가 정확한지 확인 후, '클로드 로그인' 이라고 입력해 다시 시도해 주세요."
             )
@@ -223,6 +271,7 @@ class ReloginSession:
             self.state = "pending_url"
             self.project = project
             self._config_dir = config_dir
+            self._expected_email = expected_email(config_dir)
             self._on_event = on_event
             self.started_at = time.time()
             self._thread = threading.Thread(
@@ -260,9 +309,12 @@ class ReloginSession:
 
     # ── 내부: 로그인 플로우 ─────────────────────────────────
     def _url_message(self) -> str:
+        who = (f"**{self._expected_email}** 계정으로 로그인해 주세요 (이 칸은 그 계정용입니다. "
+               "브라우저가 다른 계정으로 로그인돼 있으면 먼저 바꿔 주세요):\n") if self._expected_email else \
+            "본인 Claude 계정으로 로그인해 주세요:\n"
         return (
             "⚠️ Claude 인증이 만료되었습니다. 재로그인이 필요해요.\n\n"
-            "1) 아래 링크를 눌러 본인 Claude 계정으로 로그인해 주세요:\n"
+            "1) 아래 링크를 눌러 " + who +
             f"{self.url}\n\n"
             "2) 로그인 후 나오는 코드를 이 채팅에 그대로 붙여넣어 주세요.\n"
             "(10분 안에 붙여넣지 않으면 만료됩니다. 다시 하려면 '클로드 로그인' 이라고 입력하세요.)"
@@ -286,7 +338,8 @@ class ReloginSession:
         if pid == 0:
             # child: exec claude auth login
             try:
-                os.execvpe(CLAUDE_CMD, [CLAUDE_CMD, "auth", "login", "--claudeai"], env)
+                os.execvpe(CLAUDE_CMD, [CLAUDE_CMD, "auth", "login", "--claudeai",
+                                        *(["--email", self._expected_email] if self._expected_email else [])], env)
             except Exception:
                 os._exit(127)
 
@@ -298,40 +351,47 @@ class ReloginSession:
         buf = ""
         url = None
         enter_sent = 0
+        last_data = time.time()
         deadline = time.time() + URL_CAPTURE_TIMEOUT_SEC
         while time.time() < deadline:
             try:
-                r, _, _ = select.select([fd], [], [], 1.0)
+                r, _, _ = select.select([fd], [], [], 0.5)
             except (OSError, ValueError):
                 break
+            got_data = eof = False
             if fd in r:
                 try:
                     chunk = os.read(fd, 4096)
                 except OSError:
-                    break
-                if not chunk:
-                    break
-                buf += chunk.decode("utf-8", errors="replace")
-                clean = _sanitize(buf)
-                # URL 캡처
-                for m in _URL_RE.finditer(clean):
-                    cand = _trim_url(m.group(0))
-                    low = cand.lower()
-                    if ("oauth" in low or "authorize" in low or "/login" in low
-                            or "code=" in low or "claude.ai" in low or "claude.com" in low):
+                    chunk = b""
+                if chunk:
+                    buf += chunk.decode("utf-8", errors="replace")
+                    got_data, last_data = True, time.time()
+                else:
+                    eof = True
+            clean = _sanitize(buf)
+            # URL 캡처. pty 는 조각으로 읽힌다(CLI 가 1024바이트씩 쓴다) — 버퍼 끝에서 끝나는 URL 은 잘린 조각일 수 있어
+            # 뒤에 글자가 붙거나, 1.5초 조용하거나, 출력이 끝날 때까지 기다린다. (2026-10-30: --email 로 URL 이 길어지자
+            # 첫 조각이 login_hint=claude2% 에서 끊겨 깨진 링크를 잡았다. 그전엔 URL 이 첫 조각에 겨우 들어가 드러나지 않았다)
+            for m in _URL_RE.finditer(clean):
+                cand = _trim_url(m.group(0))
+                low = cand.lower()
+                if ("oauth" in low or "authorize" in low or "/login" in low
+                        or "code=" in low or "claude.ai" in low or "claude.com" in low):
+                    if m.end() < len(clean) or eof or time.time() - last_data >= 1.5:
                         url = cand
-                        break
-                if url:
                     break
-                # 온보딩 화면이면 Enter 진행 (URL 나올 때까지 최대 2회)
-                low = clean.lower()
-                if enter_sent < 2 and any(mk in low for mk in _ONBOARD_MARKERS):
-                    try:
-                        os.write(fd, b"\r")
-                    except OSError:
-                        pass
-                    enter_sent += 1
-                    time.sleep(0.5)
+            if url or eof:
+                break
+            # 온보딩 화면이면 Enter 진행 (URL 나올 때까지 최대 2회)
+            low = clean.lower()
+            if got_data and enter_sent < 2 and any(mk in low for mk in _ONBOARD_MARKERS):
+                try:
+                    os.write(fd, b"\r")
+                except OSError:
+                    pass
+                enter_sent += 1
+                time.sleep(0.5)
 
         if not url:
             logger.warning("[relogin] URL capture timed out")
@@ -421,12 +481,26 @@ class ReloginSession:
             with self.lock:
                 self.state = "done"
             logger.info("[relogin] login successful")
-            self._publish_result(True)
+            self._publish_result(True, self._account_warning())
         else:
             with self.lock:
                 self._fail_locked("verify_failed")
             logger.warning("[relogin] login verification failed")
             self._publish_result(False)
+
+    def _account_warning(self) -> str | None:
+        """기대 계정이 있는 자리면 들어온 계정을 대조해, 다르면 경고문. 토큰은 이미 저장됐으므로(자격증명은 건드리지 않는다)
+        성공 대신 경고로 알린다 — 이 자리로 도는 대화가 다른 계정 몫을 쓰게 되기 때문."""
+        want = self._expected_email
+        if not want:
+            return None
+        got = _logged_in_email(self._config_dir)
+        if not got or got.lower() == want.lower():
+            return None
+        logger.warning(f"[relogin] account mismatch: seat expects {want}, got {got}")
+        return (f"⚠️ 로그인은 됐지만 **{got}** 계정이 들어왔어요. 이 칸은 **{want}** 용이라, 지금부터 이 칸으로 "
+                f"도는 대화가 {got} 의 사용량을 씁니다.\n"
+                f"브라우저를 {want} 로 바꾼 뒤 '재로그인' 이라고 입력해 다시 해 주세요.")
 
     def _verify_status(self) -> bool:
         import subprocess
