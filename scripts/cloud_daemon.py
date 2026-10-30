@@ -57,7 +57,7 @@ shutdown_event = threading.Event()
 
 TURN_TIMEOUT_SEC = 30 * 60
 LOGIN_URL_TIMEOUT_SEC = 60
-LOGIN_CODE_TTL_SEC = 600
+LOGIN_CODE_TTL_SEC = 600   # 링크 뒤 코드 대기 — 1800 으로 올릴지는 25분 실측으로 정한다(문구 묶음 B-1, 2026-10-31)
 CODE_RE = re.compile(r"[A-Za-z0-9_\-]{20,}#[A-Za-z0-9_\-]{8,}")
 _URL_RE = re.compile(r"https?://[^\s\x00-\x1f\"']+")
 
@@ -83,10 +83,57 @@ NEED_LOGIN_MESSAGE = (
     "아직 클로드(Claude) 계정이 연결되지 않아 AI 비서가 잠들어 있어요. 🌙\n\n"
     "**연결 방법** (2분이면 돼요)\n"
     "1. 여기에 `클로드 로그인` 이라고 입력해주세요.\n"
-    "2. 제가 보내드리는 링크를 열어 클로드 계정으로 로그인해주세요.\n"
+    "2. 제가 보내드리는 링크를 열어 **Claude Pro 이상 유료 구독 계정**으로 로그인해주세요. (무료 계정은 연결되지 않아요)\n"
     "3. 화면에 나오는 코드를 복사해서 이 채팅에 붙여넣어 주세요.\n\n"
     "클로드 구독 계정이 없다면, 다른 사용자의 프로젝트에 초대받아 대화하는 것은 지금도 가능해요."
 )
+
+
+# 연결 단계 갈래 안내 (2026-10-31 문구 정정 묶음 B-1, petervoice-biz 10/18 판정). 첫 문장은 **고정 앞머리** —
+# biz traffic_digest 가 본문을 보지 않고 앞머리로 건수를 센다. 바꾸면 biz 에 한 줄 알릴 것.
+LOGIN_NOT_CODE_HEAD = "코드가 아닌 것 같아요."
+LOGIN_NOT_CODE_MESSAGE = (
+    LOGIN_NOT_CODE_HEAD + " ① 화면에 'Claude Max or Pro is required'가 보이면 무료 계정이라 연결되지 않습니다. "
+    "Claude Pro 구독 후 다시 `클로드 로그인`이라고 입력하시거나, 여기에 '상담'이라고 남겨 주세요. "
+    "② 유료 구독이 있는데 이 문구가 보이면 브라우저에 다른 Claude 계정으로 로그인돼 있는 것입니다. "
+    "claude.ai 에서 로그아웃한 뒤 다시 시도해 주세요."
+)
+LOGIN_LINK_EXPIRED_HEAD = "링크 유효시간이 지났어요."
+LOGIN_LINK_EXPIRED_MESSAGE = (
+    LOGIN_LINK_EXPIRED_HEAD + " `클로드 로그인`이라고 다시 입력하시면 새 링크를 보내드릴게요."
+)
+# '상담' — 갈래 A 안내문이 요청하는 낱말. 유료 구독이 없어 연결을 못 하는 가입자를 헬프데스크 help 티켓으로 넘긴다.
+_CONSULT_TRIGGERS = {
+    "상담", "상담요청", "상담신청", "상담해주세요", "상담부탁드려요", "상담부탁드립니다", "상담할게요",
+    "상담원", "상담원연결", "상담받고싶어요", "상담하고싶어요",
+}
+CONSULT_ACK_HEAD = "상담 요청을 접수했어요."
+CONSULT_ACK_MESSAGE = (
+    CONSULT_ACK_HEAD + " 담당자가 가입하신 이메일로 연락드릴게요. "
+    "그동안 Claude Pro 구독을 하셨다면 `클로드 로그인`이라고 입력하시면 바로 연결할 수 있어요."
+)
+CONSULT_FAIL_MESSAGE = (
+    "상담 요청을 접수하지 못했어요. 잠시 후 다시 '상담'이라고 남겨 주시거나, "
+    "070-8656-6190 (평일 10:00~18:00) 으로 연락 주세요."
+)
+
+
+def is_consult_trigger(text: str) -> bool:
+    """유저 입력이 '상담' 요청인지. 공백/대소문자/끝문장부호 무시 (is_login_trigger 와 같은 정규화)."""
+    if not text:
+        return False
+    s = re.sub(r"[\s​]+", "", text).strip().lower().rstrip(".!?~,")
+    return s in _CONSULT_TRIGGERS
+
+
+def _looks_like_code_attempt(text: str) -> bool:
+    """코드를 붙여넣으려다 잘리거나 틀린 것으로 보이는 입력 — 공백 없는 긴 토큰 하나 (URL 은 제외)."""
+    t = (text or "").strip()
+    return len(t) >= 16 and not re.search(r"\s", t) and "http" not in t.lower()
+
+
+# 한도 안내문 끝 한 줄 (2026-10-31 문구 묶음 B-4, 맥·클라우드 공통 — daemon/limits.py 의 같은 이름 상수와 문장을 맞출 것)
+USAGE_LIMIT_UPGRADE_TIP = "자주 닿으시면 Claude Max(월 $100부터)로 올리시면 한도가 5~20배가 됩니다."
 
 
 # ── HTTP helpers ─────────────────────────────────────────────────
@@ -624,8 +671,8 @@ def _container_system_prompt(user_id: int | None = None) -> str:
 
 ## 제약
 - 위 한도를 넘으면 강제 종료됩니다. 대규모 학습·장시간 렌더링은 피하세요.
-- **반복/예약 작업**: crontab 대신 피터보이스 HeartBeat 를 쓰세요
-  (`docs/HEARTBEAT.md` + `POST $API_URL/api/tasks`, interval_min>={hb_min}).
+- **반복/예약 작업**: 클라우드에서는 반복 작업이 아직 실행되지 않는다. 필요하면 Claude 앱의 예약 작업을 안내하거나 설치형을 안내한다.
+  (HeartBeat 등록 `POST $API_URL/api/tasks` 은 받아 두기만 하고 실행되지 않으니 "등록해 두면 돌아간다"고 말하지 말 것. crontab 도 없다.)
 
 무거운 작업(딥러닝 학습, GPU, 대량 처리)이 필요하면 응답에 `[HEAVY_TASK]` 를 포함하고,
 사용자에게 "내 컴퓨터에 설치하면 제한 없이 가능하다"고 안내하세요.
@@ -667,11 +714,9 @@ CLOUD_SYSTEM_PROMPT_TMPL = """# 실행 환경: 피터보이스 클라우드 (공
   - node 패키지: 프로젝트 폴더에 로컬 설치(`npm install`), node 버전 변경은 홈에 nvm 설치
 - 서버/데몬을 상시 띄우지 마세요. 확인용으로 잠깐 띄웠다면 작업 끝에 반드시 종료하세요.
 - 대용량 데이터, 파일은 작업 폴더에만. 디스크도 사용자별 한도가 있습니다.
-- **반복/예약 작업(cron)**: crontab은 사용할 수 없습니다. 대신 피터보이스 **HeartBeat**를 쓰세요.
-  사용자가 "매일 아침 뉴스 정리해줘", "1시간마다 확인해줘" 같은 반복 작업을 원하면
-  `docs/HEARTBEAT.md`에 체크리스트를 쓰고 `POST $API_URL/api/tasks`로 등록하세요
-  (interval_min 최소 {hb_min}, max_runs 필수). 이렇게 하면 정해진 주기마다 저를 깨워 처리하며,
-  리소스 한도 안에서 안전하게 동작합니다.
+- **반복/예약 작업(cron)**: 클라우드에서는 반복 작업이 아직 실행되지 않는다. 필요하면 Claude 앱의 예약 작업을 안내하거나 설치형을 안내한다.
+  사용자가 "매일 아침 뉴스 정리해줘", "1시간마다 확인해줘" 같은 반복 작업을 원하면 이 사실을 먼저 말하세요.
+  HeartBeat 등록(`POST $API_URL/api/tasks`)은 받아 두기만 하고 실행되지 않으니 "등록해 두면 돌아간다"고 말하지 마세요. crontab 도 없습니다.
 
 ## 함께 쓰는 사람들
 이 프로젝트는 여러 사람이 함께 쓸 수 있습니다. 메시지가
@@ -732,8 +777,8 @@ def _dedicated_host_prompt() -> str:
 
 ## 제약
 - **인터넷 아웃바운드는 443·80·53 포트만 열려 있습니다.** 그 외 포트(DB 직결, SSH 등)는 차단됩니다
-- **반복/예약 작업**: crontab 대신 피터보이스 HeartBeat 를 쓰세요
-  (`docs/HEARTBEAT.md` + `POST $API_URL/api/tasks`, interval_min>={hb_min})
+- **반복/예약 작업**: 이 서버에서는 반복 작업이 아직 실행되지 않는다(실행기 준비 중). 필요하면 Claude 앱의 예약 작업을 안내한다.
+  (HeartBeat 등록 `POST $API_URL/api/tasks` 은 받아 두기만 하고 실행되지 않으니 "등록해 두면 돌아간다"고 말하지 말 것. crontab 도 없다.)
 
 ## 함께 쓰는 사람들
 메시지가 `[팀원 OOO 님이 보낸 메시지]` 로 시작하면 프로젝트 소유자가 아닌 팀원이 보낸 것입니다.
@@ -1656,10 +1701,10 @@ def usage_limit_notice(limit: dict) -> str:
     when = _fmt_kst(_parse_reset_dt(limit.get("resets", "")), limit.get("resets") or "")
     if limit["kind"] == "model":
         head = f"⚠️ {limit['label']} 모델 사용 한도에 도달했습니다" + (f" (리셋: {when})" if when else "") + "."
-        return head + "\n다른 모델로 전환하거나 한도 리셋을 기다려야 합니다 (설정 > 모델)."
+        return head + "\n다른 모델로 전환하거나 한도 리셋을 기다려야 합니다 (설정 > 모델).\n" + USAGE_LIMIT_UPGRADE_TIP
     note = "주간 한도 · " if (limit.get("label") or "").lower().startswith("week") else ""
     head = "⏸ Claude 계정 세션 한도에 도달했습니다" + (f" ({note}리셋: {when})" if when else "") + "."
-    return head + "\n리셋 전까지는 모델을 바꿔도 실행되지 않습니다. 리셋 후 다시 요청해주세요."
+    return head + "\n리셋 전까지는 모델을 바꿔도 실행되지 않습니다. 리셋 후 다시 요청해주세요.\n" + USAGE_LIMIT_UPGRADE_TIP
 
 
 def _limit_slot(user_id: int) -> dict:
@@ -2080,6 +2125,8 @@ class LoginSession:
 
 login_sessions: dict[int, LoginSession] = {}
 login_lock = threading.Lock()
+_consult_opened: set[int] = set()      # '상담' 티켓을 이미 연 유저 (데몬 수명 동안)
+_consult_lock = threading.Lock()
 
 
 # ── Claude 사용 한도(/usage) 수집 ─────────────────────────────────
@@ -2541,6 +2588,30 @@ class CloudWorker:
                 self._locks[key] = threading.Lock()
             return self._locks[key]
 
+    def open_consult_ticket(self, api_key: str, user_id: int, project: str, msg_id):
+        """연결 단계에서 '상담'을 남긴 가입자 → 헬프데스크 help 티켓 1건 + 접수 안내 (2026-10-31 문구 묶음 B-1).
+        help 티켓은 헬프데스크(Sean 계정)에 릴레이되고, 답은 유저 채팅에 '🔧 문제 신고 #N 업데이트'로 돌아온다.
+        같은 유저가 여러 번 '상담'을 쳐도 데몬 수명 안에서는 티켓 1건."""
+        with _consult_lock:
+            already = user_id in _consult_opened
+        if already:
+            self.reply(api_key, CONSULT_ACK_MESSAGE, [msg_id], project)
+            return
+        res = user_api(api_key, "POST", "/api/support/tickets", {
+            "category": "help", "project": project,
+            "description": ("[클라우드 연결 단계 상담 요청] Claude 계정 연결 단계에서 '상담'을 남겼습니다. "
+                            "Claude Pro 이상 유료 구독이 없거나(무료 계정) 연결이 되지 않는 경우로 보입니다 — "
+                            "가입 이메일로 연락해 Claude 구독·설치형 중 맞는 길을 안내해 주세요."),
+        })
+        if res is None or (isinstance(res, dict) and res.get("error")):
+            logger.warning(f"[consult] user={user_id} project={project} 상담 티켓 생성 실패: {res!r}"[:300])
+            self.reply(api_key, CONSULT_FAIL_MESSAGE, [msg_id], project)
+            return
+        with _consult_lock:
+            _consult_opened.add(user_id)
+        logger.info(f"[consult] user={user_id} project={project} 상담 티켓 생성")
+        self.reply(api_key, CONSULT_ACK_MESSAGE, [msg_id], project)
+
     def reply(self, api_key: str, text: str, reply_to, project: str):
         user_api(api_key, "POST", "/api/bot/reply", {
             "text": text, "reply_to": reply_to, "project": project, "is_final": True,
@@ -2616,6 +2687,14 @@ class CloudWorker:
                 session = None
 
         code_match = CODE_RE.search(text.split("https://")[0]) if text else None
+        # has_credentials 는 sudo/podman 호출이라 필요한 갈래에서만 한 번 부른다
+        _cred: list = [None]
+
+        def connected() -> bool:
+            if _cred[0] is None:
+                _cred[0] = has_credentials(user_id)
+            return _cred[0]
+
         if session and session.state == "waiting_code" and code_match:
             self.reply(api_key, "코드를 확인하고 있어요...", [msg_id], project)
             ok = session.submit_code(code_match.group(0))
@@ -2646,7 +2725,9 @@ class CloudWorker:
             url = new_session.start()
             if url:
                 self.reply(api_key,
-                           f"아래 링크를 열어 클로드 계정으로 로그인한 뒤, 표시되는 코드를 여기에 붙여넣어 주세요:\n\n{url}",
+                           # 앞머리 "아래 링크를 열어 클로드 계정으로 로그인한" 은 biz traffic_digest 의 GATE — 바꾸면 집계가 끊긴다
+                           f"아래 링크를 열어 클로드 계정으로 로그인한 뒤, 표시되는 코드를 여기에 붙여넣어 주세요 "
+                           f"(Claude Pro 이상 유료 구독 계정 · 링크는 {LOGIN_CODE_TTL_SEC // 60}분 동안 유효해요):\n\n{url}",
                            [msg_id], project)
             else:
                 with login_lock:
@@ -2656,8 +2737,27 @@ class CloudWorker:
                            [msg_id], project)
             return
 
+        # ── 갈래 B: 세션이 없거나 만료됐는데 코드 모양 메시지 (2026-10-31 문구 묶음 B-1) ──
+        # 만료 뒤의 코드는 "코드가 아닌 메시지"처럼 처음 안내로 떨어져 유저가 같은 코드를 다시 붙여넣었다(biz 10/18 판정).
+        # 연결된 유저가 일반 대화에 긴 토큰을 섞어 보낸 경우는 제외 — 메시지 전체가 코드일 때만 안내한다.
+        if code_match and not (session and session.state == "waiting_code") and (
+                not connected() or text.strip() == code_match.group(0)):
+            self.reply(api_key, LOGIN_LINK_EXPIRED_MESSAGE, [msg_id], project)
+            return
+
+        # ── '상담': 유료 구독이 없어 연결을 못 하는 가입자 → 헬프데스크 help 티켓 (갈래 A 안내문이 이 낱말을 요청한다) ──
+        if not connected() and is_consult_trigger(text):
+            self.open_consult_ticket(api_key, user_id, project, msg_id)
+            return
+
+        # ── 갈래 A: 링크를 보낸 뒤 코드 모양이 아닌 메시지 ──
+        # 연결된 유저(계정 교체 중)가 일반 질문을 하면 평소대로 턴을 돈다 — 코드처럼 생긴(공백 없는 긴) 문자열일 때만 안내.
+        if session and session.state == "waiting_code" and (not connected() or _looks_like_code_attempt(text)):
+            self.reply(api_key, LOGIN_NOT_CODE_MESSAGE, [msg_id], project)
+            return
+
         # ── 미연결 유저: 안내만 ──
-        if not has_credentials(user_id):
+        if not connected():
             self.reply(api_key, NEED_LOGIN_MESSAGE, [msg_id], project)
             return
 

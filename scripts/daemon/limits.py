@@ -547,8 +547,12 @@ def account_cooldown_notice(account: str = "default", config_dir: str | None = N
     )
 
 
+# 한도 안내문 끝 한 줄 (2026-10-31 문구 정정 묶음 B-4, 맥·클라우드 공통 — cloud_daemon.py 의 같은 이름 상수와 문장을 맞출 것)
+USAGE_LIMIT_UPGRADE_TIP = "자주 닿으시면 Claude Max(월 $100부터)로 올리시면 한도가 5~20배가 됩니다."
+
+
 def usage_limit_notice(limit: dict, fallback_note: str = "") -> str:
-    """한도로 턴이 끝났을 때 사용자에게 보낼 안내."""
+    """한도로 턴이 끝났을 때 사용자에게 보낼 안내. 첫 문장은 고정 앞머리(집계용), 끝 줄은 구독 상향 안내."""
     resets = f" (리셋: {limit['resets']})" if limit.get("resets") else ""
     if limit["kind"] == "model":
         head = f"⚠️ {limit['label']} 모델 사용 한도에 도달했습니다{resets}."
@@ -556,4 +560,4 @@ def usage_limit_notice(limit: dict, fallback_note: str = "") -> str:
     else:
         head = f"⏸ Claude 계정 세션 한도에 도달했습니다{resets}."
         body = "리셋 전까지는 모델을 바꿔도 실행되지 않습니다. 리셋 후 다시 요청해주세요."
-    return f"{head}\n{body}"
+    return f"{head}\n{body}\n{USAGE_LIMIT_UPGRADE_TIP}"

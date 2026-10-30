@@ -13,7 +13,8 @@ ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "daemon"))
 
-from daemon.limits import detect_usage_limit, _SESSION_LIMIT_RE, _MODEL_LABEL_RE  # noqa: E402
+from daemon.limits import (detect_usage_limit, usage_limit_notice, _SESSION_LIMIT_RE, _MODEL_LABEL_RE,  # noqa: E402
+                           USAGE_LIMIT_UPGRADE_TIP)
 
 CASES = [
     # (입력, 기대 kind, 기대 label, 기대 resets)
@@ -60,6 +61,26 @@ for name, compiled in [("_SESSION_LIMIT_RE", _SESSION_LIMIT_RE), ("_MODEL_LABEL_
     fails += 0 if ok else 1
 ok = 'kind = "model" if _MODEL_LABEL_RE.match(label) else "session"' in cloud_src
 print(("PASS" if ok else "FAIL"), "cloud_daemon 동일 규칙: kind 분류")
+fails += 0 if ok else 1
+
+# 한도 안내문 — 첫 문장(고정 앞머리)은 그대로, 끝 줄은 구독 상향 안내 (2026-10-31 문구 묶음 B-4), 두 파일 같은 문장
+for lim, head in [({"kind": "session", "label": "5-hour", "resets": "3am"}, "⏸ Claude 계정 세션 한도에 도달했습니다"),
+                  ({"kind": "model", "label": "Opus", "resets": ""}, "⚠️ Opus 모델 사용 한도에 도달했습니다")]:
+    notice = usage_limit_notice(lim)
+    ok = notice.startswith(head) and notice.rstrip().endswith(USAGE_LIMIT_UPGRADE_TIP)
+    print(("PASS" if ok else "FAIL"), "notice", lim["kind"], "" if ok else repr(notice))
+    fails += 0 if ok else 1
+ok = f'USAGE_LIMIT_UPGRADE_TIP = "{USAGE_LIMIT_UPGRADE_TIP}"' in cloud_src and cloud_src.count("+ USAGE_LIMIT_UPGRADE_TIP") == 2
+print(("PASS" if ok else "FAIL"), "cloud_daemon 동일 문장: USAGE_LIMIT_UPGRADE_TIP (두 갈래 모두 끝 줄)")
+fails += 0 if ok else 1
+# 연결 단계 갈래 A·B 의 고정 앞머리 (biz traffic_digest 집계용) + 링크 메시지 GATE 앞머리 보존
+for name, head in [("LOGIN_NOT_CODE_HEAD", "코드가 아닌 것 같아요."), ("LOGIN_LINK_EXPIRED_HEAD", "링크 유효시간이 지났어요."),
+                   ("CONSULT_ACK_HEAD", "상담 요청을 접수했어요.")]:
+    ok = f'{name} = "{head}"' in cloud_src
+    print(("PASS" if ok else "FAIL"), "cloud_daemon 고정 앞머리:", name)
+    fails += 0 if ok else 1
+ok = 'f"아래 링크를 열어 클로드 계정으로 로그인한 뒤, 표시되는 코드를 여기에 붙여넣어 주세요 "' in cloud_src
+print(("PASS" if ok else "FAIL"), "cloud_daemon 링크 메시지 GATE 앞머리 보존")
 fails += 0 if ok else 1
 
 print("\nFAILS:", fails)
