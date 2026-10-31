@@ -297,6 +297,15 @@ def build_claude_env(config: dict, account_config_dir: str | None = None) -> dic
     # 되돌리려면 config.json 에 "claudeai_connectors": true (대화형 CLI 는 이 env 를 안 거치므로 영향 없음).
     if not config.get("claudeai_connectors", False):
         env["ENABLE_CLAUDEAI_MCP_SERVERS"] = "false"
+    # Claude Code 자동 압축 창 (2026-10-31 세션 위생 검토). 기본은 모델 창(1M)이라 이 맥 실측 24건 전부 96.5만~99.1만 토큰에서야
+    # 압축됐다. config "claude_auto_compact_window": 400000 처럼 두면 그 근처에서 CLI 가 **같은 세션 안에서** 요약·압축한다
+    # (CLI 2.1.314 `CLAUDE_CODE_AUTO_COMPACT_WINDOW`, 헤드리스 -p 에도 적용). 미설정(0)이면 손대지 않는다 — 값은 Sean 결정.
+    try:
+        win = int(config.get("claude_auto_compact_window") or 0)
+    except (TypeError, ValueError):
+        win = 0
+    if win > 0:
+        env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = str(win)
     return env
 
 

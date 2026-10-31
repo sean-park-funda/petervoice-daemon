@@ -12,6 +12,7 @@ from daemon.globals import config, active_projects, active_projects_lock, proces
 from daemon.api import api_request, inject_system_message
 from daemon.supabase import get_project_dir
 from daemon.limits import clear_account_cooldown_if_stale, claude_account_email, seat_config_dir
+from daemon import scout
 import usage_api
 
 
@@ -101,6 +102,10 @@ class HeartbeatThread(threading.Thread):
         self._last_usage_fetch = 0.0
         # project → (직전 주입 msg_id, 주입 시각). 짧은 간격에서 큐에 메시지가 쌓이는 것을 막는다.
         self._pending: dict[str, tuple[int, float]] = {}
+        # 정찰 턴(scout) — 동시에 도는 정찰 수 상한과, 정찰 중인 프로젝트(같은 태스크를 다시 집지 않게)
+        self._scout_sem = threading.BoundedSemaphore(max(1, int(scout.settings().get("max_concurrent") or 2)))
+        self._scouting: set[str] = set()
+        self._scouting_lock = threading.Lock()
 
     def run(self):
         logger.info("[heartbeat] Thread started")
@@ -134,6 +139,10 @@ class HeartbeatThread(threading.Thread):
                 self._process_task(task)
             except Exception as e:
                 logger.error(f"[heartbeat] {task.get('project', '?')} error: {e}")
+        try:
+            scout.maybe_cleanup_transcripts()
+        except Exception as e:
+            logger.warning(f"[scout] cleanup error: {e}")
 
     def _fetch_due_tasks(self) -> list[dict]:
         api_key = config.get("api_key", "")
@@ -252,7 +261,42 @@ class HeartbeatThread(threading.Thread):
             logger.info(f"[heartbeat] {project} skipped (no HEARTBEAT.md)")
             return
 
-        msg = self.HEARTBEAT_MSG.replace("HEARTBEAT.md", self._heartbeat_filename(project))
+        hb_name = self._heartbeat_filename(project)
+        msg = self.HEARTBEAT_MSG.replace("HEARTBEAT.md", hb_name)
+
+        # ── 정찰 턴 (2026-10-31, Sean 승인) — 본 세션을 깨우기 전에 가벼운 새 세션이 「지금 할 일이 있나」를 판정 ──
+        # 빈 회차가 턴의 44%였고 문맥 45만 세션은 「할 일 없음」 한 줄에 $5 였다. 본 세션은 손대지 않는다(지식 보존).
+        # force_every 회차마다 한 번은 정찰 없이 본 세션을 깨워, 상태를 세션 안에만 둔 담당의 일이 영영 미뤄지지 않게 한다.
+        if scout.enabled() and not (warning and "비어 있음" in warning):
+            with self._scouting_lock:
+                already = project in self._scouting
+            if already:
+                logger.info(f"[scout] {project} still scouting → skip this tick")
+                return
+            forced = scout.should_force_main(task.get("run_count") or 0, scout.settings().get("force_every"))
+            if not forced and scout.account_in_cooldown(project):
+                # 계정 한도 쿨다운 중 — 정찰도 본 세션도 못 돈다. busy 처럼 조금 미룬다(간격만큼 넘기면 일일 태스크가 하루를 건너뛴다)
+                delay = self._busy_postpone_min(interval)
+                self._update_task(task["id"], {"next_run_at": (datetime.now(timezone.utc) + timedelta(minutes=delay)).isoformat()})
+                logger.info(f"[scout] {project} account cooldown → postponed {delay}m")
+                return
+            if not forced:
+                hb_text = self._read_heartbeat_text(project, hb_name)
+                if hb_text is not None:
+                    # 스케줄을 먼저 넘긴다 — 정찰이 도는 동안 다음 폴링이 같은 태스크를 또 집지 않게
+                    next_run = self._next_run_from_schedule(task, interval)
+                    self._update_task(task["id"], {
+                        "next_run_at": next_run.isoformat(),
+                        "run_count": task["run_count"] + 1,
+                    })
+                    with self._scouting_lock:
+                        self._scouting.add(project)
+                    threading.Thread(target=self._scout_then_inject, args=(task, msg, hb_name, hb_text, interval),
+                                     daemon=True, name=f"scout-{project}").start()
+                    return
+            else:
+                logger.info(f"[scout] {project} run#{task['run_count'] + 1} forced main session (every {scout.settings().get('force_every')})")
+
         msg_id, ts = inject_system_message(project, msg, prefix="[heartbeat]")
         if not msg_id:
             logger.warning(f"[heartbeat] {project} inject failed")
@@ -265,6 +309,41 @@ class HeartbeatThread(threading.Thread):
             "run_count": task["run_count"] + 1,
         })
         logger.info(f"[heartbeat] {project} woke up (run #{task['run_count'] + 1}, next in {interval}m)")
+
+    def _read_heartbeat_text(self, project: str, hb_name: str) -> str | None:
+        """HEARTBEAT 파일 본문(정찰 입력). 없거나 비면 None → 정찰하지 않고 기존 경로로."""
+        try:
+            path = os.path.join(get_project_dir(project), "docs", hb_name)
+            text = open(path, encoding="utf-8", errors="replace").read()
+            return text if text.strip() else None
+        except Exception:
+            return None
+
+    def _scout_then_inject(self, task: dict, msg: str, hb_name: str, hb_text: str, interval: int):
+        """정찰 스레드: 판정이 「있음」이면 본 세션에 하트비트를 주입한다(정찰 결과를 덧붙여 본 세션이 점검을 되풀이하지 않게)."""
+        project = task["project"]
+        run_no = int(task.get("run_count") or 0) + 1
+        try:
+            with self._scout_sem:
+                if shutdown_event.is_set():
+                    return
+                verdict = scout.run_scout(project, task, hb_name, hb_text)
+            if not verdict.get("work"):
+                return  # 조용히 — 채팅에 아무것도 남기지 않는다 (기록은 ledger·로그)
+            text = msg
+            if verdict.get("reason"):
+                text = f"{msg}\n\n(정찰 결과: {verdict['reason']})"
+            msg_id, _ts = inject_system_message(project, text, prefix="[heartbeat]")
+            if not msg_id:
+                logger.warning(f"[heartbeat] {project} inject failed (after scout)")
+                return
+            self._pending[project] = (msg_id, time.time())
+            logger.info(f"[heartbeat] {project} woke up after scout (run #{run_no}, next in {interval}m)")
+        except Exception as e:
+            logger.error(f"[scout] {project} thread error: {e}")
+        finally:
+            with self._scouting_lock:
+                self._scouting.discard(project)
 
     def _update_task(self, task_id: str, updates: dict):
         api_key = config.get("api_key", "")

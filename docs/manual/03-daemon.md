@@ -242,6 +242,13 @@ stderr에 "context" 포함 감지
 - 프로젝트별 `account` 필드 → 해당 계정의 config_dir 사용
 - `CLAUDE_CONFIG_DIR` 환경변수로 Claude CLI에 전달
 - 계정 변경 시 세션 자동 리셋
+- **자동 비우기(`daemon/autoreset.py`, 2시간 주기)** 임계: 수명 48h · 메시지 500 · 전사 10MB · **문맥 25만 토큰**(2026-10-31 추가 — 전사 꼬리의 마지막
+  assistant usage = 입력+캐시 쓰기+캐시 읽기. 파일 크기보다 문맥이 비용을 정한다). 컨텍스트 저장이 3회 연속 실패하면 저장 없이 리셋(좀비 세션).
+  config: `session_max_context_tokens`(0=끔) · `session_summary_max_failures`.
+- **비우기 전 회고(`session_retro`, 2026-10-31)**: 요약 호출 한 번에 「`docs/playbook.md` 에 `## 회고 <날짜> (세션 리셋 전)` 절(잘 된 방법·실패·유저 피드백,
+  15줄, 근거 괄호, 대화에 있던 것만) → 인계 요약」을 시킨다. 다음 세션 인계 메모 끝에 플레이북 안내가 붙는다. 끄기 `session_retro.enabled=false`.
+- **CLI 자동 압축 창**: config `claude_auto_compact_window`(토큰)를 두면 `CLAUDE_CODE_AUTO_COMPACT_WINDOW` 로 Claude Code 가 그 근처에서 같은 세션 안에서
+  압축한다(기본 모델 창 1M — 실측 24건 전부 96.5만+에서 압축). 기본 미설정, 값은 Sean 결정.
 
 ## SecretsSyncer — 환경변수 싱크
 

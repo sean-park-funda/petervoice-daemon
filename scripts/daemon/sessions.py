@@ -145,6 +145,38 @@ def _session_transcript_path(session_id: str, config_dir: str | None = None) -> 
     return ""
 
 
+def retro_settings() -> dict:
+    """비우기 전 회고 (2026-10-31 Sean 승인 — 문구 묶음이 아니라 세션 위생 계획 제안 4).
+    config.json `session_retro`: {"enabled": true, "path": "docs/playbook.md", "max_lines": 15, "max_turns": 12, "timeout_sec": 420}"""
+    d = {"enabled": True, "path": "docs/playbook.md", "max_lines": 15, "max_turns": 12, "timeout_sec": 420}
+    raw = config.get("session_retro")
+    if isinstance(raw, dict):
+        d.update({k: v for k, v in raw.items() if v is not None})
+    elif isinstance(raw, bool):
+        d["enabled"] = raw
+    return d
+
+
+def build_retro_block(playbook_path: str, max_lines: int, today: str) -> str:
+    """요약 호출에 앞세우는 회고 지시. 요약과 같은 `claude -p --resume` 한 번에 돌아 프리필(문맥 전체)은 한 번만 낸다.
+    규칙은 인계 요약과 같다 — 대화에 실제로 있던 것만, 불확실은 표시(티켓 #29 날조 사고의 교훈)."""
+    return (
+        "세션이 곧 리셋됩니다. 두 가지를 **순서대로** 하세요.\n\n"
+        f"[1] 회고를 파일에 남기기 — 이 세션에서 배운 것을 `{playbook_path}` 에 갱신하세요(없으면 만드세요. 파일 맨 위 제목은 "
+        "`# 플레이북 — 이 담당자가 일을 더 잘하게 된 기록`).\n"
+        f"    파일 제목 바로 아래에 `## 회고 {today} (세션 리셋 전)` 절을 **추가**합니다(기존 절은 지우지 말 것, 최신이 위). 항목은 세 가지뿐입니다:\n"
+        "    - 잘 된 방법: 같은 일을 다음에 더 빨리·정확히 하는 데 쓸 절차·명령·판단 기준\n"
+        "    - 실패·함정: 시간을 잃은 원인과 피하는 법\n"
+        "    - 유저 피드백·규칙: 유저가 고치라고 했거나 확정한 기준\n"
+        "    규칙: ① 이 대화에 실제로 있었던 것만, 줄 끝에 근거(날짜·요지)를 괄호로 ② 추측·일반론·이미 플레이북에 있는 내용은 쓰지 않는다 — "
+        f"해당 없으면 그 항목에 '없음' ③ 세 항목 합쳐 {max_lines}줄 이내 ④ 외부 서비스(구글·쿠팡·네이버·결제·관공서·API 등) 경험은 "
+        "`docs/lessons/<service>-<task>.md` 규칙대로 별도 파일에 ⑤ 자격증명 값·고객 개인정보는 적지 않는다 "
+        "⑥ 플레이북이 400줄을 넘으면 가장 오래된 회고 절부터 `docs/playbook-archive.md` 로 옮긴다.\n"
+        "    배운 것이 정말 없으면 파일을 만들지 말고 [2]로 넘어가세요.\n\n"
+        "[2] 인계 요약 — 아래 지시대로 요약을 **마지막 응답 본문으로** 출력하세요 (파일에 쓴 회고 내용을 다시 적지 마세요).\n\n"
+    )
+
+
 def save_session_context(project: str) -> bool:
     """Save session context before reset: ask Claude to summarize, then store."""
     key = session_key(project)
@@ -180,7 +212,14 @@ def save_session_context(project: str) -> bool:
     # 발췌는 메시지별로 잘릴 수 있어 '원문 그대로'라고 쓰면 안 된다 — 모델이 잘린 뒤를
     # 지어내 '확정'으로 적은 사고가 있었다 (티켓 #29, 2026-10-08).
     recent_raw = _fetch_recent_conversation(project, limit=recent_turns, max_chars=recent_max_chars)
-    summary_prompt = (
+    retro = retro_settings()
+    retro_on = bool(retro.get("enabled")) and not project.startswith("demo_")
+    playbook_rel = str(retro.get("path") or "docs/playbook.md")
+    playbook_abs = os.path.join(project_dir, playbook_rel) if project_dir else playbook_rel
+    playbook_mtime_before = os.path.getmtime(playbook_abs) if os.path.exists(playbook_abs) else None
+    retro_block = build_retro_block(playbook_rel, int(retro.get("max_lines") or 15),
+                                    datetime.now().strftime("%Y-%m-%d")) if retro_on else ""
+    summary_prompt = retro_block + (
         "세션이 곧 리셋됩니다. 다음 세션에서 이어갈 수 있도록 지금까지의 핵심 맥락을 요약해주세요.\n"
         "아래 '최근 대화'는 다음 세션에도 이 발췌 그대로 함께 전달되므로 요약에서는 제외하고, "
         "그 이전 내용만 요약하세요 (최근 대화 내용을 다시 적지 마세요):\n"
@@ -204,8 +243,11 @@ def save_session_context(project: str) -> bool:
     # --verbose 필수: CLI가 "When using --print, --output-format=stream-json requires --verbose"로
     # exit 1 하며 즉시 죽는다(1초). 이 인자가 없어 AI 요약이 항상 실패하고 폴백(원문)만
     # 저장되고 있었다 — 2026-07-27 실측으로 확인·수정.
-    cmd = [CLAUDE_CMD, "-p", "--output-format", "stream-json", "--verbose",
-           "--resume", sid, "--", summary_prompt]
+    cmd = [CLAUDE_CMD, "-p", "--output-format", "stream-json", "--verbose"]
+    if retro_on:
+        # 회고는 파일을 읽고 쓴다 — 본 턴과 같은 권한, 도구 루프 상한
+        cmd.extend(["--dangerously-skip-permissions", "--max-turns", str(int(retro.get("max_turns") or 12))])
+    cmd.extend(["--resume", sid, "--", summary_prompt])
     claude_env = build_claude_env(config, account_config_dir)
 
     try:
@@ -217,6 +259,7 @@ def save_session_context(project: str) -> bool:
             cwd=project_dir, env=claude_env, shell=IS_WINDOWS,
         )
         summary_text = ""
+        final_result = ""
         for line in proc.stdout:
             line = line.decode("utf-8", errors="replace").strip()
             if not line:
@@ -235,12 +278,24 @@ def save_session_context(project: str) -> bool:
                 if delta.get("type") == "text_delta":
                     summary_text += delta.get("text", "")
             elif etype == "result":
-                if event.get("result") and not summary_text.strip():
-                    summary_text = event["result"]
+                if event.get("result"):
+                    final_result = event["result"]
         # 19.5MB 세션 요약에 실측 25초. 더 큰 세션(30~70MB)도 있어 60초는 빡빡하므로
-        # 기본 180초로 늘리고 config로 조정 가능하게 한다.
-        proc.wait(timeout=config.get("session_summary_timeout_sec", 180))
+        # 기본 180초로 늘리고 config로 조정 가능하게 한다. 회고가 켜져 있으면 도구 호출이 더 있어 더 길게.
+        wait_sec = config.get("session_summary_timeout_sec", 180)
+        if retro_on:
+            wait_sec = max(int(wait_sec), int(retro.get("timeout_sec") or 420))
+        proc.wait(timeout=wait_sec)
+        # 회고가 켜져 있으면 중간 텍스트(도구 사이의 말)가 섞이므로 마지막 응답(result)만 요약으로 쓴다
+        if final_result.strip():
+            summary_text = final_result
         summary_text = _strip_ansi(summary_text).strip()
+        if retro_on:
+            after = os.path.getmtime(playbook_abs) if os.path.exists(playbook_abs) else None
+            if after and after != playbook_mtime_before:
+                logger.info(f"[retro] {project} playbook updated: {playbook_abs}")
+            else:
+                logger.info(f"[retro] {project} no playbook change")
 
         if summary_text and len(summary_text) > 20:
             # 슬라이딩 윈도우: 요약(N턴 이전) + 최근 N턴 원문을 함께 저장.
@@ -376,6 +431,16 @@ def _build_session_context_prompt(project: str) -> str:
         return ""
     # 요약은 기계가 만든 것이라 틀릴 수 있다. 새 세션이 그대로 믿고 작업해 유저가 확정한
     # 내용과 다른 결과물을 만든 사고가 있었다 (티켓 #29) → 원본과 대조하는 방법을 함께 준다.
+    playbook_note = ""
+    try:
+        rel = str(retro_settings().get("path") or "docs/playbook.md")
+        pb = os.path.join(get_project_dir(project), rel)
+        if os.path.exists(pb):
+            n = sum(1 for ln in open(pb, encoding="utf-8", errors="replace") if ln.startswith("## 회고 "))
+            playbook_note = (f"\n\n## 플레이북\n이 담당의 회고 {n}건이 `{rel}` 에 쌓여 있습니다(최신이 위). "
+                             "같은 종류의 일을 시작하기 전에 해당 절을 읽고, 세션이 끝날 때 배운 것을 거기에 더하세요.")
+    except Exception:
+        playbook_note = ""
     return (
         "# 이전 세션 컨텍스트\n"
         "아래는 이전 세션이 리셋되기 직전에 자동으로 만든 인계 메모입니다. 기계 요약이라 틀리거나 빠진 것이 있을 수 있습니다.\n"
@@ -385,7 +450,7 @@ def _build_session_context_prompt(project: str) -> str:
         "- 원본 기록 찾는 법: ① 메모 끝 '원본 기록'의 이전 세션 대화 파일(있으면) — 크므로 Read 말고 Grep 으로 키워드 검색 "
         f"② 대화 조회 API `GET $API_URL/api/bot/conversation?project={project}&limit=200` (`Authorization: Bearer <config.json 의 api_key>` 헤더 — X-Api-Key 는 거절됨) — 더 이전 대화는 응답의 "
         "`next_before` 값을 `&before=` 로 넘겨 계속 거슬러 올라갑니다.\n\n"
-        f"{summary.strip()}"
+        f"{summary.strip()}{playbook_note}"
     )
 
 
