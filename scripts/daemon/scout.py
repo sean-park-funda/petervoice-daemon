@@ -175,10 +175,14 @@ def _system_prompt(project: str, project_dir: str, role: str) -> str:
     )
 
 
-def _user_prompt(hb_name: str, hb_text: str, recent: str, run_no: int) -> str:
-    now = datetime.now().strftime("%Y-%m-%d %H:%M (%a)")
+def _user_prompt(hb_name: str, hb_text: str, recent: str) -> str:
+    """정찰 첫 user 메시지. **시각·회차 번호를 넣지 않는다** — 첫 메시지가 직전 정찰과 글자까지 같아야 프롬프트 캐시가 맞는다.
+    10/31 실측: 시각이 앞에 있던 동안 정찰 19회 전부 첫 호출에서 시스템 프롬프트(붙임)+이 메시지를 매번 다시 썼다(쓰기 3만~17만 토큰,
+    캐시 읽기는 CLI 기본 프롬프트 1.2만뿐). 같은 프롬프트로 두 번째 프로세스를 돌리면 쓰기 0·읽기 전부, 비용 1/27.
+    오늘 날짜는 Claude Code 시스템 프롬프트("Today's date")에 있고, 시각이 필요하면 `date` 로 본다."""
     return (
-        f"[하트비트 정찰] 지금 {now}, 회차 #{run_no}. `docs/{hb_name}` 를 확인하고 이번 회차에 처리할 일이 있는지 판정해주세요.\n\n"
+        f"[하트비트 정찰] `docs/{hb_name}` 를 확인하고 이번 회차에 처리할 일이 있는지 판정해주세요. "
+        "오늘 날짜는 시스템 프롬프트의 Today's date, 현재 시각이 필요하면 Bash `date` 로 확인하세요.\n\n"
         f"## docs/{hb_name}\n{hb_text.strip()}\n\n"
         f"## 최근 회차 결과 (최근 메시지 발췌, 잘렸을 수 있음)\n{recent.strip() or '(없음)'}"
     )
@@ -223,7 +227,7 @@ def run_scout(project: str, task: dict, hb_name: str, hb_text: str, forced: bool
                "--append-system-prompt-file", str(sys_file)]
         if st.get("effort"):
             cmd.extend(["--effort", str(st["effort"])])
-        cmd.extend(["--", _user_prompt(hb_name, hb_text, recent, run_no)])
+        cmd.extend(["--", _user_prompt(hb_name, hb_text, recent)])
         env = build_claude_env(config, config_dir)
 
         final_text, texts = "", []

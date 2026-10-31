@@ -306,6 +306,9 @@ def build_claude_env(config: dict, account_config_dir: str | None = None) -> dic
         win = 0
     if win > 0:
         env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = str(win)
+    else:
+        # config 가 단일 원천 — 부모 프로세스(예: 창이 켜진 데몬 턴 안에서 띄운 시험)에서 물려받은 값은 버린다
+        env.pop("CLAUDE_CODE_AUTO_COMPACT_WINDOW", None)
     return env
 
 

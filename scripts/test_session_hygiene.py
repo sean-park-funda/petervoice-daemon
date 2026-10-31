@@ -4,6 +4,7 @@
 실행: python3 scripts/test_session_hygiene.py
 """
 import json
+import re
 import os
 import sys
 from pathlib import Path
@@ -83,6 +84,18 @@ check("compact window bad value ignored", "CLAUDE_CODE_AUTO_COMPACT_WINDOW" not 
 env3 = summary_call_env({"claude_auto_compact_window": 400000}, None)
 check("retro/summary call drops the compact window (sees the whole transcript)", "CLAUDE_CODE_AUTO_COMPACT_WINDOW" not in env3)
 check("retro/summary call keeps the rest of the env", env3.get("ENABLE_CLAUDEAI_MCP_SERVERS") == env1.get("ENABLE_CLAUDEAI_MCP_SERVERS"))
+
+# ── 정찰 프롬프트는 캐시 안정 (시각·회차 번호 없음) ──
+import time as _time
+_p1 = scout._user_prompt("HEARTBEAT.md", "- [ ] a\n- [ ] b", "최근 발췌")
+_time.sleep(1.1)
+_p2 = scout._user_prompt("HEARTBEAT.md", "- [ ] a\n- [ ] b", "최근 발췌")
+check("scout user prompt is byte-identical across calls (prompt cache)", _p1 == _p2)
+check("scout user prompt has no clock/run number", not re.search(r"20\d\d-\d\d-\d\d|회차 #", _p1))
+check("scout user prompt carries HEARTBEAT text and recent excerpt", "- [ ] b" in _p1 and "최근 발췌" in _p1 and "docs/HEARTBEAT.md" in _p1)
+_sys1 = scout._system_prompt("peter-voice", "/tmp/x", "역할")
+_sys2 = scout._system_prompt("peter-voice", "/tmp/x", "역할")
+check("scout system prompt is deterministic", _sys1 == _sys2 and "역할" in _sys1)
 
 # ── 정찰 설정 병합 ──
 s = scout.settings()
