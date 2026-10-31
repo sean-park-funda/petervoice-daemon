@@ -177,6 +177,16 @@ def build_retro_block(playbook_path: str, max_lines: int, today: str) -> str:
     )
 
 
+def summary_call_env(config: dict, account_config_dir) -> dict:
+    """비우기 직전 회고·인계 요약 호출의 env — 본 턴과 같되 **압축 창만 뺀다**.
+    회고는 원문 전체를 봐야 한다. 압축 창(config claude_auto_compact_window, 2026-10-31 Sean 결정 40만)이 켜져 있으면
+    문맥이 창을 넘은 세션은 이 턴 첫 호출에서 CLI 가 먼저 압축해 버려 회고가 압축 요약을 보고 쓰이게 된다.
+    이 한 호출만 창을 빼서 비우기 직전 회고는 항상 전체 대화에서 나온다."""
+    env = build_claude_env(config, account_config_dir)
+    env.pop("CLAUDE_CODE_AUTO_COMPACT_WINDOW", None)
+    return env
+
+
 def save_session_context(project: str) -> bool:
     """Save session context before reset: ask Claude to summarize, then store."""
     key = session_key(project)
@@ -248,7 +258,7 @@ def save_session_context(project: str) -> bool:
         # 회고는 파일을 읽고 쓴다 — 본 턴과 같은 권한, 도구 루프 상한
         cmd.extend(["--dangerously-skip-permissions", "--max-turns", str(int(retro.get("max_turns") or 12))])
     cmd.extend(["--resume", sid, "--", summary_prompt])
-    claude_env = build_claude_env(config, account_config_dir)
+    claude_env = summary_call_env(config, account_config_dir)
 
     try:
         proc = subprocess.Popen(

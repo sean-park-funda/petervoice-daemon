@@ -17,7 +17,7 @@ sys.path.insert(0, str(ROOT / "daemon"))
 
 from daemon import scout  # noqa: E402
 from daemon import autoreset  # noqa: E402
-from daemon.sessions import build_retro_block  # noqa: E402
+from daemon.sessions import build_retro_block, summary_call_env  # noqa: E402
 from daemon.limits import build_claude_env  # noqa: E402
 
 fails = 0
@@ -80,6 +80,9 @@ env1 = build_claude_env({"claude_auto_compact_window": 400000}, None)
 check("compact window env when configured", env1.get("CLAUDE_CODE_AUTO_COMPACT_WINDOW") == "400000")
 env2 = build_claude_env({"claude_auto_compact_window": "abc"}, None)
 check("compact window bad value ignored", "CLAUDE_CODE_AUTO_COMPACT_WINDOW" not in env2)
+env3 = summary_call_env({"claude_auto_compact_window": 400000}, None)
+check("retro/summary call drops the compact window (sees the whole transcript)", "CLAUDE_CODE_AUTO_COMPACT_WINDOW" not in env3)
+check("retro/summary call keeps the rest of the env", env3.get("ENABLE_CLAUDEAI_MCP_SERVERS") == env1.get("ENABLE_CLAUDEAI_MCP_SERVERS"))
 
 # ── 정찰 설정 병합 ──
 s = scout.settings()
