@@ -87,15 +87,19 @@ check("retro/summary call keeps the rest of the env", env3.get("ENABLE_CLAUDEAI_
 
 # ── 정찰 프롬프트는 캐시 안정 (시각·회차 번호 없음) ──
 import time as _time
-_p1 = scout._user_prompt("HEARTBEAT.md", "- [ ] a\n- [ ] b", "최근 발췌")
+_p1 = scout._user_prompt("HEARTBEAT.md", "최근 발췌")
 _time.sleep(1.1)
-_p2 = scout._user_prompt("HEARTBEAT.md", "- [ ] a\n- [ ] b", "최근 발췌")
+_p2 = scout._user_prompt("HEARTBEAT.md", "최근 발췌")
 check("scout user prompt is byte-identical across calls (prompt cache)", _p1 == _p2)
 check("scout user prompt has no clock/run number", not re.search(r"20\d\d-\d\d-\d\d|회차 #", _p1))
-check("scout user prompt carries HEARTBEAT text and recent excerpt", "- [ ] b" in _p1 and "최근 발췌" in _p1 and "docs/HEARTBEAT.md" in _p1)
-_sys1 = scout._system_prompt("peter-voice", "/tmp/x", "역할")
-_sys2 = scout._system_prompt("peter-voice", "/tmp/x", "역할")
-check("scout system prompt is deterministic", _sys1 == _sys2 and "역할" in _sys1)
+check("scout user prompt carries recent excerpt + file name only", "최근 발췌" in _p1 and "docs/HEARTBEAT.md" in _p1 and "- [ ] b" not in _p1)
+# HEARTBEAT 본문은 시스템 프롬프트(별도 캐시 접두어)에 — 최근 발췌가 바뀌어도 본문은 다시 쓰지 않는다
+_sys1 = scout._system_prompt("peter-voice", "/tmp/x", "역할", "HEARTBEAT.md", "- [ ] a\n- [ ] b")
+_sys2 = scout._system_prompt("peter-voice", "/tmp/x", "역할", "HEARTBEAT.md", "- [ ] a\n- [ ] b")
+check("scout system prompt is deterministic and carries HEARTBEAT body + role", _sys1 == _sys2 and "- [ ] b" in _sys1 and "docs/HEARTBEAT.md" in _sys1 and "역할" in _sys1)
+check("scout system prompt does not carry the recent excerpt", "최근 발췌" not in _sys1)
+check("scout system prompt without body (legacy call) still has role", "역할" in scout._system_prompt("peter-voice", "/tmp/x", "역할") and "점검 대상 체크리스트" not in scout._system_prompt("peter-voice", "/tmp/x", "역할"))
+check("scout system prompt changes only with the body, not with the user turn", scout._system_prompt("peter-voice", "/tmp/x", "역할", "HEARTBEAT.md", "- [ ] c") != _sys1)
 
 # ── 정찰 설정 병합 ──
 s = scout.settings()

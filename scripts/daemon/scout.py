@@ -154,8 +154,13 @@ def _role_prompt(project: str, max_chars: int) -> str:
     return text
 
 
-def _system_prompt(project: str, project_dir: str, role: str) -> str:
-    return (
+def _system_prompt(project: str, project_dir: str, role: str, hb_name: str = "", hb_text: str = "") -> str:
+    """정찰 시스템 프롬프트(붙임 파일). **HEARTBEAT 본문은 여기에 싣는다.**
+    시스템 프롬프트는 user 메시지와 별개의 캐시 접두어다 — 10/31 실측: user 메시지만 바꾼 2회차에서 붙임 1.3만 토큰이
+    cache_read 로 잡혔다(CLI 기본 1.1만 + 붙임). 본문이 user 메시지에 있던 동안은 본 세션이 한 번 답해 「최근 회차 결과」가
+    바뀌면 본문 10만 토큰까지 통째로 다시 썼다(990: 12:48 w=101k → 13:17 w=99k, 1123 처럼 아무것도 안 바뀐 경우만 적중).
+    그래서 바뀌지 않는 것(지시·체크리스트·역할)은 여기, 회차마다 바뀌는 것(최근 발췌)만 user 메시지에 둔다."""
+    text = (
         "# 하트비트 정찰 턴\n"
         f"당신은 담당자 「{project}」의 하트비트를 대신 **점검만** 하는 정찰 세션입니다. 본 세션(긴 대화)은 따로 있고, "
         "당신이 「있음」이라고 판정할 때만 깨어나 일합니다. 작업 폴더: `" + project_dir + "`\n\n"
@@ -171,20 +176,28 @@ def _system_prompt(project: str, project_dir: str, role: str) -> str:
         "## 답 형식\n"
         "짧은 점검 요약 뒤, **마지막 줄에 반드시** 다음 한 줄만 쓰세요(다른 말 붙이지 않기):\n"
         'SCOUT: {"work": true, "reason": "무엇이 생겼는지 한 줄"}   또는   SCOUT: {"work": false, "reason": "무엇을 확인했는지 한 줄"}\n'
-        + (f"\n\n# 담당자 역할 (참고용)\n{role}" if role else "")
     )
+    if hb_text and hb_text.strip():
+        text += (
+            f"\n\n# 점검 대상 체크리스트 — `docs/{hb_name}` 원문\n"
+            "아래는 그 파일의 내용 그대로다(다시 Read 할 필요 없다). 항목이 가리키는 주기·기록 파일·날짜 조건은 실제 파일로 확인한다.\n\n"
+            f"{hb_text.strip()}"
+        )
+    if role:
+        text += f"\n\n# 담당자 역할 (참고용)\n{role}"
+    return text
 
 
-def _user_prompt(hb_name: str, hb_text: str, recent: str) -> str:
-    """정찰 첫 user 메시지. **시각·회차 번호를 넣지 않는다** — 첫 메시지가 직전 정찰과 글자까지 같아야 프롬프트 캐시가 맞는다.
-    10/31 실측: 시각이 앞에 있던 동안 정찰 19회 전부 첫 호출에서 시스템 프롬프트(붙임)+이 메시지를 매번 다시 썼다(쓰기 3만~17만 토큰,
-    캐시 읽기는 CLI 기본 프롬프트 1.2만뿐). 같은 프롬프트로 두 번째 프로세스를 돌리면 쓰기 0·읽기 전부, 비용 1/27.
-    오늘 날짜는 Claude Code 시스템 프롬프트("Today's date")에 있고, 시각이 필요하면 `date` 로 본다."""
+def _user_prompt(hb_name: str, recent: str) -> str:
+    """정찰 첫 user 메시지 — **회차마다 바뀌는 것(최근 회차 발췌)만** 싣는다. HEARTBEAT 본문은 시스템 프롬프트(_system_prompt)에.
+    **시각·회차 번호를 넣지 않는다**(d74119a) — 10/31 실측: 시각이 앞에 있던 동안 정찰 19회 전부 첫 호출에서 붙임+이 메시지를
+    매번 다시 썼다. 같은 프롬프트로 두 번째 프로세스를 돌리면 쓰기 0·읽기 전부, 비용 1/27.
+    이 메시지가 바뀌면 Claude Code 가 첫 user 턴에 붙이는 주입 문맥(CLAUDE.md·메모리·스킬 목록, 1만~3만 토큰)도 같이 다시 쓴다 —
+    그래도 본문(3만~17만)보다는 작다. 오늘 날짜는 Claude Code 시스템 프롬프트("Today's date")에 있고, 시각이 필요하면 `date` 로 본다."""
     return (
-        f"[하트비트 정찰] `docs/{hb_name}` 를 확인하고 이번 회차에 처리할 일이 있는지 판정해주세요. "
+        f"[하트비트 정찰] 시스템 프롬프트에 실린 `docs/{hb_name}` 체크리스트(파일 원문)를 보고 이번 회차에 처리할 일이 있는지 판정해주세요. "
         "오늘 날짜는 시스템 프롬프트의 Today's date, 현재 시각이 필요하면 Bash `date` 로 확인하세요.\n\n"
-        f"## docs/{hb_name}\n{hb_text.strip()}\n\n"
-        f"## 최근 회차 결과 (최근 메시지 발췌, 잘렸을 수 있음)\n{recent.strip() or '(없음)'}"
+        f"## 최근 회차 결과 (본 세션의 최근 메시지 발췌, 잘렸을 수 있음)\n{recent.strip() or '(없음)'}"
     )
 
 
@@ -216,7 +229,7 @@ def run_scout(project: str, task: dict, hb_name: str, hb_text: str, forced: bool
 
         role = _role_prompt(project, int(st["role_prompt_max_chars"]))
         recent = _fetch_recent_conversation(project, limit=6, max_chars=600)
-        sys_text = _system_prompt(project, project_dir, role)
+        sys_text = _system_prompt(project, project_dir, role, hb_name, hb_text)
         PROMPTS_DIR.mkdir(parents=True, exist_ok=True)
         sys_file = PROMPTS_DIR / f"_scout_{project.replace(':', '_')}.md"
         sys_file.write_text(sys_text, encoding="utf-8")
@@ -227,7 +240,7 @@ def run_scout(project: str, task: dict, hb_name: str, hb_text: str, forced: bool
                "--append-system-prompt-file", str(sys_file)]
         if st.get("effort"):
             cmd.extend(["--effort", str(st["effort"])])
-        cmd.extend(["--", _user_prompt(hb_name, hb_text, recent)])
+        cmd.extend(["--", _user_prompt(hb_name, recent)])
         env = build_claude_env(config, config_dir)
 
         final_text, texts = "", []
