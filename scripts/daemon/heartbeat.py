@@ -16,6 +16,30 @@ from daemon import scout
 import usage_api
 
 
+# ─── active_hours 파싱 (2026-11-03) ───
+# 정식은 "HH:MM-HH:MM" 이지만 "07-24"·"7:30~22"·"07:00-24:00" 같은 약식도 읽는다. 24 는 끝 쪽에서 하루 끝(자정)을 뜻한다.
+# 배경: 10/31 login-manager 가 태스크 13개에 "07-24" 를 넣었는데 옛 파서는 start_str[3:]="" 로 예외 → return True(항상 켜짐)
+# 였고 밤 정지가 사흘(10/31~11/03) 동안 효과 0 이었다(대표님 맥 00~07시 깨움 밤마다 90~200회, 창 밖 스킵은 1회).
+# 못 읽으면 None 을 돌려주고 호출부가 로그 경고 + 태스크 warning 으로 드러낸다 — 조용히 넘기지 않는다.
+# 웹 API(/api/tasks POST·PATCH)도 같은 약식을 받아 정식으로 고쳐 저장하고 못 읽는 값은 400 으로 거른다.
+_ACTIVE_HOURS_RE = re.compile(r"^\s*(\d{1,2})(?::(\d{2}))?\s*[-~–]\s*(\d{1,2})(?::(\d{2}))?\s*$")
+
+
+def parse_active_hours(hours_str) -> tuple[int, int] | None:
+    """active_hours 문자열 → (시작, 끝) 하루 기준 분(0~1440). 못 읽으면 None.
+    끝 24:00 → 1440(하루 끝), 시작 24:00 → 0. 시작 > 끝이면 자정을 넘기는 창("22:00-06:00")."""
+    if not isinstance(hours_str, str):
+        return None
+    m = _ACTIVE_HOURS_RE.match(hours_str)
+    if not m:
+        return None
+    sh, sm, eh, em = (int(x) if x is not None else 0 for x in m.groups())
+    for h, mm in ((sh, sm), (eh, em)):
+        if h > 24 or mm > 59 or (h == 24 and mm != 0):
+            return None
+    return (sh % 24) * 60 + sm, eh * 60 + em
+
+
 # ─── Claude 사용 한도(/usage) 수집 — 주기(heartbeat) + 온디맨드(main loop) 공용 ───
 def fetch_usage_limits() -> dict | None:
     """세션/주간 리밋 % + 리셋 시각.
@@ -214,6 +238,11 @@ class HeartbeatThread(threading.Thread):
 
         # Check HEARTBEAT.md existence and update warning
         warning = self._check_heartbeat_md(project)
+        hours = task.get("active_hours")
+        if hours and parse_active_hours(hours) is None:
+            # 형식을 못 읽으면 창 없이 24시간 돈다 — 그 사실을 태스크 warning(설정 화면·채팅 목록에 보임)에 적는다 (2026-11-03)
+            hours_warning = f"active_hours '{hours}' 형식 오류 — HH:MM-HH:MM 가 아니라 24시간 켜짐으로 돈다"
+            warning = f"{warning} · {hours_warning}" if warning else hours_warning
         prev_warning = task.get("warning")
         if warning != prev_warning:
             self._update_task(task["id"], {"warning": warning})
@@ -352,18 +381,20 @@ class HeartbeatThread(threading.Thread):
         api_request(api_key, "PATCH", "/api/bot/tasks", body={"id": task_id, "updates": updates}, timeout=10)
 
     @staticmethod
-    def _in_active_hours(hours_str: str) -> bool:
-        try:
-            start_str, end_str = hours_str.split("-")
-            now = datetime.now()
-            start = now.replace(hour=int(start_str[:2]), minute=int(start_str[3:]), second=0, microsecond=0)
-            end = now.replace(hour=int(end_str[:2]), minute=int(end_str[3:]), second=0, microsecond=0)
-            if start <= end:
-                return start <= now <= end
-            else:
-                return now >= start or now <= end
-        except Exception:
+    def _in_active_hours(hours_str: str, now: datetime | None = None) -> bool:
+        """로컬 시각이 active_hours 창 안인가. 분 단위 포함 비교 — "07:00-23:59" 는 23:59:59 까지 창 안.
+        형식을 못 읽으면 True(돌린다)를 주되 경고를 남긴다 — _process_task 가 태스크 warning 에도 적어 화면에 보인다.
+        (2026-11-03 전에는 "07-24" 가 예외 → True 로 조용히 항상 켜졌다. 위 parse_active_hours 주석 참조)"""
+        win = parse_active_hours(hours_str)
+        if win is None:
+            logger.warning(f"[heartbeat] active_hours {hours_str!r} 를 읽을 수 없음 → 항상 켜짐으로 처리 (HH:MM-HH:MM 로 고칠 것)")
             return True
+        start, end = win
+        now = now or datetime.now()
+        cur = now.hour * 60 + now.minute
+        if start <= end:
+            return start <= cur <= end
+        return cur >= start or cur <= end
 
     @staticmethod
     def _parse_ts(value) -> datetime | None:
@@ -403,15 +434,15 @@ class HeartbeatThread(threading.Thread):
         return nxt
 
     @staticmethod
-    def _next_window_start(hours_str: str) -> datetime | None:
+    def _next_window_start(hours_str: str, now: datetime | None = None) -> datetime | None:
         """active_hours 창 밖일 때 다음으로 창이 열리는 시각(UTC). _in_active_hours 와 같은 로컬 시각 기준.
-        파싱 실패면 None (호출부는 예전처럼 그냥 돌아간다)."""
-        try:
-            start_str, _ = hours_str.split("-")
-            now = datetime.now()
-            start = now.replace(hour=int(start_str[:2]), minute=int(start_str[3:]), second=0, microsecond=0)
-            if start <= now:
-                start += timedelta(days=1)
-            return start.astimezone(timezone.utc)
-        except Exception:
+        파싱 실패면 None (호출부는 예전처럼 그냥 돌아간다 — 그 사실은 _in_active_hours 의 경고와 태스크 warning 이 알린다)."""
+        win = parse_active_hours(hours_str)
+        if win is None:
             return None
+        start_min = win[0]
+        now = now or datetime.now()
+        start = now.replace(hour=start_min // 60, minute=start_min % 60, second=0, microsecond=0)
+        if start <= now:
+            start += timedelta(days=1)
+        return start.astimezone(timezone.utc)
