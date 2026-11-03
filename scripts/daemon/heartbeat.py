@@ -40,6 +40,31 @@ def parse_active_hours(hours_str) -> tuple[int, int] | None:
     return (sh % 24) * 60 + sm, eh * 60 + em
 
 
+# ─── HEARTBEAT 파일 크기 규칙 (2026-11-03 Sean 지시) ───
+# 담당이 깨어날 때마다 HEARTBEAT 파일을 통째로 읽는다(본 세션도 정찰도). 바이트의 약 절반이 토큰 — 30KB 면 매 회 1.5만 토큰.
+# 11/03 실측: 살아있는 84개 중 중앙값 14KB, 10개가 100KB 이상(최대 319KB, 끝난 회차 로그를 체크리스트 안에 매일 +2만 바이트).
+# 30KB 이상이면 ① 태스크 warning(설정 화면·채팅 목록) ② 깨우는 메시지 끝에 「기록 파일로 옮기고 줄여라」 한 줄 — 담당이 스스로 줄인다.
+HEARTBEAT_WARN_BYTES = 30_000
+HEARTBEAT_TARGET_BYTES = 10_000
+
+
+def heartbeat_size_warning(size_bytes: int, filename: str) -> str | None:
+    """태스크 warning 에 넣는 한 줄. 기준 미만이면 None."""
+    if size_bytes < HEARTBEAT_WARN_BYTES:
+        return None
+    return (f"{filename} {size_bytes // 1000}KB — 체크리스트가 너무 큼(권장 {HEARTBEAT_TARGET_BYTES // 1000}KB 아래). "
+            f"끝난 회차 기록·과거 판정·배경 설명은 docs/ops/ 기록 파일로 옮길 것")
+
+
+def heartbeat_size_hint(size_bytes: int, filename: str) -> str:
+    """하트비트 메시지 끝에 붙이는 지시. 기준 미만이면 빈 문자열."""
+    if size_bytes < HEARTBEAT_WARN_BYTES:
+        return ""
+    return (f"\n\n(주의: {filename} 이 {size_bytes // 1000}KB 입니다 — 깨어날 때마다 통째로 읽혀 비용과 문맥을 잡아먹습니다. "
+            f"이번 회차에 끝난 회차 기록·과거 판정·배경 설명을 docs/ops/ 기록 파일로 옮기고, 체크리스트에는 할 일 항목과 판정 기준만 남겨 "
+            f"{HEARTBEAT_TARGET_BYTES // 1000}KB(한글 약 3천 자) 아래로 줄이세요. 규칙은 지우지 말고 옮기세요.)")
+
+
 # ─── Claude 사용 한도(/usage) 수집 — 주기(heartbeat) + 온디맨드(main loop) 공용 ───
 def fetch_usage_limits() -> dict | None:
     """세션/주간 리밋 % + 리셋 시각.
@@ -198,11 +223,19 @@ class HeartbeatThread(threading.Thread):
             content = open(heartbeat_path).read().strip()
             if not content:
                 return f"{filename}가 비어 있음"
-            if "[ ]" not in content:
-                return f"{filename}에 미완료 항목 없음"
-            return None
+            base = None if "[ ]" in content else f"{filename}에 미완료 항목 없음"
+            size_w = heartbeat_size_warning(os.path.getsize(heartbeat_path), filename)  # 2026-11-03 크기 규칙
+            parts = [w for w in (base, size_w) if w]
+            return " · ".join(parts) if parts else None
         except Exception:
             return None
+
+    def _heartbeat_size_hint(self, project: str, hb_name: str) -> str:
+        """HEARTBEAT 파일이 기준(HEARTBEAT_WARN_BYTES) 이상이면 메시지 끝에 붙일 지시, 아니면 빈 문자열."""
+        try:
+            return heartbeat_size_hint(os.path.getsize(os.path.join(get_project_dir(project), "docs", hb_name)), hb_name)
+        except Exception:
+            return ""
 
     @classmethod
     def _interval_min(cls, task: dict) -> int:
@@ -291,7 +324,7 @@ class HeartbeatThread(threading.Thread):
             return
 
         hb_name = self._heartbeat_filename(project)
-        msg = self.HEARTBEAT_MSG.replace("HEARTBEAT.md", hb_name)
+        msg = self.HEARTBEAT_MSG.replace("HEARTBEAT.md", hb_name) + self._heartbeat_size_hint(project, hb_name)
 
         # ── 정찰 턴 (2026-10-31, Sean 승인) — 본 세션을 깨우기 전에 가벼운 새 세션이 「지금 할 일이 있나」를 판정 ──
         # 빈 회차가 턴의 44%였고 문맥 45만 세션은 「할 일 없음」 한 줄에 $5 였다. 본 세션은 손대지 않는다(지식 보존).
