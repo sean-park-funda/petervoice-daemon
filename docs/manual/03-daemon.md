@@ -75,6 +75,7 @@ claude_daemon.py + scripts/daemon/
   "bot_name": "Peter",
 
   "max_concurrent": 3,
+  "human_reserved_lanes": 0,
   "session_ttl_hours": 24,
   "poll_interval_sec": 3,
   "stream_interval_sec": 2.0,
@@ -106,6 +107,8 @@ claude_daemon.py + scripts/daemon/
   }
 }
 ```
+
+> **동시 실행 칸(`max_concurrent`)은 실제로 도는 턴만 센다 (2026-11-03).** 같은 담당(프로젝트·브랜치)에 몰린 메시지는 칸을 쥐지 않고 디스패처 대기열(`daemon/dispatch.py`)에서 기다리며, 담당당 한 번에 한 턴만 돈다. 사람이 친 메시지가 자동 메시지(`[relay from:` · `[heartbeat]` 등)보다 먼저 시작한다. `human_reserved_lanes` 는 사람 메시지 전용 예비 칸 수 (기본 `max_concurrent // 4`, 최대 2 — 3칸이면 0). 로그 `[queue] msg #N → … started after Ns wait` 가 5초 넘게 기다린 메시지를 남긴다. 배경: 11/03 Sean 맥 12칸이 실제 실행 3 + 잠금 대기 9 로 차서 사람 메시지가 16분 기다렸다.
 
 ## 파일 구조
 

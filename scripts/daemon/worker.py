@@ -27,6 +27,7 @@ from daemon.tasks import (
 from daemon.prompts import get_prompt_file, build_system_prompt
 from daemon.claude_runner import run_claude, run_codex, run_gemini, rewrite_for_voice, SHUTDOWN_INTERRUPTED
 from daemon.queue import enqueue_message, dequeue_message
+from daemon.dispatch import TurnDispatcher
 from daemon.utils import resolve_files, cleanup_downloads, _split_text_chunks, _read_json, _write_json, with_sender
 from daemon.encryption import decrypt_message, get_encryptor
 # kanban messages now flow through messages table — no separate kanban import needed
@@ -44,6 +45,15 @@ class Worker(threading.Thread):
         # 줄을 선다(실측: 12칸 포화로 97초 대기). 칸 2개면 동시 회의 2개까지 바로 처리.
         self._live_executor = ThreadPoolExecutor(
             max_workers=config.get("live_meeting_lanes", 2), thread_name_prefix="live")
+        # 턴 디스패처 (2026-11-03) — 칸(max_concurrent)은 실제로 도는 턴만 쓴다. 같은 담당에게 몰린 메시지는
+        # 스레드를 쥐지 않고 디스패처 대기열에 남고, 사람 메시지가 자동 메시지(릴레이·하트비트)보다 먼저 간다.
+        # 실측 11/03 12:14: 실제 실행 3개인데 잠금 대기 9개(한 담당에 몰린 자동 릴레이 6개)가 칸을 쥐어 사람 메시지가 16분 대기.
+        # human_reserved_lanes = 사람 메시지 예비 칸 (기본 max_concurrent//4, 최대 2 · 0이면 예비 없음, 우선순위만)
+        _reserve_default = min(2, max_workers // 4)
+        self._dispatcher = TurnDispatcher(
+            max_workers, config.get("human_reserved_lanes", _reserve_default),
+            run_turn=self._process_message_safe, submit=self._executor.submit,
+            logger=logger, shutdown_event=shutdown_event)
         self._spawned_ids: set[int] = set()
         self._spawned_lock = threading.Lock()
         # 실제 처리 중인 턴 수 — 종료 드레인 시 main()이 0이 될 때까지 대기
@@ -466,11 +476,19 @@ class Worker(threading.Thread):
                 and text.startswith(("[라이브회의 단락 ", "[라이브회의 종료]")))
 
     def submit(self, msg: dict):
-        """메시지를 처리 줄에 넣는다 — 라이브회의 단락은 전용 줄, 나머지는 일반 줄."""
-        ex = self._live_executor if self._is_live_meeting_paragraph(msg) else self._executor
-        ex.submit(self._process_message_safe, msg)
+        """메시지를 처리 줄에 넣는다 — 라이브회의 단락은 전용 줄(즉시 스레드), 나머지는 디스패처 대기열.
+
+        디스패처는 담당마다 한 턴만 스레드에 올리고(줄 선 메시지는 칸을 쥐지 않음), 사람 메시지를 먼저 보낸다."""
+        if self._is_live_meeting_paragraph(msg):
+            self._live_executor.submit(self._process_message_safe, msg)
+            return
+        self._dispatcher.enqueue(msg)
+
+    def queue_stats(self) -> dict:
+        return self._dispatcher.stats()
 
     def shutdown_executors(self):
+        self._dispatcher.stop()
         self._executor.shutdown(wait=False, cancel_futures=True)
         self._live_executor.shutdown(wait=False, cancel_futures=True)
 
@@ -517,6 +535,10 @@ class Worker(threading.Thread):
     def run(self):
         import time
         logger.info(f"[{self.bot_name}] Worker started")
+        self._dispatcher.start()
+        _qs = self._dispatcher.stats()
+        logger.info(f"[queue] dispatcher on: lanes {_qs['max_workers']}, human reserve {_qs['reserve']} "
+                    f"(queued messages hold no lane; human first)")
         consecutive_errors = 0
         last_heartbeat = 0
         poll_interval = config.get("poll_interval_sec", 3)
