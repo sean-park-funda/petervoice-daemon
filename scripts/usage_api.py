@@ -119,6 +119,34 @@ def local_access_token(config_dir: str | None = None) -> str | None:
         return None
 
 
+def login_expiry_iso(value) -> str | None:
+    """로그인이 끝나는 시각 → ISO-8601(UTC). `auth status` 의 문자열과 저장 파일의 밀리초를 모두 받는다. 못 읽으면 None."""
+    try:
+        if value in (None, "") or isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            dt = datetime.fromtimestamp(value / 1000, timezone.utc)
+        else:
+            dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc).isoformat()
+    except Exception:
+        return None
+
+
+def cli_login_expires_at(claude_cmd: str, env: dict | None = None) -> str | None:
+    """이 데몬 맥락에서 본 로그인 만료 시각 (`claude auth status` 의 loginExpiresAt, 2026-11-05 Sean 승인 카드 743).
+    SSH 로 재면 키체인·PATH 가 달라 틀리므로 데몬이 직접 잰다. 토큰과 모델을 쓰지 않는다.
+    날짜 칸을 기록하기 전 CLI 로 로그인했거나 CLI 가 답하지 못하면 None — 사용량 보고는 그대로 나간다."""
+    try:
+        r = subprocess.run([claude_cmd, "auth", "status"], capture_output=True, text=True, timeout=20, env=env)
+        return login_expiry_iso(json.loads(r.stdout).get("loginExpiresAt"))
+    except Exception as e:
+        logger.info(f"[usage] login expiry miss: {type(e).__name__}")
+        return None
+
+
 def fetch_oauth_usage(token: str, timeout: int = 15) -> dict | None:
     """토큰으로 usage API 호출 → 배너 dict. 실패는 None (토큰 값은 로그에 남기지 않는다)."""
     if not token:

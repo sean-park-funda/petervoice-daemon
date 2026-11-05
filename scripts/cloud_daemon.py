@@ -2296,6 +2296,9 @@ def collect_and_store_usage(user_id: int, api_key: str, allow_wake: bool = False
     if not limits:
         return False
     limits["account"] = _claude_account_email(user_id)
+    # 호스트 CLI(2.1.291)는 auth status 에 날짜를 안 내지만 저장 파일에는 있다 (맥 데몬과 같은 칸, 카드 743)
+    limits["login_expires_at"] = usage_api.login_expiry_iso(
+        ((_read_credentials(user_id) or {}).get("claudeAiOauth") or {}).get("refreshTokenExpiresAt"))
     clear_user_cooldown_if_stale(user_id, limits)   # 한도 근처가 아니면 쿨다운 오판 → 해제
     if user_id not in _usage_ok:
         _usage_ok.add(user_id)

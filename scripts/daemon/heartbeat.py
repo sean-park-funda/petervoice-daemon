@@ -75,13 +75,14 @@ def fetch_usage_limits() -> dict | None:
     고객 맥 1대당 하루 96세션을 배너 하나에 썼다)"""
     # 계정 자리(claude_seat)가 걸려 있으면 그 자리를 잰다 — 보드가 "Sean 이 지금 어느 계정인지"를 이 값으로 안다
     cdir = seat_config_dir("default")
-    limits = usage_api.fetch_oauth_usage(usage_api.local_access_token(cdir))
-    if limits:
-        limits["account"] = claude_account_email(cdir)
-        return limits
     env = dict(os.environ)
     if cdir:
         env["CLAUDE_CONFIG_DIR"] = cdir
+    limits = usage_api.fetch_oauth_usage(usage_api.local_access_token(cdir))
+    if limits:
+        limits["account"] = claude_account_email(cdir)
+        limits["login_expires_at"] = usage_api.cli_login_expires_at(CLAUDE_CMD, env)
+        return limits
     try:
         r = subprocess.run(
             [CLAUDE_CMD, "-p", "/usage"],
@@ -115,6 +116,7 @@ def fetch_usage_limits() -> dict | None:
         "session_reset": session_reset,
         "week_reset": week_reset,
         "account": claude_account_email(cdir),
+        "login_expires_at": usage_api.cli_login_expires_at(CLAUDE_CMD, env),
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
 
