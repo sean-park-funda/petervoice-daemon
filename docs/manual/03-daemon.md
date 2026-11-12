@@ -76,6 +76,8 @@ claude_daemon.py + scripts/daemon/
 
   "max_concurrent": 3,
   "human_reserved_lanes": 0,
+  "merge_auto_messages": true,
+  "merge_auto_max": 10,
   "session_ttl_hours": 24,
   "poll_interval_sec": 3,
   "stream_interval_sec": 2.0,
@@ -109,6 +111,8 @@ claude_daemon.py + scripts/daemon/
 ```
 
 > **동시 실행 칸(`max_concurrent`)은 실제로 도는 턴만 센다 (2026-11-03).** 같은 담당(프로젝트·브랜치)에 몰린 메시지는 칸을 쥐지 않고 디스패처 대기열(`daemon/dispatch.py`)에서 기다리며, 담당당 한 번에 한 턴만 돈다. 사람이 친 메시지가 자동 메시지(`[relay from:` · `[heartbeat]` 등)보다 먼저 시작한다. `human_reserved_lanes` 는 사람 메시지 전용 예비 칸 수 (기본 `max_concurrent // 4`, 최대 2 — 3칸이면 0). 로그 `[queue] msg #N → … started after Ns wait` 가 5초 넘게 기다린 메시지를 남긴다. 배경: 11/03 Sean 맥 12칸이 실제 실행 3 + 잠금 대기 9 로 차서 사람 메시지가 16분 기다렸다.
+>
+> **쌓인 자동 메시지는 한 턴에 묶인다 (2026-11-12, Sean 「둘 다 해」).** 자동 턴을 시작할 때 같은 담당에게 대기 중인 릴레이·알림(`[relay from:` · `[외부 relay` · `[자료수신` · `[stall-check`)이 더 있으면 도착순으로 한 통에 묶어 한 턴으로 돈다 — 머리 `[자동 메시지 N건 묶음]`, 통마다 `━━━ i/N · #id · 시각(KST) ━━━`. 「A 가 맡아」 뒤에 온 「A 말고 B」 를 같은 턴에 보게 하고 턴 수를 줄인다(11/09 revenue-lab 부산진 중복 답). 사람 메시지·하트비트(`[heartbeat]`, 「할 일 없음」 조용한 회차 판정이 입력 1건 기준)·`[매니저]`·첨부·댓글(reply_to)·암호화 메시지는 묶지 않는다. 묶음 턴은 메시지 전부를 처리완료로 표시하고 답의 `reply_to` 에 전부를 넣는다(영구 큐에도 묶음 하나로). `merge_auto_messages`(기본 true, false 면 끔) · `merge_auto_max`(기본 10통, 본문 합 60,000자 상한). 릴레이의 `metadata.supersede` 키가 같은 옛 대기 메시지는 새 메시지가 들어오는 순간 대기열에서 빠지고 처리완료로 표시된다(서버 쪽 규칙은 11장 「대기 중 메시지 합치기·대체」). 이미 시작된 턴은 막지 못한다. 로그 `[queue] merged N auto msgs → <담당>: #a,#b` · `[queue] msg #N → <담당> dropped: superseded by #M`. 시험 `scripts/test_worker_dispatch.py`.
 
 ## 파일 구조
 

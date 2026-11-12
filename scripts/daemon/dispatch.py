@@ -11,18 +11,93 @@
   같은 종류끼리는 도착 순.
 - 사람 예비 칸(reserve): 자동 턴은 동시에 (max_workers - reserve)개까지만 돈다. 사람 턴은 max_workers 까지.
   자동 턴이 칸을 다 채워도 사람 메시지는 바로 시작한다.
+
+쌓인 자동 메시지 합치기 · 대체 (2026-11-12, Sean 「둘 다 해」 — revenue-lab 이관):
+- 배경: 담당당 한 턴이라 「A 가 맡아」 뒤에 「A 말고 B」 를 보내도 A 는 첫 알림만 들고 한 턴을 다 쓴 뒤에야
+  둘째를 봤다(11/09 부산진 중복 답 1건, 11/09~12 넘김 9건). 바로잡는 메시지는 구조상 늘 늦었다.
+- 합치기: 자동 턴을 시작할 때 같은 담당에게 대기 중인 **합칠 수 있는 자동 메시지**(릴레이·알림 — MERGE_PREFIXES)가
+  더 있으면 도착순으로 한 통에 묶어 한 턴으로 돈다(구분선 + 각 통의 #id·시각). 「맡김」과 「취소」를 같은 턴에 보고
+  턴 수도 준다. 하트비트는 「할 일 없음」 조용한 회차 판정이 입력 1건 기준이라 묶지 않고, [매니저] 는 자기 1문1답
+  흐름이 있어 묶지 않는다. 첨부·댓글(reply_to)·암호화 메시지도 따로 돈다. 사람 메시지는 절대 묶지 않는다.
+  config `merge_auto_messages`(기본 true) · `merge_auto_max`(기본 10통).
+- 대체: 릴레이 metadata.supersede 키(예: "room:241574666")가 붙은 메시지가 들어오면, 같은 담당 대기열에 있는
+  같은 키의 옛 메시지는 빼고 on_superseded 콜백(워커: 처리완료 마킹)으로 넘긴다. 서버(/api/relay/message)도
+  아직 안 집어간 옛 메시지를 같은 규칙으로 닫으므로, 데몬은 '이미 받아 와 줄 서 있는' 것만 맡는다.
+  이미 시작된 턴은 어느 쪽도 막지 못한다 — 보내는 쪽 관문(revenue-lab 「담당 확인」)과 같이 쓴다.
 """
 import itertools
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 
 # 사람이 친 메시지가 아닌 것 — 본문 머리말로 판별한다 (서버가 종류 필드를 따로 주지 않는다).
 AUTO_PREFIXES = ("[relay from:", "[heartbeat]", "[stall-check", "[외부 relay", "[자료수신", "[매니저]")
+# 한 턴에 묶을 수 있는 자동 메시지 — 릴레이·알림만 (하트비트·매니저 제외, 위 모듈 설명 참조)
+MERGE_PREFIXES = ("[relay from:", "[외부 relay", "[자료수신", "[stall-check")
+MERGE_MAX_DEFAULT = 10
+MERGE_MAX_CHARS = 60_000   # 묶음 본문 상한 — 넘치면 나머지는 다음 턴
+_KST = timezone(timedelta(hours=9))
 
 
 def is_automatic(msg: dict) -> bool:
     text = (msg.get("text") or "").lstrip()
     return text.startswith(AUTO_PREFIXES)
+
+
+def is_mergeable(msg: dict) -> bool:
+    """같은 담당의 다른 자동 메시지와 한 턴에 묶어도 되는 메시지인가."""
+    text = (msg.get("text") or "").lstrip()
+    if not text.startswith(MERGE_PREFIXES):
+        return False
+    if msg.get("files") or msg.get("reply_to") or msg.get("encrypted"):
+        return False
+    return True
+
+
+def supersede_key(msg: dict) -> str | None:
+    """릴레이 metadata.supersede — 같은 담당·같은 키의 옛 대기 메시지를 대체한다."""
+    meta = msg.get("metadata")
+    if not isinstance(meta, dict):
+        return None
+    key = meta.get("supersede")
+    return key.strip() if isinstance(key, str) and key.strip() else None
+
+
+def turn_message_ids(msg: dict) -> list:
+    """이 턴이 소비하는 메시지 id 전부 — 묶음이면 merged_ids, 아니면 [id]."""
+    ids = msg.get("merged_ids")
+    return list(ids) if ids else [msg.get("id")]
+
+
+def _fmt_kst(iso: str | None) -> str:
+    if not iso:
+        return ""
+    try:
+        dt = datetime.fromisoformat(str(iso).strip().replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(_KST).strftime("%m/%d %H:%M")
+    except ValueError:
+        return str(iso)[:16]
+
+
+def merge_messages(msgs: list[dict]) -> dict:
+    """도착순 자동 메시지 2건 이상을 한 턴용 메시지 하나로 합친다.
+    id·project 등은 첫 메시지의 것을 쓰고, merged_ids 에 전부를 둔다(워커가 처리완료·reply_to 에 쓴다)."""
+    n = len(msgs)
+    parts = [
+        f"[자동 메시지 {n}건 묶음] 같은 담당에게 쌓인 자동 메시지(릴레이·알림)를 도착순으로 한 턴에 넣었습니다. "
+        f"뒤의 것이 앞의 것을 바꾸거나 거둘 수 있으니 {n}건을 전부 읽은 뒤 처리하고, 답은 한 번에 합니다."
+    ]
+    for i, m in enumerate(msgs, 1):
+        when = _fmt_kst(m.get("created_at"))
+        head = f"━━━ {i}/{n} · #{m.get('id')}" + (f" · {when}" if when else "") + " ━━━"
+        parts.append(f"{head}\n{(m.get('text') or '').strip()}")
+    merged = dict(msgs[0])
+    merged["text"] = "\n\n".join(parts)
+    merged["merged_ids"] = [m.get("id") for m in msgs]
+    merged["merged_count"] = n
+    return merged
 
 
 class _Item:
@@ -37,7 +112,8 @@ class _Item:
 
 
 class TurnDispatcher:
-    def __init__(self, max_workers: int, reserve: int, run_turn, submit, logger=None, shutdown_event=None):
+    def __init__(self, max_workers: int, reserve: int, run_turn, submit, logger=None, shutdown_event=None,
+                 merge_enabled: bool = True, merge_max: int = MERGE_MAX_DEFAULT, on_superseded=None):
         self.max_workers = max(1, int(max_workers))
         # 자동 턴 칸은 최소 1개는 남긴다 (reserve 가 커도 하트비트·릴레이가 영영 안 도는 일은 없게)
         self.reserve = max(0, min(int(reserve or 0), self.max_workers - 1))
@@ -45,6 +121,9 @@ class TurnDispatcher:
         self._submit = submit          # 실행기 submit (ThreadPoolExecutor.submit)
         self._log = logger
         self._shutdown = shutdown_event or threading.Event()
+        self.merge_enabled = bool(merge_enabled)
+        self.merge_max = max(1, int(merge_max or MERGE_MAX_DEFAULT))
+        self._on_superseded = on_superseded   # (old_msg, new_msg) — 워커가 처리완료 마킹
         self._cv = threading.Condition()
         self._pending: list[_Item] = []
         self._running_projects: set[str] = set()
@@ -52,14 +131,36 @@ class TurnDispatcher:
         self._auto_running = 0
         self._seq = itertools.count()
         self._thread: threading.Thread | None = None
+        self._merged_turns = 0
+        self._merged_msgs = 0
+        self._superseded = 0
 
     # ── 바깥 API ──
     def enqueue(self, msg: dict, project: str | None = None):
         project = project or msg.get("project") or "general"
         item = _Item(next(self._seq), msg, project, is_automatic(msg))
+        key = supersede_key(msg) if item.auto else None
+        dropped: list[_Item] = []
         with self._cv:
+            if key:
+                # 같은 담당 대기열의 같은 키 옛 메시지는 빼낸다 (이미 도는 턴은 못 막는다)
+                for it in list(self._pending):
+                    if it.project == project and it.auto and supersede_key(it.msg) == key:
+                        self._pending.remove(it)
+                        dropped.append(it)
+                self._superseded += len(dropped)
             self._pending.append(item)
             self._cv.notify()
+        for it in dropped:
+            if self._log:
+                self._log.info(f"[queue] msg #{it.msg.get('id')} → {project} dropped: superseded by "
+                               f"#{msg.get('id')} (key {key})")
+            if self._on_superseded:
+                try:
+                    self._on_superseded(it.msg, msg)
+                except Exception as e:  # 콜백 실패가 대기열을 멈추면 안 된다
+                    if self._log:
+                        self._log.error(f"[queue] on_superseded failed for #{it.msg.get('id')}: {e}")
 
     def start(self):
         if self._thread is None:
@@ -79,6 +180,9 @@ class TurnDispatcher:
                 "pending_projects": len({it.project for it in self._pending}),
                 "max_workers": self.max_workers,
                 "reserve": self.reserve,
+                "merged_turns": self._merged_turns,
+                "merged_msgs": self._merged_msgs,
+                "superseded": self._superseded,
             }
 
     # ── 내부 ──
@@ -98,6 +202,26 @@ class TurnDispatcher:
                 best = (key, it)
         return best[1] if best else None
 
+    def _collect_merge(self, item: _Item) -> list[_Item]:
+        """cv 를 쥔 채 호출. item(자동·합침 가능)과 같은 담당의 합칠 수 있는 대기 메시지를 도착순으로 뽑아 대기열에서 뺀다.
+        _pick 이 자동 메시지를 골랐다는 것은 그 담당에 대기 중인 사람 메시지가 없다는 뜻이라(사람 먼저), 사람을 앞지르지 않는다."""
+        if not (self.merge_enabled and item.auto and is_mergeable(item.msg)):
+            return []
+        picked: list[_Item] = []
+        total = len(item.msg.get("text") or "")
+        for it in sorted(self._pending, key=lambda x: x.seq):
+            if len(picked) + 1 >= self.merge_max:
+                break
+            if it.project != item.project or not it.auto or not is_mergeable(it.msg):
+                continue
+            total += len(it.msg.get("text") or "")
+            if total > MERGE_MAX_CHARS:
+                break
+            picked.append(it)
+        for it in picked:
+            self._pending.remove(it)
+        return picked
+
     def _loop(self):
         while not self._shutdown.is_set():
             with self._cv:
@@ -106,12 +230,21 @@ class TurnDispatcher:
                     self._cv.wait(timeout=1.0)
                     continue
                 self._pending.remove(item)
+                extra = self._collect_merge(item)
+                if extra:
+                    item.msg = merge_messages([item.msg] + [it.msg for it in extra])
+                    self._merged_turns += 1
+                    self._merged_msgs += 1 + len(extra)
                 self._running_projects.add(item.project)
                 self._running += 1
                 if item.auto:
                     self._auto_running += 1
                 running, auto_running, pending = self._running, self._auto_running, len(self._pending)
             waited = time.monotonic() - item.enqueued_at
+            if self._log and extra:
+                ids = ",".join(f"#{i}" for i in item.msg.get("merged_ids") or [])
+                self._log.info(f"[queue] merged {1 + len(extra)} auto msgs → {item.project}: {ids} "
+                               f"(one turn; pending {pending})")
             if self._log and waited > 5:
                 self._log.info(
                     f"[queue] msg #{item.msg.get('id')} → {item.project} started after {waited:.0f}s wait "

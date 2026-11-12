@@ -29,7 +29,8 @@ Body:
   "to_project": "peter-voice",     // 필수: 대상 프로젝트
   "from_project": "evolution",     // 필수: 발신 프로젝트
   "text": "전달할 메시지",          // 필수: 본문
-  "attachments": ["/path/to/file"] // 선택: 첨부 파일 경로
+  "attachments": ["/path/to/file"], // 선택: 첨부 파일 경로
+  "supersede": "room:241574666"    // 선택: 같은 대상에 같은 키로 아직 처리 안 된 옛 릴레이를 대체(닫음) — 아래 「대기 중 메시지 합치기·대체」
 }
 
 응답:
@@ -37,7 +38,9 @@ Body:
   "success": true,
   "message_id": 15832,
   "to_project": "peter-voice",
-  "from_project": "evolution"
+  "from_project": "evolution",
+  "supersede": "room:241574666",   // supersede 를 보냈을 때만
+  "superseded": [15830]            // 이번 메시지가 닫은 옛 릴레이 id (없으면 [])
 }
 ```
 
@@ -126,6 +129,35 @@ POST /api/relay/message
 - 수신 시 처리 가이드
 
 이로써 브랜치 에이전트가 별도 안내 없이도 다른 프로젝트/브랜치에 릴레이를 보낼 수 있다.
+
+## 대기 중 메시지 합치기 · 대체 (2026-11-12, Sean 「둘 다 해」 — revenue-lab 이관)
+
+담당은 한 번에 한 턴만 돌고 대기 메시지는 한 통이 한 턴이었다. 그래서 「A 가 맡아」 뒤에 「A 말고 B」 를 보내도 A 는 첫 릴레이만
+들고 한 턴을 다 쓴 뒤에야 둘째를 봤다(11/09 부산진 중복 답 1건, 11/09~12 담당 넘김 9건). 두 가지로 푼다.
+
+**① 합치기(데몬 디스패처)** — 자동 턴을 시작할 때 같은 담당에게 대기 중인 릴레이·알림(`[relay from:` · `[외부 relay` · `[자료수신` ·
+`[stall-check`)이 더 있으면 **도착순으로 한 통에 묶어 한 턴**으로 넣는다. 머리에 `[자동 메시지 N건 묶음]`, 통마다
+`━━━ i/N · #id · 시각 ━━━` 구분선. 받는 담당은 N건을 전부 읽은 뒤 처리하고 답은 한 번에 한다(묶음 턴의 답 `reply_to` 에는 id 전부가 들어간다).
+하트비트(`[heartbeat]`, 「할 일 없음」 조용한 회차 판정이 입력 1건 기준)·`[매니저]`·첨부·댓글·암호화 메시지와 **사람 메시지는 묶지 않는다.**
+데몬 config `merge_auto_messages`(기본 true) · `merge_auto_max`(기본 10통). 이미 시작된 턴은 막지 못한다. 상세는 03장 데몬.
+
+**② 대체 키(서버 + 데몬)** — 같은 건을 **바꾸거나 거두는** 릴레이에는 같은 `supersede` 키를 붙인다(≤80자, 글자·숫자와 `_ : . / @ # + -`).
+권장 키: `room:<채팅번호>` · `task:<id>` · `card:<칸반id>` 처럼 「무엇에 대한 지시인지」.
+- 서버는 키를 `messages.metadata.supersede` 에 저장하고, **같은 받는 세션에 같은 키로 아직 처리되지 않은(processed=false) 옛 릴레이**를
+  닫는다 — `processed=true`, 본문 끝에 `(이후 메시지 #N 로 대체됨 — 담당에게 전달되지 않음)`, `metadata.superseded_by=N`.
+  응답 `superseded` 에 닫은 id 가 온다.
+- 데몬이 이미 받아 가 **대기열에 줄 서 있는** 옛 메시지는 데몬 디스패처가 같은 키로 빼내고 처리완료로 표시한다(`[queue] … dropped: superseded by #N`).
+- **이미 시작된 턴은 어느 쪽도 막지 못한다.** 보내는 쪽은 받는 담당이 행동 직전에 정본(담당 파일·체크리스트)을 확인하는 관문과 같이 써야 한다
+  (revenue-lab 「담당 확인」 관문, `docs/plans/relay-reassign-race-2026-11-12.md`).
+- 키가 없는 릴레이는 전과 같다. 다른 키는 서로 건드리지 않는다. 사람 메시지·하트비트는 대상이 아니다.
+
+```bash
+# 「1084 가 맡아」 → 잠시 뒤 「1084 말고 1249」: 두 번째가 첫 번째(아직 안 읽힘)를 닫는다
+curl -s -X POST "$API_URL/api/relay/message" -H "X-Api-Key: $API_KEY" -H "Content-Type: application/json" \
+  -d '{"from_project":"revenue-lab","from_branch_id":959,"to_project":"revenue-lab","to_branch_id":1084,
+       "text":"이 방은 1249 몫으로 넘어갔습니다 — 손대지 마세요","supersede":"room:241574666"}'
+# → {"success":true,"message_id":15832,"supersede":"room:241574666","superseded":[15830], ...}
+```
 
 ## 서버 가드 — 왕복 깊이·수신 건수 (2026-10-26 교체)
 

@@ -27,7 +27,7 @@ from daemon.tasks import (
 from daemon.prompts import get_prompt_file, build_system_prompt
 from daemon.claude_runner import run_claude, run_codex, run_gemini, rewrite_for_voice, SHUTDOWN_INTERRUPTED
 from daemon.queue import enqueue_message, dequeue_message
-from daemon.dispatch import TurnDispatcher
+from daemon.dispatch import TurnDispatcher, turn_message_ids
 from daemon.utils import resolve_files, cleanup_downloads, _split_text_chunks, _read_json, _write_json, with_sender
 from daemon.encryption import decrypt_message, get_encryptor
 # kanban messages now flow through messages table — no separate kanban import needed
@@ -50,15 +50,29 @@ class Worker(threading.Thread):
         # 실측 11/03 12:14: 실제 실행 3개인데 잠금 대기 9개(한 담당에 몰린 자동 릴레이 6개)가 칸을 쥐어 사람 메시지가 16분 대기.
         # human_reserved_lanes = 사람 메시지 예비 칸 (기본 max_concurrent//4, 최대 2 · 0이면 예비 없음, 우선순위만)
         _reserve_default = min(2, max_workers // 4)
+        # 쌓인 자동 메시지 합치기·대체 (2026-11-12): 같은 담당에 대기 중인 릴레이·알림은 다음 자동 턴에 한 통으로
+        # 묶이고, metadata.supersede 키가 같은 옛 대기 메시지는 새 메시지가 오면 빠진다 (dispatch.py 모듈 설명).
         self._dispatcher = TurnDispatcher(
             max_workers, config.get("human_reserved_lanes", _reserve_default),
             run_turn=self._process_message_safe, submit=self._executor.submit,
-            logger=logger, shutdown_event=shutdown_event)
+            logger=logger, shutdown_event=shutdown_event,
+            merge_enabled=config.get("merge_auto_messages", True),
+            merge_max=config.get("merge_auto_max", 10),
+            on_superseded=self._on_superseded)
         self._spawned_ids: set[int] = set()
         self._spawned_lock = threading.Lock()
         # 실제 처리 중인 턴 수 — 종료 드레인 시 main()이 0이 될 때까지 대기
         self._inflight = 0
         self._inflight_lock = threading.Lock()
+
+    def _on_superseded(self, old_msg: dict, new_msg: dict):
+        """대기열에서 빠진(대체된) 메시지 — 서버에 처리완료로 표시해 재폴링·좀비를 막는다.
+        서버(/api/relay/message)도 같은 표시를 하지만, 이미 받아 온 메시지는 여기서 닫아야 한다.
+        _spawned_ids 에는 그대로 둔다 — 이 프로세스가 그 메시지를 다시 돌리는 일은 없어야 한다."""
+        old_id = old_msg.get("id")
+        processed_ids.add(old_id)
+        mark_message_processed(old_id)
+        logger.info(f"[{self.bot_name}] msg #{old_id} superseded by #{new_msg.get('id')} — marked processed, not run")
 
     def poll(self) -> list | None:
         result = api_request(self.api_key, "GET", "/api/bot/poll", timeout=30)
@@ -100,6 +114,8 @@ class Worker(threading.Thread):
     def process_message(self, msg: dict):
         msg = decrypt_message(msg)
         msg_id = msg.get("id")
+        # 묶음 턴(디스패처가 합친 자동 메시지)이면 이 턴이 소비하는 id 전부 — 처리완료·reply_to 에 쓴다
+        turn_ids = turn_message_ids(msg)
         text = msg.get("text", "").strip()
         project = msg.get("project", "general") or "general"
 
@@ -108,15 +124,16 @@ class Worker(threading.Thread):
             # 재마킹하지 않으면 매 폴마다 계속 반환되어 핫루프가 지속된다 (2026-07-06 비용 폭증 원인).
             mark_message_processed(msg_id)
             return
-        processed_ids.add(msg_id)
+        processed_ids.update(turn_ids)
         if len(processed_ids) > 1000:
             processed_ids.clear()
-            processed_ids.add(msg_id)
+            processed_ids.update(turn_ids)
 
         is_synthetic = msg.get("_is_timeout_followup", False)
         if not is_synthetic:
             enqueue_message(msg)
-            mark_message_processed(msg_id)
+            for _tid in turn_ids:
+                mark_message_processed(_tid)
 
         files = msg.get("files", [])
         # downloaded_paths = 프롬프트에 넘길 전체 경로, _ephemeral_paths = 처리 후 삭제할 임시 다운로드만
@@ -126,7 +143,8 @@ class Worker(threading.Thread):
         if not text and not downloaded_paths:
             return
 
-        logger.info(f"[{self.bot_name}] msg #{msg_id}: project={project}, text={text[:80]}, files={len(downloaded_paths)}")
+        _bundle = f" (묶음 {len(turn_ids)}건: {','.join('#' + str(i) for i in turn_ids)})" if len(turn_ids) > 1 else ""
+        logger.info(f"[{self.bot_name}] msg #{msg_id}{_bundle}: project={project}, text={text[:80]}, files={len(downloaded_paths)}")
 
         with active_projects_lock:
             active_projects.add(project)
@@ -439,11 +457,11 @@ class Worker(threading.Thread):
                 if _do_rewrite:
                     _msg_text = rewrite_for_voice(_msg_text)
                 for chunk in _split_text_chunks(_msg_text):
-                    self.reply(chunk, reply_to=[msg_id], project=project, is_final=True)
+                    self.reply(chunk, reply_to=turn_ids, project=project, is_final=True)
 
             # 도구 로그는 본문 뒤에 보낸다 — 스트리밍 중 레이아웃(버블 위·도구 아래)과 완료 후 배치를 맞춤
             if tool_lines:
-                self.reply("\n".join(tool_lines), reply_to=[msg_id], project=project, is_final=True, subtype="tool_log")
+                self.reply("\n".join(tool_lines), reply_to=turn_ids, project=project, is_final=True, subtype="tool_log")
 
         self.reply("", reply_to=None, project=project, is_final=False)
 
@@ -523,7 +541,8 @@ class Worker(threading.Thread):
             with active_projects_lock:
                 active_projects.discard(project)
             with self._spawned_lock:
-                self._spawned_ids.discard(msg_id)
+                for _tid in turn_message_ids(msg):
+                    self._spawned_ids.discard(_tid)
             with self._inflight_lock:
                 self._inflight -= 1
             self.heartbeat(is_working=False)
