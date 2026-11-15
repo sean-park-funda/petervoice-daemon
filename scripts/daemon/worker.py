@@ -27,7 +27,8 @@ from daemon.tasks import (
 from daemon.prompts import get_prompt_file, build_system_prompt
 from daemon.claude_runner import run_claude, run_codex, run_gemini, rewrite_for_voice, SHUTDOWN_INTERRUPTED
 from daemon.queue import enqueue_message, dequeue_message
-from daemon.dispatch import TurnDispatcher, turn_message_ids
+from daemon.dispatch import (TurnDispatcher, turn_message_ids, BOOT_GRACE_SEC_DEFAULT, BOOT_AUTO_LANES_DEFAULT,
+                             BOOT_GRACE_UPTIME_SEC_DEFAULT)
 from daemon.utils import resolve_files, cleanup_downloads, _split_text_chunks, _read_json, _write_json, with_sender
 from daemon.encryption import decrypt_message, get_encryptor
 # kanban messages now flow through messages table — no separate kanban import needed
@@ -58,7 +59,11 @@ class Worker(threading.Thread):
             logger=logger, shutdown_event=shutdown_event,
             merge_enabled=config.get("merge_auto_messages", True),
             merge_max=config.get("merge_auto_max", 10),
-            on_superseded=self._on_superseded)
+            on_superseded=self._on_superseded,
+            # 부팅 완충 (2026-11-16): 기계가 막 켜졌으면 데몬 시작 뒤 boot_grace_sec 동안 자동 턴을 boot_auto_lanes 개로 제한
+            boot_grace_sec=config.get("boot_grace_sec", BOOT_GRACE_SEC_DEFAULT),
+            boot_auto_lanes=config.get("boot_auto_lanes", BOOT_AUTO_LANES_DEFAULT),
+            boot_grace_uptime_sec=config.get("boot_grace_uptime_sec", BOOT_GRACE_UPTIME_SEC_DEFAULT))
         self._spawned_ids: set[int] = set()
         self._spawned_lock = threading.Lock()
         # 실제 처리 중인 턴 수 — 종료 드레인 시 main()이 0이 될 때까지 대기
@@ -522,6 +527,8 @@ class Worker(threading.Thread):
         lock = self._get_project_lock(project)
         with self._inflight_lock:
             self._inflight += 1
+        with g.turns_inflight_lock:   # 업데이터가 'CLI 교체는 턴이 없을 때' 를 판단하는 데 쓴다 (2026-11-16)
+            g.turns_inflight += 1
         try:
             with lock:
                 if shutdown_event.is_set():
@@ -545,6 +552,8 @@ class Worker(threading.Thread):
                     self._spawned_ids.discard(_tid)
             with self._inflight_lock:
                 self._inflight -= 1
+            with g.turns_inflight_lock:
+                g.turns_inflight = max(0, g.turns_inflight - 1)
             self.heartbeat(is_working=False)
 
     def inflight_count(self) -> int:

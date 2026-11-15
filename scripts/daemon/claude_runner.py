@@ -28,7 +28,7 @@ import daemon.globals as g
 import signal
 import threading
 
-from daemon.utils import _strip_ansi, count_dirty_files, mark_interrupted
+from daemon.utils import _strip_ansi, count_dirty_files, mark_interrupted, popen_retry_missing_binary
 from daemon.api import api_request
 from daemon.supabase import (
     resolve_user_id, _fetch_project_settings, _fetch_recent_conversation,
@@ -446,15 +446,20 @@ def run_claude(
         # browser-handoff 등 스킬이 API 회신을 정확한 대화로 받기 위해 사용.
         # basename $PWD 방식은 브랜치·공유 디렉토리에서 틀린다 (2026-07-30 실측)
         claude_env["PV_PROJECT"] = project
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            cwd=project_dir,
-            env=claude_env,
-            shell=IS_WINDOWS,
-            # 강제 킬 에스컬레이션 시 killpg 로 자식(도구/서브에이전트)까지 정리하기 위해 그룹 분리
-            start_new_session=not IS_WINDOWS,
+        # 실행 파일이 잠깐 없으면(업데이터의 npm 교체 공백) 바로 죽지 않고 기다렸다 다시 시도한다 (2026-11-16, utils 참조)
+        proc = popen_retry_missing_binary(
+            lambda c: subprocess.Popen(
+                c,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                cwd=project_dir,
+                env=claude_env,
+                shell=IS_WINDOWS,
+                # 강제 킬 에스컬레이션 시 killpg 로 자식(도구/서브에이전트)까지 정리하기 위해 그룹 분리
+                start_new_session=not IS_WINDOWS,
+            ),
+            cmd, resolve=g._find_claude_cmd, retry_sec=config.get("claude_spawn_retry_sec", 120),
+            log=logger, should_stop=shutdown_event.is_set,
         )
 
         # ── 멈춤 감지 폴러 (2초 간격, 별도 스레드 — 스트리밍 루프를 API 지연으로 막지 않기 위함) ──

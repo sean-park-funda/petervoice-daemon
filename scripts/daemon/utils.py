@@ -9,6 +9,40 @@ from pathlib import Path
 from daemon.globals import DOWNLOADS_DIR, logger
 
 
+def popen_retry_missing_binary(popen, cmd: list, *, resolve=None, retry_sec: float = 120.0,
+                               interval: float = 3.0, log=None, should_stop=None,
+                               sleep=time.sleep, clock=time.monotonic):
+    """Popen 인데 실행 파일이 잠깐 없을 때(FileNotFoundError) 기다렸다 다시 시도한다.
+
+    배경(2026-11-16): 업데이터가 `npm install -g @anthropic-ai/claude-code@…` 를 돌리는 동안 npm 이 옛 패키지
+    디렉터리를 치워 두므로 `/opt/homebrew/bin/claude` 심링크가 수십 초 끊긴다. 그 순간 시작한 턴은
+    `[Errno 2] No such file or directory: '/opt/homebrew/bin/claude'` 로 죽어 유저에게 오류 한 줄만 갔다
+    (11/10~11/15 Sean 맥 16건 — 설치가 매 5분 실패·롤백을 반복하며 공백을 만들었다).
+    popen(cmd) 는 subprocess.Popen 을 감싼 호출자. resolve() 가 있으면 재시도마다 실행 파일 경로를 다시 찾아
+    cmd[0] 을 바꾼다(심링크가 다른 곳에 다시 생기는 경우). 기한이 지나면 마지막 예외를 그대로 올린다.
+    """
+    cmd = list(cmd)
+    deadline = clock() + max(0.0, float(retry_sec or 0))
+    warned = False
+    while True:
+        try:
+            return popen(cmd)
+        except FileNotFoundError as e:
+            if clock() >= deadline or (should_stop and should_stop()):
+                raise
+            if not warned and log:
+                log.warning(f"[spawn] {cmd[0]} missing ({e}) — updater reinstalling? retrying up to {retry_sec:.0f}s")
+                warned = True
+            if resolve:
+                try:
+                    found = resolve()
+                    if found:
+                        cmd[0] = found
+                except Exception:
+                    pass
+            sleep(interval)
+
+
 def download_files(files: list[dict]) -> list[Path]:
     """Download files from Supabase Storage URLs to local directory.
     Returns list of local file paths."""

@@ -1,8 +1,10 @@
 """Auto-updater: periodically git pull and restart if new commits found."""
 
+import os
 import re
 import subprocess
 import threading
+import time
 
 from daemon.globals import config, shutdown_event, logger
 
@@ -19,6 +21,65 @@ def _find_repo_dir():
     return None
 
 
+class CliUpdatePolicy:
+    """CLI(claude·codex) npm 교체를 '언제' 할지 — 순수 판단만 (시험: scripts/test_auto_updater_policy.py).
+
+    배경(2026-11-16, 11/15 23:53 맥미니 커널 패닉 → 자동로그인 2분 뒤 WindowServer 재크래시):
+    - 부팅 32초 뒤 업데이터가 Claude CLI npm 설치(실패)·Codex 재설치를 돌려 이미 넘친 기계를 더 눌렀다.
+    - `npm install -g @anthropic-ai/claude-code@…` 는 옛 패키지를 치운 뒤 새것을 깔므로 수십 초 동안 실행 파일이 없다.
+      그 순간 시작한 턴은 `[Errno 2] … /opt/homebrew/bin/claude` 로 죽었다(11/10~15 Sean 맥 16건).
+    - 같은 버전 설치가 5분마다 실패·롤백을 반복했다(하루 200~283회) — 공백도 그만큼 반복됐다.
+
+    규칙:
+    - 데몬 시작 뒤 boot_grace_sec(기본 900초) 안에는 시도하지 않는다.
+    - 턴이 도는 중(inflight > 0)에는 미룬다. 새 버전을 처음 본 뒤 max_defer_sec(기본 6시간)가 지나면 그래도 한다
+      (바쁜 기계에서 영영 안 올라가는 일은 없게).
+    - 설치가 실패한 버전은 retry_sec(기본 6시간) 동안 다시 시도하지 않는다. 다른 버전이 나오면 바로 다시 본다.
+    """
+
+    def __init__(self, boot_grace_sec: float = 900, max_defer_sec: float = 6 * 3600,
+                 retry_sec: float = 6 * 3600, clock=time.monotonic):
+        self._clock = clock
+        self.boot_grace_sec = max(0.0, float(boot_grace_sec or 0))
+        self.max_defer_sec = max(0.0, float(max_defer_sec or 0))
+        self.retry_sec = max(0.0, float(retry_sec or 0))
+        self._started_at = clock()
+        self._pending_version: str | None = None
+        self._pending_since: float = 0.0
+        self._fail: dict | None = None
+        self._logged: tuple | None = None   # (version, reason) — 같은 미룸 사유는 한 번만 INFO 로 남긴다
+
+    def in_boot_grace(self) -> bool:
+        return self._clock() - self._started_at < self.boot_grace_sec
+
+    def decide(self, latest: str, inflight: int) -> tuple[bool, str]:
+        """(지금 설치해도 되나, 미루는 이유). 이유는 로그용."""
+        now = self._clock()
+        if latest != self._pending_version:
+            self._pending_version, self._pending_since = latest, now
+        if self.in_boot_grace():
+            return False, "boot grace"
+        if self._fail and self._fail["version"] == latest and now - self._fail["at"] < self.retry_sec:
+            return False, "failed earlier"
+        if inflight > 0 and now - self._pending_since < self.max_defer_sec:
+            return False, f"{inflight} turn(s) in flight"
+        return True, ""
+
+    def note_failure(self, version: str):
+        self._fail = {"version": version, "at": self._clock()}
+
+    def note_success(self):
+        self._fail = None
+        self._pending_version, self._pending_since = None, 0.0
+
+    def should_log_defer(self, version: str, reason: str) -> bool:
+        key = (version, reason.split(" ")[-1] if "in flight" in reason else reason)
+        if key == self._logged:
+            return False
+        self._logged = key
+        return True
+
+
 class AutoUpdater(threading.Thread):
     CHECK_INTERVAL = 300  # 5 minutes
     MAX_FAILURES = 3
@@ -28,6 +89,14 @@ class AutoUpdater(threading.Thread):
         self._repo_dir = _find_repo_dir()
         self._consecutive_failures = 0
         self._codex_repair_tried = False
+        self._codex_broken_seen = 0
+        _policy_kw = dict(
+            boot_grace_sec=config.get("cli_update_boot_grace_sec", 900),
+            max_defer_sec=config.get("cli_update_max_defer_sec", 6 * 3600),
+            retry_sec=config.get("cli_update_retry_sec", 6 * 3600),
+        )
+        self._claude_policy = CliUpdatePolicy(**_policy_kw)
+        self._codex_policy = CliUpdatePolicy(**_policy_kw)
 
     def _git(self, *args, timeout=30) -> subprocess.CompletedProcess:
         return subprocess.run(
@@ -251,13 +320,55 @@ class AutoUpdater(threading.Thread):
         except Exception as e:
             logger.warning(f"[updater] CLI update check failed (non-blocking): {e}")
 
+    @staticmethod
+    def _turns_inflight() -> int:
+        try:
+            import daemon.globals as g
+            return int(getattr(g, "turns_inflight", 0) or 0)
+        except Exception:
+            return 0
+
+    def _log_defer(self, what: str, policy: CliUpdatePolicy, latest: str, reason: str):
+        if policy.should_log_defer(latest, reason):
+            logger.info(f"[updater] {what} {latest} available — deferred ({reason})")
+
+    def _stray_platform_packages(self, _env: dict, root: str | None = None) -> list[str]:
+        """전역 node_modules/@anthropic-ai/ 에 따로 깔린 플랫폼 패키지(claude-code-darwin-arm64 등) 이름 목록.
+
+        install.cjs 는 플랫폼 패키지가 '본체 안(node_modules)' 과 '전역 최상위' 두 곳에 있으면 어느 쪽도 쓰지 않고
+        설치를 실패시킨다("Two copies of the native package"). 예전 업데이터가 플랫폼 패키지를 먼저 전역에 깔던
+        단계가 그 두 번째 사본을 만들었다(2026-11-10~15 매 5분 실패). 설치 전에 치운다.
+        """
+        try:
+            if root is None:
+                r = subprocess.run(["npm", "root", "-g"], capture_output=True, text=True, timeout=20, env=_env)
+                root = r.stdout.strip() if r.returncode == 0 else ""
+            if not root:
+                return []
+            scope = os.path.join(root, "@anthropic-ai")
+            if not os.path.isdir(scope):
+                return []
+            return sorted(n for n in os.listdir(scope)
+                          if n.startswith("claude-code-") and os.path.isdir(os.path.join(scope, n)))
+        except Exception as e:
+            logger.warning(f"[updater] stray platform package check failed: {e}")
+            return []
+
+    def _remove_stray_platform_packages(self, _env: dict) -> list[str]:
+        stray = self._stray_platform_packages(_env)
+        for name in stray:
+            logger.info(f"[updater] removing stray top-level @anthropic-ai/{name} (install.cjs rejects two copies)")
+            subprocess.run(["npm", "rm", "-g", f"@anthropic-ai/{name}"],
+                           capture_output=True, text=True, timeout=120, env=_env)
+        return stray
+
+    def _claude_version(self, _env: dict, path: str = "claude") -> str:
+        v = subprocess.run([path, "--version"], capture_output=True, text=True, timeout=10, env=_env)
+        return v.stdout.strip().split()[0] if v.returncode == 0 and v.stdout.strip() else ""
+
     def _update_claude_cli(self, _env: dict):
-        """Update @anthropic-ai/claude-code to latest."""
-        r = subprocess.run(
-            ["claude", "--version"],
-            capture_output=True, text=True, timeout=10, env=_env,
-        )
-        current = r.stdout.strip().split()[0] if r.returncode == 0 else ""
+        """Update @anthropic-ai/claude-code to latest — 시점은 CliUpdatePolicy 가 정한다."""
+        current = self._claude_version(_env)
         if not current:
             return
 
@@ -267,35 +378,54 @@ class AutoUpdater(threading.Thread):
         )
         latest = r.stdout.strip() if r.returncode == 0 else ""
         if not latest or current == latest:
+            self._claude_policy.note_success()
+            return
+
+        ok, why = self._claude_policy.decide(latest, self._turns_inflight())
+        if not ok:
+            self._log_defer("Claude CLI", self._claude_policy, latest, why)
             return
 
         logger.info(f"[updater] Updating Claude CLI: {current} → {latest}")
-        import platform
-        if platform.machine() == "arm64" and __import__("sys").platform == "darwin":
-            subprocess.run(
-                ["npm", "install", "-g", "@anthropic-ai/claude-code-darwin-arm64"],
-                capture_output=True, text=True, timeout=120, env=_env,
-            )
+        # 플랫폼 패키지는 본체의 optionalDependencies 로 따라온다. 전역에 따로 깔지 않는다(두 벌이면 install.cjs 가 거절).
+        self._remove_stray_platform_packages(_env)
         r = subprocess.run(
             ["npm", "install", "-g", f"@anthropic-ai/claude-code@{latest}"],
             capture_output=True, text=True, timeout=180, env=_env,
         )
-        if r.returncode == 0:
-            import shutil
+        if r.returncode != 0:
+            self._claude_policy.note_failure(latest)
+            err = r.stderr.strip()
+            hint = " (two copies of the platform package — official fix: npm rm -g both, then reinstall)" \
+                if "Two copies" in err else ""
+            logger.warning(f"[updater] Claude CLI update failed: {err[:200]}{hint} — "
+                           f"next try for {latest} in {self._claude_policy.retry_sec / 3600:.0f}h")
+            return
+
+        import shutil
+        new_path = shutil.which("claude", path=_env["PATH"])
+        v = self._claude_version(_env, new_path or "claude")
+        if not v:
+            # 설치는 됐다는데 실행이 안 됨 — 공식 처방(본체·플랫폼 패키지 둘 다 지우고 재설치)을 한 번만 해 본다
+            logger.warning("[updater] Claude CLI binary broken after update — trying the clean reinstall once")
+            self._remove_stray_platform_packages(_env)
+            subprocess.run(["npm", "rm", "-g", "@anthropic-ai/claude-code"],
+                           capture_output=True, text=True, timeout=120, env=_env)
+            subprocess.run(["npm", "install", "-g", f"@anthropic-ai/claude-code@{latest}"],
+                           capture_output=True, text=True, timeout=180, env=_env)
             new_path = shutil.which("claude", path=_env["PATH"])
-            v = subprocess.run(
-                [new_path or "claude", "--version"],
-                capture_output=True, text=True, timeout=10, env=_env,
-            )
-            if v.returncode == 0:
-                logger.info(f"[updater] Claude CLI updated to {v.stdout.strip()}")
-                if new_path:
-                    import daemon.globals as g
-                    g.CLAUDE_CMD = new_path
-            else:
-                logger.warning("[updater] Claude CLI binary broken after update — may need manual fix")
+            v = self._claude_version(_env, new_path or "claude")
+        if v:
+            logger.info(f"[updater] Claude CLI updated to {v}")
+            self._claude_policy.note_success()
+            if new_path:
+                import daemon.globals as g
+                g.CLAUDE_CMD = new_path
         else:
-            logger.warning(f"[updater] Claude CLI update failed: {r.stderr.strip()[:200]}")
+            self._claude_policy.note_failure(latest)
+            logger.error("[updater] Claude CLI still broken after clean reinstall — manual fix needed: "
+                         "npm rm -g @anthropic-ai/claude-code @anthropic-ai/claude-code-darwin-arm64 && "
+                         "npm i -g @anthropic-ai/claude-code")
 
     def _update_codex_cli(self, _env: dict):
         """Update @openai/codex to latest, repairing the install if npm left it broken."""
@@ -303,10 +433,15 @@ class AutoUpdater(threading.Thread):
         if not current:
             # Installed but not runnable: repair instead of giving up here, otherwise
             # every later cycle bails out at this line and codex stays dead until a
-            # human notices.
+            # human notices. 단, 부팅 직후(boot grace)와 첫 관측에서는 고치지 않는다 — 켜진 직후의
+            # 부하로 한 번 삐끗한 것을 '깨짐' 으로 보고 재설치해 기계를 더 누른 일이 있다(2026-11-15 23:56).
+            self._codex_broken_seen += 1
+            if self._codex_policy.in_boot_grace() or self._codex_broken_seen < 2:
+                return
             current = self._repair_codex_cli(_env)
             if not current:
                 return
+        self._codex_broken_seen = 0
 
         r = subprocess.run(
             ["npm", "view", "@openai/codex", "version"],
@@ -314,6 +449,12 @@ class AutoUpdater(threading.Thread):
         )
         latest = r.stdout.strip() if r.returncode == 0 else ""
         if not latest or current == latest:
+            self._codex_policy.note_success()
+            return
+
+        ok, why = self._codex_policy.decide(latest, self._turns_inflight())
+        if not ok:
+            self._log_defer("Codex CLI", self._codex_policy, latest, why)
             return
 
         logger.info(f"[updater] Updating Codex CLI: {current} \u2192 {latest}")
@@ -322,12 +463,17 @@ class AutoUpdater(threading.Thread):
             capture_output=True, text=True, timeout=180, env=_env,
         )
         if r.returncode != 0:
-            logger.warning(f"[updater] Codex CLI update failed: {r.stderr.strip()[:200]}")
+            self._codex_policy.note_failure(latest)
+            logger.warning(f"[updater] Codex CLI update failed: {r.stderr.strip()[:200]} — "
+                           f"next try for {latest} in {self._codex_policy.retry_sec / 3600:.0f}h")
             return
 
         updated = self._codex_version(_env) or self._repair_codex_cli(_env)
         if updated:
             logger.info(f"[updater] Codex CLI updated to {updated}")
+            self._codex_policy.note_success()
+        else:
+            self._codex_policy.note_failure(latest)
 
     def _codex_version(self, _env: dict) -> str:
         """Installed codex version, or "" when the binary refuses to run."""

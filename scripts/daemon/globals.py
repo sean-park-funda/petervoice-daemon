@@ -194,6 +194,9 @@ claude_semaphore: threading.Semaphore | None = None
 # (2026-07-10~15 연쇄 로그아웃: 사망 시점이 전부 병렬 버스트 순간이었음)
 claude_inflight: int = 0
 claude_inflight_lock = threading.Lock()
+# 엔진 무관 '지금 도는 턴' 수 (worker 가 올리고 내린다) — 업데이터가 CLI 교체 시점(턴 없을 때)을 고르는 데 쓴다 (2026-11-16)
+turns_inflight: int = 0
+turns_inflight_lock = threading.Lock()
 last_claude_ok: float = 0.0   # 마지막으로 claude 가 정상 완료한 시각(토큰 신선도 추정)
 project_locks: dict = {}
 project_locks_lock = threading.Lock()

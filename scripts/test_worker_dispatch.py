@@ -19,6 +19,7 @@ sys.path.insert(0, str(ROOT))
 
 from daemon.dispatch import (  # noqa: E402
     TurnDispatcher, is_automatic, is_mergeable, merge_messages, supersede_key, turn_message_ids,
+    RESUME_NOTICE, body_text,
 )
 
 FAILS = []
@@ -43,16 +44,24 @@ def scenario(title, max_workers, reserve, msgs, gate_first=True, **kw):
     def seen():
         return {i for ids, _ in order for i in ids} | {o["id"] for o, _ in superseded}
 
+    cur_auto, max_auto = [0], [0]   # 자동 턴 동시 실행 수 (부팅 완충 시나리오가 본다)
+
     def run_turn(msg):
         ids = turn_message_ids(msg)
+        auto = is_automatic(msg)
         with lock:
             for i in ids:
                 starts[i] = round(time.monotonic() - t0, 2)
             order.append((ids, msg))
+            if auto:
+                cur_auto[0] += 1
+                max_auto[0] = max(max_auto[0], cur_auto[0])
         if gate_first and msg["id"] == first_id:
             gate.wait(10)
         time.sleep(msg.get("dur", 0.05))
         with lock:
+            if auto:
+                cur_auto[0] -= 1
             if want <= seen():
                 done.set()
 
@@ -82,6 +91,7 @@ def scenario(title, max_workers, reserve, msgs, gate_first=True, **kw):
     time.sleep(0.1)
     ex.shutdown(wait=True)
     st = d.stats()
+    st["max_auto_concurrency"] = max_auto[0]
     check(st["running"] == 0 and st["pending"] == 0, f"drained cleanly {st}")
     print("  starts:", starts, "| gate opened at", gate_t)
     print("  turns:", [ids for ids, _ in order], "| superseded:", [(o["id"], n["id"]) for o, n in superseded])
@@ -133,6 +143,12 @@ check(is_automatic({"text": "[heartbeat] HEARTBEAT.md를 확인"}), "heartbeat =
 check(not is_automatic({"text": "결정: A 로 간다"}), "decision answer = human")
 check(not is_automatic({"text": "[음성 핸드오프 from:coo] 용건"}), "voice handoff = human")
 check(not is_automatic({"text": ""}), "empty text (file only) = human")
+# 재시작 복구 머리말은 분류 전에 벗긴다 (2026-11-16 — 전에는 복구된 릴레이가 사람으로 분류됐다)
+check(is_automatic({"text": RESUME_NOTICE + "[relay from:x] a"}), "resumed relay = automatic")
+check(is_mergeable({"text": RESUME_NOTICE + "[relay from:x] a"}), "resumed relay = mergeable")
+check(is_automatic({"text": RESUME_NOTICE + "[heartbeat] HEARTBEAT.md"}), "resumed heartbeat = automatic")
+check(not is_automatic({"text": RESUME_NOTICE + "사람이 친 메시지"}), "resumed human message = human")
+check(body_text({"text": RESUME_NOTICE + "  [relay from:x] a"}) == "[relay from:x] a", "body_text strips notice + spaces")
 
 # 6. Worker 통합 스모크 — 실제 Worker 가 디스패처로 턴을 돌리는지 (네트워크 호출은 전부 막는다)
 print("\n[worker smoke]")
@@ -209,6 +225,41 @@ check(order == [["r1"], ["r2"], ["r3"]], f"no merging when disabled: {order}")
 # 10. 묶음 상한: merge_max=2 면 두 통씩
 s, order, *_ = scenario("merge_max=2", 1, 0, [relay("r1"), relay("r2"), relay("r3"), relay("r4"), relay("r5")], merge_max=2)
 check(order == [["r1"], ["r2", "r3"], ["r4", "r5"]], f"two per turn: {order}")
+
+# ── 부팅 완충 (2026-11-16) — 기계가 막 켜졌으면 자동 턴은 boot_auto_lanes 개씩, 사람은 바로. 따뜻한 기계엔 없음 ──
+# 11. 막 켜진 기계(uptime 30초): 자동 턴 동시 1개, 사람 메시지는 자동 칸이 꽉 차도 바로
+s, order, gate_t, turns, _, st = scenario("boot grace caps auto turns", 4, 0, [
+    {"id": "X1", "project": "X", "text": "[heartbeat] x", "dur": 0.2},
+    {"id": "Y1", "project": "Y", "text": RESUME_NOTICE + "[relay from:q] y", "dur": 0.2},   # 복구된 릴레이 = 자동
+    {"id": "Z1", "project": "Z", "text": "[relay from:q] z", "dur": 0.2},
+    {"id": "H1", "project": "H", "text": "사람 메시지"},
+], merge_enabled=False, boot_grace_sec=30, boot_auto_lanes=1, uptime_fn=lambda: 30.0)
+check(s["H1"] < gate_t, f"H1 (human) started at {s['H1']}s during boot grace")
+check(st["max_auto_concurrency"] == 1, f"auto turns never overlapped during boot grace (max {st['max_auto_concurrency']})")
+check(s["Y1"] >= gate_t and s["Z1"] >= gate_t, f"Y1/Z1 waited behind gated X1 ({s['Y1']}, {s['Z1']} ≥ {gate_t})")
+check(st["boot_grace_left"] > 20, f"grace still armed after the run ({st['boot_grace_left']}s left)")
+
+# 12. 따뜻한 기계(uptime 2시간): 완충 없음 → 자동 턴이 겹쳐 돈다
+s, order, gate_t, turns, _, st = scenario("no boot grace on a warm machine", 4, 0, [
+    {"id": "X1", "project": "X", "text": "[heartbeat] x", "dur": 0.2},
+    {"id": "Y1", "project": "Y", "text": "[relay from:q] y", "dur": 0.2},
+    {"id": "Z1", "project": "Z", "text": "[relay from:q] z", "dur": 0.2},
+], merge_enabled=False, boot_grace_sec=30, boot_auto_lanes=1, uptime_fn=lambda: 7200.0)
+check(st["max_auto_concurrency"] >= 2, f"auto turns overlapped without grace (max {st['max_auto_concurrency']})")
+check(st["boot_grace_left"] == 0, "no grace armed on a warm machine")
+
+# 13. 완충은 시간이 지나면 풀린다 · uptime 을 모르면 보수적으로 건다 (white-box)
+d = TurnDispatcher(4, 0, run_turn=lambda m: None, submit=lambda f, it: None, boot_grace_sec=30, uptime_fn=lambda: 10.0)
+d._arm_boot_grace()
+check(d.boot_grace_left() > 25, f"armed on cold machine ({d.boot_grace_left()}s)")
+d._boot_until = time.monotonic() - 1
+check(d.boot_grace_left() == 0, "expired grace → no cap")
+d2 = TurnDispatcher(4, 0, run_turn=lambda m: None, submit=lambda f, it: None, boot_grace_sec=30, uptime_fn=lambda: None)
+d2._arm_boot_grace()
+check(d2.boot_grace_left() > 25, "unknown uptime → grace armed (conservative)")
+d3 = TurnDispatcher(4, 0, run_turn=lambda m: None, submit=lambda f, it: None, boot_grace_sec=0, uptime_fn=lambda: 10.0)
+d3._arm_boot_grace()
+check(d3.boot_grace_left() == 0, "boot_grace_sec=0 → disabled")
 
 # 11. 분류기 · 도우미
 check(is_mergeable({"text": "[relay from:a branch:9]\nx"}), "relay mergeable")

@@ -20,6 +20,7 @@ from daemon.prompts import ensure_template
 from daemon.queue import load_queue
 from daemon.supabase import resolve_user_id, check_force_restart, clear_force_restart, check_bot_response_exists
 from daemon.worker import Worker
+from daemon.dispatch import RESUME_NOTICE
 from daemon.health import SessionHealthChecker
 from daemon.autoreset import SessionAutoResetThread
 from daemon.syncers.secrets import SecretsSyncer
@@ -101,12 +102,9 @@ def _recover_after_restart(worker):
                     worker._spawned_ids.add(msg_id)
                 # 같은 세션을 --resume 하므로 완료된 작업의 반복(이중 부작용)을 막는 안내를 붙인다.
                 # 큐에는 원본 msg가 남아있어(id 기준 dedupe) 프리픽스가 중첩되지 않는다.
+                # 머리말은 dispatch.RESUME_NOTICE 하나로 관리 — 디스패처가 분류 전에 벗긴다 (복구된 릴레이가 사람으로 분류되던 버그, 2026-11-16)
                 msg = dict(msg)
-                msg["text"] = (
-                    "[안내: 직전 턴이 데몬 재시작으로 중단되었습니다. "
-                    "이미 완료된 작업은 반복하지 말고, 중단 지점부터 이어서 진행한 뒤 결과를 보고하세요.]\n\n"
-                    + msg.get("text", "")
-                )
+                msg["text"] = RESUME_NOTICE + msg.get("text", "")
                 worker.submit(msg)
 
 

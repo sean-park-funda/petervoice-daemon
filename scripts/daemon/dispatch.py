@@ -24,8 +24,17 @@
   같은 키의 옛 메시지는 빼고 on_superseded 콜백(워커: 처리완료 마킹)으로 넘긴다. 서버(/api/relay/message)도
   아직 안 집어간 옛 메시지를 같은 규칙으로 닫으므로, 데몬은 '이미 받아 와 줄 서 있는' 것만 맡는다.
   이미 시작된 턴은 어느 쪽도 막지 못한다 — 보내는 쪽 관문(revenue-lab 「담당 확인」)과 같이 쓴다.
+
+부팅 직후 완충(boot grace, 2026-11-16 — 11/15 23:53 커널 패닉 → 자동로그인 → 2분 뒤 WindowServer 워치독 재크래시 사고):
+- 기계가 막 켜진 직후(기동 시 uptime < `boot_grace_uptime_sec`, 기본 600초)에는 데몬 시작 뒤 `boot_grace_sec`(기본 180초)
+  동안 **자동 턴**을 `boot_auto_lanes`(기본 1)개까지만 동시에 돈다. 사람 메시지는 평소대로(max_workers 까지) 바로 간다.
+  부팅 때는 로컬 사이트 40여 개·감시 LaunchAgent 의 브라우저·업데이터 npm 이 한꺼번에 뜨므로, 중단됐던 긴 자동 턴
+  (전사·크롤링)까지 즉시 재개하면 16GB 기계가 넘친다. 배포 재시작(따뜻한 기계)에는 적용하지 않는다.
+- 재시작 복구 메시지의 머리말 `[안내: 직전 턴이 데몬 재시작으로 중단되었습니다. …]` 은 분류 전에 벗긴다 — 전에는 이 머리말
+  때문에 복구된 릴레이·하트비트가 '사람 메시지' 로 분류돼 우선순위·예비 칸·묶기 규칙을 전부 건너뛰었다.
 """
 import itertools
+import re
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -38,15 +47,32 @@ MERGE_MAX_DEFAULT = 10
 MERGE_MAX_CHARS = 60_000   # 묶음 본문 상한 — 넘치면 나머지는 다음 턴
 _KST = timezone(timedelta(hours=9))
 
+# 데몬 재시작 복구가 원문 앞에 붙이는 머리말 (claude_daemon.py 가 같은 상수를 쓴다). 분류할 때는 벗긴다.
+RESUME_NOTICE = (
+    "[안내: 직전 턴이 데몬 재시작으로 중단되었습니다. "
+    "이미 완료된 작업은 반복하지 말고, 중단 지점부터 이어서 진행한 뒤 결과를 보고하세요.]\n\n"
+)
+_NOTICE_RE = re.compile(r"^\s*\[안내:[^\]]*\]\s*")
+
+# 부팅 완충 기본값 (config 키와 같은 이름)
+BOOT_GRACE_SEC_DEFAULT = 180
+BOOT_AUTO_LANES_DEFAULT = 1
+BOOT_GRACE_UPTIME_SEC_DEFAULT = 600
+
+
+def body_text(msg: dict) -> str:
+    """분류용 본문 — 복구 머리말(`[안내: …]`)을 벗긴 뒤 앞 공백을 뗀 텍스트."""
+    text = msg.get("text") or ""
+    return _NOTICE_RE.sub("", text, count=1).lstrip()
+
 
 def is_automatic(msg: dict) -> bool:
-    text = (msg.get("text") or "").lstrip()
-    return text.startswith(AUTO_PREFIXES)
+    return body_text(msg).startswith(AUTO_PREFIXES)
 
 
 def is_mergeable(msg: dict) -> bool:
     """같은 담당의 다른 자동 메시지와 한 턴에 묶어도 되는 메시지인가."""
-    text = (msg.get("text") or "").lstrip()
+    text = body_text(msg)
     if not text.startswith(MERGE_PREFIXES):
         return False
     if msg.get("files") or msg.get("reply_to") or msg.get("encrypted"):
@@ -100,6 +126,25 @@ def merge_messages(msgs: list[dict]) -> dict:
     return merged
 
 
+def system_uptime_sec() -> float | None:
+    """기계가 켜진 뒤 지난 초. 모르면 None (호출 쪽이 보수적으로 다룬다)."""
+    try:
+        import os
+        import subprocess
+        import sys
+        if sys.platform == "darwin":
+            r = subprocess.run(["/usr/sbin/sysctl", "-n", "kern.boottime"], capture_output=True, text=True, timeout=3)
+            m = re.search(r"sec\s*=\s*(\d+)", r.stdout)
+            if m:
+                return max(0.0, time.time() - int(m.group(1)))
+        elif os.path.exists("/proc/uptime"):
+            with open("/proc/uptime") as f:
+                return float(f.read().split()[0])
+    except Exception:
+        pass
+    return None
+
+
 class _Item:
     __slots__ = ("seq", "msg", "project", "auto", "enqueued_at")
 
@@ -113,7 +158,9 @@ class _Item:
 
 class TurnDispatcher:
     def __init__(self, max_workers: int, reserve: int, run_turn, submit, logger=None, shutdown_event=None,
-                 merge_enabled: bool = True, merge_max: int = MERGE_MAX_DEFAULT, on_superseded=None):
+                 merge_enabled: bool = True, merge_max: int = MERGE_MAX_DEFAULT, on_superseded=None,
+                 boot_grace_sec: float = 0, boot_auto_lanes: int = BOOT_AUTO_LANES_DEFAULT,
+                 boot_grace_uptime_sec: float = BOOT_GRACE_UPTIME_SEC_DEFAULT, uptime_fn=None):
         self.max_workers = max(1, int(max_workers))
         # 자동 턴 칸은 최소 1개는 남긴다 (reserve 가 커도 하트비트·릴레이가 영영 안 도는 일은 없게)
         self.reserve = max(0, min(int(reserve or 0), self.max_workers - 1))
@@ -134,6 +181,12 @@ class TurnDispatcher:
         self._merged_turns = 0
         self._merged_msgs = 0
         self._superseded = 0
+        # 부팅 완충 — start() 에서 기계 uptime 을 보고 _boot_until 을 정한다 (0 이면 없음)
+        self.boot_grace_sec = max(0.0, float(boot_grace_sec or 0))
+        self.boot_auto_lanes = max(1, int(boot_auto_lanes or BOOT_AUTO_LANES_DEFAULT))
+        self.boot_grace_uptime_sec = max(0.0, float(boot_grace_uptime_sec or 0))
+        self._uptime_fn = uptime_fn or system_uptime_sec
+        self._boot_until = 0.0
 
     # ── 바깥 API ──
     def enqueue(self, msg: dict, project: str | None = None):
@@ -164,8 +217,28 @@ class TurnDispatcher:
 
     def start(self):
         if self._thread is None:
+            self._arm_boot_grace()
             self._thread = threading.Thread(target=self._loop, daemon=True, name="dispatch")
             self._thread.start()
+
+    def _arm_boot_grace(self):
+        """기계가 막 켜졌을 때만 자동 턴 완충을 건다. uptime 을 모르면 보수적으로 건다."""
+        if self.boot_grace_sec <= 0:
+            return
+        try:
+            up = self._uptime_fn()
+        except Exception:
+            up = None
+        if up is not None and up >= self.boot_grace_uptime_sec:
+            return
+        self._boot_until = time.monotonic() + self.boot_grace_sec
+        if self._log:
+            self._log.info(f"[queue] boot grace: machine up {('%.0fs' % up) if up is not None else 'unknown'} → "
+                           f"auto turns capped at {self.boot_auto_lanes} for {self.boot_grace_sec:.0f}s "
+                           f"(human turns unaffected)")
+
+    def boot_grace_left(self) -> float:
+        return max(0.0, self._boot_until - time.monotonic())
 
     def stop(self):
         with self._cv:
@@ -183,6 +256,7 @@ class TurnDispatcher:
                 "merged_turns": self._merged_turns,
                 "merged_msgs": self._merged_msgs,
                 "superseded": self._superseded,
+                "boot_grace_left": round(self.boot_grace_left(), 1),
             }
 
     # ── 내부 ──
@@ -191,6 +265,8 @@ class TurnDispatcher:
         if self._running >= self.max_workers:
             return None
         auto_cap = self.max_workers - self.reserve
+        if self._boot_until and time.monotonic() < self._boot_until:
+            auto_cap = min(auto_cap, self.boot_auto_lanes)
         best = None
         for it in self._pending:
             if it.project in self._running_projects:

@@ -78,6 +78,13 @@ claude_daemon.py + scripts/daemon/
   "human_reserved_lanes": 0,
   "merge_auto_messages": true,
   "merge_auto_max": 10,
+  "boot_grace_sec": 180,
+  "boot_auto_lanes": 1,
+  "boot_grace_uptime_sec": 600,
+  "claude_spawn_retry_sec": 120,
+  "cli_update_boot_grace_sec": 900,
+  "cli_update_max_defer_sec": 21600,
+  "cli_update_retry_sec": 21600,
   "session_ttl_hours": 24,
   "poll_interval_sec": 3,
   "stream_interval_sec": 2.0,
@@ -113,6 +120,10 @@ claude_daemon.py + scripts/daemon/
 > **동시 실행 칸(`max_concurrent`)은 실제로 도는 턴만 센다 (2026-11-03).** 같은 담당(프로젝트·브랜치)에 몰린 메시지는 칸을 쥐지 않고 디스패처 대기열(`daemon/dispatch.py`)에서 기다리며, 담당당 한 번에 한 턴만 돈다. 사람이 친 메시지가 자동 메시지(`[relay from:` · `[heartbeat]` 등)보다 먼저 시작한다. `human_reserved_lanes` 는 사람 메시지 전용 예비 칸 수 (기본 `max_concurrent // 4`, 최대 2 — 3칸이면 0). 로그 `[queue] msg #N → … started after Ns wait` 가 5초 넘게 기다린 메시지를 남긴다. 배경: 11/03 Sean 맥 12칸이 실제 실행 3 + 잠금 대기 9 로 차서 사람 메시지가 16분 기다렸다.
 >
 > **쌓인 자동 메시지는 한 턴에 묶인다 (2026-11-12, Sean 「둘 다 해」).** 자동 턴을 시작할 때 같은 담당에게 대기 중인 릴레이·알림(`[relay from:` · `[외부 relay` · `[자료수신` · `[stall-check`)이 더 있으면 도착순으로 한 통에 묶어 한 턴으로 돈다 — 머리 `[자동 메시지 N건 묶음]`, 통마다 `━━━ i/N · #id · 시각(KST) ━━━`. 「A 가 맡아」 뒤에 온 「A 말고 B」 를 같은 턴에 보게 하고 턴 수를 줄인다(11/09 revenue-lab 부산진 중복 답). 사람 메시지·하트비트(`[heartbeat]`, 「할 일 없음」 조용한 회차 판정이 입력 1건 기준)·`[매니저]`·첨부·댓글(reply_to)·암호화 메시지는 묶지 않는다. 묶음 턴은 메시지 전부를 처리완료로 표시하고 답의 `reply_to` 에 전부를 넣는다(영구 큐에도 묶음 하나로). `merge_auto_messages`(기본 true, false 면 끔) · `merge_auto_max`(기본 10통, 본문 합 60,000자 상한). 릴레이의 `metadata.supersede` 키가 같은 옛 대기 메시지는 새 메시지가 들어오는 순간 대기열에서 빠지고 처리완료로 표시된다(서버 쪽 규칙은 11장 「대기 중 메시지 합치기·대체」). 이미 시작된 턴은 막지 못한다. 로그 `[queue] merged N auto msgs → <담당>: #a,#b` · `[queue] msg #N → <담당> dropped: superseded by #M`. 시험 `scripts/test_worker_dispatch.py`.
+>
+> **부팅 직후 완충 (2026-11-16).** 기계가 막 켜진 뒤(데몬 기동 시 uptime < `boot_grace_uptime_sec`, 기본 600초) 데몬이 시작하면 `boot_grace_sec`(기본 180초) 동안 **자동 턴**(릴레이·하트비트·복구 재개)을 `boot_auto_lanes`(기본 1)개까지만 동시에 돈다. 사람 메시지는 평소대로 바로 간다. 배포 재시작(따뜻한 기계)에는 걸리지 않는다. 배경: 11/15 23:53 커널 패닉 → 자동로그인 → 로컬 사이트 45개·감시 크롬 50개·whisper 4개·업데이터 npm 과 함께 중단된 긴 턴 3개가 즉시 재개돼 2분 뒤 WindowServer 워치독 크래시(16GB 맥미니). 로그 `[queue] boot grace: machine up Ns → auto turns capped at 1 for 180s`. `boot_grace_sec: 0` 이면 끔. 같은 날 정정: 재시작 복구 머리말(`[안내: 직전 턴이 데몬 재시작으로 중단되었습니다…]`)은 분류 전에 벗긴다 — 전엔 복구된 릴레이가 사람 메시지로 분류돼 우선순위·예비 칸·묶기를 건너뛰었다.
+>
+> **실행 파일 공백 재시도 (2026-11-16).** claude 를 띄울 때 `FileNotFoundError`(업데이터가 npm 으로 CLI 를 교체하는 수십 초 동안 `/opt/homebrew/bin/claude` 심링크가 끊김)가 나면 바로 오류를 돌려주지 않고 3초 간격으로 `claude_spawn_retry_sec`(기본 120초)까지 경로를 다시 찾아 재시도한다(`daemon/utils.popen_retry_missing_binary`). 로그 `[spawn] … missing — updater reinstalling? retrying up to 120s`. 11/10~15 Sean 맥에서 이 공백에 걸린 턴 16건이 `(Claude 실행 오류: [Errno 2] …)` 로 끝났다.
 
 ## 파일 구조
 
@@ -360,6 +371,17 @@ agent:
 - **fast-forward only**: 로컬 수정이 있으면 pull 거부 → 충돌 방지
 - **연속 실패 3회**: 자동 일시 중단 + 로그 경고
 - **30초 지연 시작**: 데몬 초기화 완료 후 첫 체크
+
+### Claude·Codex CLI 교체 시점 — `CliUpdatePolicy` (2026-11-16)
+
+매 5분 사이클에 CLI(npm 전역 패키지) 최신 버전도 확인하지만, **설치는 아래 조건에서만** 한다 (`daemon/syncers/auto_updater.py`, 시험 `scripts/test_auto_updater_policy.py`):
+
+- 데몬 시작 뒤 `cli_update_boot_grace_sec`(기본 900초) 안에는 하지 않는다 — 11/15 부팅 32초 뒤 npm 설치·Codex 재설치가 넘친 기계를 더 눌렀다.
+- 턴이 도는 중(`globals.turns_inflight > 0`)에는 미룬다. 새 버전을 처음 본 뒤 `cli_update_max_defer_sec`(기본 6시간)가 지나면 그래도 한다. 이유: `npm install -g` 는 옛 패키지를 치운 뒤 새것을 깔아 수십 초 동안 실행 파일이 없다.
+- 설치가 실패한 버전은 `cli_update_retry_sec`(기본 6시간) 동안 다시 시도하지 않는다(다른 버전이 나오면 바로). 전엔 같은 버전을 5분마다 283회/일 실패·롤백하며 매번 공백을 만들었다.
+- **플랫폼 패키지(`@anthropic-ai/claude-code-darwin-arm64` 등)를 전역에 따로 깔지 않는다.** 본체의 optionalDependencies 로 따라온다. 전역 최상위에 따로 있으면 설치 전에 `npm rm -g` 로 치운다 — 2.1.32x 의 `install.cjs` 는 두 벌이면 "Two copies of the native package" 로 설치를 거절한다(11/10~15 실패 원인). 설치 뒤 실행이 안 되면 공식 처방(본체·플랫폼 둘 다 지우고 재설치)을 한 번만 더 해 보고, 그래도 안 되면 ERROR 로그와 수동 명령을 남긴다.
+- Codex 「설치돼 있는데 안 돎 → 재설치」 복구는 부팅 완충 중·첫 관측에서는 하지 않는다(두 사이클 연속 관측 뒤).
+- 로그: `[updater] Claude CLI 2.1.325 available — deferred (3 turn(s) in flight)`(같은 사유는 한 번만) · `… update failed: … — next try for 2.1.325 in 6h` · `removing stray top-level @anthropic-ai/claude-code-darwin-arm64`.
 
 ### config.json 설정
 
