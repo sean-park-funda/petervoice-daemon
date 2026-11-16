@@ -9,6 +9,9 @@
 - 담당(project 키)마다 한 번에 한 턴. 그 담당의 다음 메시지는 스레드를 쥐지 않고 이 대기열에 남는다.
 - 사람 메시지가 자동 메시지(릴레이·하트비트·stall-check 등)보다 먼저 간다 — 담당이 달라도, 같은 담당 안에서도.
   같은 종류끼리는 도착 순.
+- 예외(2026-11-16, axl 작업대 카드 839 E): 작업대 실무자 글은 릴레이 길로 오지만 사람이 친 글이라 사람 메시지로 센다
+  (WORKBENCH_HUMAN — 릴레이 머리 바로 뒤에 `[작업대 대화] ` 가 올 때만). 11/03 11:35~12:13 맥 전체 칸 부족 때 실무자 글
+  4건이 예비 칸을 못 쓰고 하트비트·팀장 릴레이 뒤에 서서 3분 넘게 기다렸다 — 재발 막기.
 - 사람 예비 칸(reserve): 자동 턴은 동시에 (max_workers - reserve)개까지만 돈다. 사람 턴은 max_workers 까지.
   자동 턴이 칸을 다 채워도 사람 메시지는 바로 시작한다.
 
@@ -41,6 +44,11 @@ from datetime import datetime, timedelta, timezone
 
 # 사람이 친 메시지가 아닌 것 — 본문 머리말로 판별한다 (서버가 종류 필드를 따로 주지 않는다).
 AUTO_PREFIXES = ("[relay from:", "[heartbeat]", "[stall-check", "[외부 relay", "[자료수신", "[매니저]")
+# 작업대(axl 작업대) 실무자 글은 릴레이 길로 오지만 사람이 친 글 — 사람 메시지로 센다 (2026-11-16, axl 카드 839 E).
+# 릴레이 머리 `[relay from:…]` 바로 뒤(줄바꿈 뒤)에 `[작업대 대화] ` 가 올 때만. 시험 자리 `[시험 자리] `·대신 보기 `(○○ 시험) `
+# 표식이 앞에 붙은 글, 작업대 깨우기 `[작업대 확인]`·`[작업 중지]`, 본문 중간에 같은 머리가 있는 다른 릴레이는 그대로 자동.
+# 이 머리는 그 작업대만 쓰므로 다른 설치에는 영향이 없다.
+WORKBENCH_HUMAN = re.compile(r"^\[relay from:[^\]\n]*\]\s*\[작업대 대화\] ")
 # 한 턴에 묶을 수 있는 자동 메시지 — 릴레이·알림만 (하트비트·매니저 제외, 위 모듈 설명 참조)
 MERGE_PREFIXES = ("[relay from:", "[외부 relay", "[자료수신", "[stall-check")
 MERGE_MAX_DEFAULT = 10
@@ -67,7 +75,8 @@ def body_text(msg: dict) -> str:
 
 
 def is_automatic(msg: dict) -> bool:
-    return body_text(msg).startswith(AUTO_PREFIXES)
+    text = body_text(msg)
+    return text.startswith(AUTO_PREFIXES) and not WORKBENCH_HUMAN.match(text)
 
 
 def is_mergeable(msg: dict) -> bool:

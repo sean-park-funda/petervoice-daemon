@@ -131,6 +131,26 @@ s, order, *_ = scenario("human jumps queue within project", 1, 0, [
 ], merge_enabled=False)
 check(order == [["a1"], ["h1"], ["a2"], ["a3"]], f"order a1 → h1 → a2 → a3: {order}")
 
+# 3b. 작업대 실무자 글(릴레이 길)은 같은 담당 대기열에서 하트비트·팀장 릴레이를 앞지르고, 묶기(켜 둠)에도 안 들어간다 (2026-11-16)
+WB = "[relay from:axl-consulting branch:766]\n[작업대 대화] 1 정산서 검수 — 김현정 경영관리부 대리 (대화 #552) · 역할: 실무자"
+s, order, *_ = scenario("workbench staff message jumps queue, not merged", 1, 0, [
+    {"id": "r1", "project": "branch:741", "text": "[relay from:axl-consulting branch:708]\n팀장 지시 1"},
+    {"id": "r2", "project": "branch:741", "text": "[relay from:axl-consulting branch:708]\n팀장 지시 2"},
+    {"id": "hb", "project": "branch:741", "text": "[heartbeat] HEARTBEAT.md"},
+    {"id": "wb", "project": "branch:741", "text": WB},
+    {"id": "ts", "project": "branch:741", "text": "[relay from:axl-consulting branch:766]\n[시험 자리] [작업대 대화] 1 정산서 검수 — 시험"},
+])
+check(order == [["r1"], ["wb"], ["r2", "ts"], ["hb"]], f"order r1 → wb(human) → r2+ts merged → hb: {order}")
+
+# 3c. 작업대 실무자 글은 사람 예비 칸을 쓴다 — 자동 턴이 칸을 다 채워도 바로 시작 (11/03 원인 ③ 재발 막기)
+s, order, gate_t, *_ = scenario("workbench staff message uses the human reserve lane", 2, 1, [
+    {"id": "X1", "project": "X", "text": "[heartbeat] x"},
+    {"id": "Y1", "project": "Y", "text": "[relay from:q] y"},
+    {"id": "W1", "project": "branch:741", "text": WB},
+], merge_enabled=False)
+check(s["W1"] < gate_t, f"W1 (workbench staff) started at {s['W1']}s though the auto lane was full")
+check(s["Y1"] >= gate_t, f"Y1 (auto) waited for the auto lane ({s['Y1']}s)")
+
 # 4. 사람끼리는 도착 순 (한 사람이 연달아 보낸 4건, 게이트 없이)
 s, order, *_ = scenario("humans FIFO", 3, 1, [
     {"id": f"m{i}", "project": "jangsa", "text": f"요청 {i}", "dur": 0.2} for i in range(4)
@@ -149,6 +169,16 @@ check(is_mergeable({"text": RESUME_NOTICE + "[relay from:x] a"}), "resumed relay
 check(is_automatic({"text": RESUME_NOTICE + "[heartbeat] HEARTBEAT.md"}), "resumed heartbeat = automatic")
 check(not is_automatic({"text": RESUME_NOTICE + "사람이 친 메시지"}), "resumed human message = human")
 check(body_text({"text": RESUME_NOTICE + "  [relay from:x] a"}) == "[relay from:x] a", "body_text strips notice + spaces")
+# 작업대 실무자 글은 릴레이 길로 와도 사람 메시지 (2026-11-16, axl 카드 839 E) — 표식·깨우기·중지·본문 중간 언급은 자동 그대로
+WB = "[relay from:axl-consulting branch:766]\n[작업대 대화] 1 정산서 검수 — 김현정 경영관리부 대리 (대화 #552) · 역할: 실무자"
+check(not is_automatic({"text": WB}), "workbench staff message = human")
+check(not is_automatic({"text": RESUME_NOTICE + WB}), "resumed workbench staff message = human")
+check(is_automatic({"text": "[relay from:axl-consulting branch:766]\n[시험 자리] [작업대 대화] 1 정산서 검수 — 시험"}), "workbench test seat = automatic")
+check(is_automatic({"text": "[relay from:axl-consulting branch:766]\n(Sean 시험) [작업대 대화] 1 정산서 검수 — 대신 보기"}), "workbench proxy view = automatic")
+check(is_automatic({"text": "[relay from:axl-consulting branch:766]\n[작업대 확인] 1 정산서 검수 · 역할: 실무자 — eta 지남"}), "workbench wake-up = automatic")
+check(is_automatic({"text": "[relay from:axl-consulting branch:766]\n[작업 중지] 1 정산서 검수 — 김현정"}), "workbench stop = automatic")
+check(is_automatic({"text": "[relay from:coo]\n팀장 지시 — 작업대 글 「[작업대 대화] …」 를 참고"}), "other relay mentioning the head mid-body = automatic")
+check(is_automatic({"text": "[heartbeat] [작업대 대화] x"}), "heartbeat with the head = automatic")
 
 # 6. Worker 통합 스모크 — 실제 Worker 가 디스패처로 턴을 돌리는지 (네트워크 호출은 전부 막는다)
 print("\n[worker smoke]")
