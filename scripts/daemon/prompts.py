@@ -131,7 +131,7 @@ def build_agent_roster() -> str:
             pid = b.get("project_id", "")
             owner = names.get(pid, pid)
             branch_lines.append(
-                f"- `branch:{b['id']}` — #{b.get('branch_number')} {b.get('title', '')} ({owner} 브랜치)"
+                f"- #{b.get('branch_number') or b['id']} {b.get('title', '')} ({owner}) · `branch:{b['id']}`"
             )
 
         if not proj_lines and not branch_lines:
@@ -146,7 +146,8 @@ def build_agent_roster() -> str:
         if branch_lines:
             tail = (f"\n- (그 외 활성 브랜치 {dropped}개는 최근 사용순에서 밀려 생략 — "
                     f"`GET $API_URL/api/branches?project_id=프로젝트ID` 로 확인)") if dropped else ""
-            parts.append("### 활성 브랜치 (최근 사용순) — 릴레이 `to_branch_id`(숫자), 핸드오프 `[[voice/handoff:branch:숫자:용건]]`\n"
+            parts.append("### 활성 브랜치 (최근 사용순) — #번호 = 사이드바 번호 = 릴레이 `to_branch_id` = `branch:번호` (2026-11-16 통일). "
+                         "유저에게는 「#번호 제목」으로 부른다. 핸드오프 `[[voice/handoff:branch:번호:용건]]`\n"
                          + "\n".join(branch_lines) + tail)
         text = "\n".join(parts)
         _roster_cache["text"] = text

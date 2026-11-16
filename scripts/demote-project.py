@@ -288,7 +288,7 @@ def main():
                 {"parent_project_id": parent_id, "parent_branch_id": a.parent_branch, "title": a.title})
         br = r["branch"]
         bkey = f"branch:{br['id']}"
-        log(f"  ✅ DB: 브랜치 #{br['branch_number']} (내부ID {br['id']}) 생성 · 대화 {r['moved_messages']}건 이전 · 하위 {len(r['moved_branches'])}개")
+        log(f"  ✅ DB: 브랜치 #{br['branch_number']} 생성 · 대화 {r['moved_messages']}건 이전 · 하위 {len(r['moved_branches'])}개")
         for w in r.get("warnings", []):
             log(f"  ⚠️ {w}")
         if r["folder_move"]["to"] != new_dir:

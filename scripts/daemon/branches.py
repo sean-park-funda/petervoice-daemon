@@ -274,7 +274,7 @@ def build_branch_prompt(branch: dict) -> str:
         branch_prompt = "\n\n".join(inherited_parts + ([branch.get("prompt")] if branch.get("prompt") else []))
         path_parts = [project_id] + [f"#{a.get('branch_number')} {a.get('title','')}" for a in ancestors] + [f"#{branch_num} {branch.get('title','')}"]
         parent_line = (
-            f"부모 브랜치: #{ancestors[-1].get('branch_number')} {ancestors[-1].get('title','')} (내부ID: {ancestors[-1].get('id')}, 릴레이 to_branch_id)\n"
+            f"부모 브랜치: #{ancestors[-1].get('branch_number')} {ancestors[-1].get('title','')} (릴레이 to_branch_id 도 이 번호)\n"
             if ancestors else ""
         )
         folder_line = ""

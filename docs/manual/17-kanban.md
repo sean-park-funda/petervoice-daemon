@@ -35,7 +35,8 @@
 branches
 ├── id (PK, SERIAL)
 ├── user_id, project_id              -- 소속 프로젝트
-├── branch_number                    -- 프로젝트 내 자동증가 번호
+├── branch_number                    -- = id (2026-11-16 통일 — 사이드바 #N·릴레이 to_branch_id 와 같은 수)
+├── legacy_branch_number             -- 통일 전 프로젝트 내 순번 (옛 /?project=X&branch=N 링크 호환, 새 브랜치는 NULL)
 ├── title, description               -- 작업 제목/설명
 ├── session_id                       -- Claude Code 세션 ID
 ├── session_started_at               -- 세션 시작 시각
@@ -46,6 +47,17 @@ branches
 ├── created_at, updated_at
 └── UNIQUE (user_id, project_id, branch_number)
 ```
+
+### 브랜치 번호는 하나다 (2026-11-16 통일)
+
+사이드바의 `#N` = 내부 `id` = 릴레이 `to_branch_id` = 세션 키 `branch:N` 의 N. 그전에는 프로젝트 안 순번(#1, #2…)이었고
+담당들은 내부 id(946, 1084…)로 서로를 불러 유저가 누가 누군지 구분하지 못했다(30일 봇 메시지 1,771건). 합쳐서 번호 하나로 만들었다.
+- 새 브랜치는 DB 트리거 `branches_number_is_id` 가 INSERT 때 번호를 id 로 맞춘다(웹은 임시 음수만 넣는다).
+- 옛 번호는 `legacy_branch_number` 에 남아 통일 전 링크 `/?project=X&branch=<옛 번호>` 도 계속 열린다. 화면은 지금 번호를 먼저,
+  없으면 옛 번호로 풀고, 통일 전에 쓰인 메시지 안의 링크는 옛 번호를 먼저 본다(옛 번호와 다른 브랜치의 새 번호가 겹치는 쌍이 있다).
+  칸반 meta(`owner_link`·`decision.link`)와 프롬프트 본문의 링크는 마이그레이션 때 새 번호로 고쳐 썼다.
+- 유저에게 담당을 말할 때는 숫자만 쓰지 말고 **「#번호 제목」**(예: #959 숨고 판매팀)으로 부른다 — 유저는 그 번호로 사이드바에서 검색한다.
+- 마이그레이션: `supabase/migrations/20261116083000_branch_number_is_id.sql`(박스는 psql 직접 적용). 기록: `docs/plans/2026-11-16-branch-number-unification.md`.
 
 ### 브랜치 만드는 4가지 방법
 
@@ -180,7 +192,7 @@ Layer 4: 브랜치/카드 규칙        ← 브랜치 작업 규칙 (아래 참�
 
 ### 브랜치 전용 작업 폴더 (2026-10-29~)
 
-- **새 브랜치는 자기 폴더에서 시작한다.** 새 데몬이 브랜치의 **첫 세션** 때 `<부모 폴더>/branches/<내부ID>-<영문이름>` 을 배정하고
+- **새 브랜치는 자기 폴더에서 시작한다.** 새 데몬이 브랜치의 **첫 세션** 때 `<부모 폴더>/branches/<브랜치 번호>-<영문이름>` 을 배정하고
   `branches.directory` 에 기록한다(`daemon/branches.py ensure_branch_folder`). 하위 브랜치는 부모 브랜치 폴더 안 → 폴더 = 계층.
   영문이름은 제목 로마자(`네이버 클립 제작` → `neibeo-keulrip-jejak`), 제목이 바뀌어도 폴더는 그대로.
 - 대상: 2026-10-29 이후 만들어지고 세션이 한 번도 없던 브랜치. **이미 부모 폴더에서 일하던 브랜치는 그대로**(파일이 거기 있다).
@@ -196,7 +208,7 @@ Layer 4: 브랜치/카드 규칙        ← 브랜치 작업 규칙 (아래 참�
 | 방향 | 도구 | 비고 |
 |---|---|---|
 | 브랜치 → 프로젝트 (승격) | `python3 scripts/promote-branch.py <브랜치ID> <새_프로젝트ID>` | API `POST /api/branches/[id]/promote` |
-| 프로젝트 → 브랜치 (넣기) | `python3 scripts/demote-project.py <프로젝트ID> <부모_프로젝트ID> [--parent-branch <내부ID>] --dry-run` 먼저 | API `POST /api/projects/[id]/demote` — **직접 부르지 말 것** |
+| 프로젝트 → 브랜치 (넣기) | `python3 scripts/demote-project.py <프로젝트ID> <부모_프로젝트ID> [--parent-branch <브랜치 번호>] --dry-run` 먼저 | API `POST /api/projects/[id]/demote` — **직접 부르지 말 것** |
 
 **넣기(demote, 2026-10-29 지원#84)** — 프로젝트가 도는 맥에서, 그 맥의 유저로 실행한다.
 - 대화는 복사하지 않고 소속만 바꾼다(`messages.project` → `branch:<새id>`). 원래 프로젝트의 브랜치는 새 브랜치의 하위로 따라온다.
@@ -208,7 +220,7 @@ Layer 4: 브랜치/카드 규칙        ← 브랜치 작업 규칙 (아래 참�
 - 세션 키는 데몬을 `launchctl bootout` 으로 내린 채 옮기고 `bootstrap` 으로 올린다(돌아가는 데몬은 sessions.json 을 덮어쓴다). 데몬이 응답 중이면 최대 3분 기다린다.
 - 팀 지식 그래프는 부모 폴더에서 하위 `branches/` 까지 포함해 만든다. 부모 그래프가 있으면 브랜치 프롬프트가 그쪽 조회를 안내한다.
 - 문서탭·채팅 미디어는 `branches.directory` 가 있으면 그 폴더의 `docs/` 를 연다(포탈 토큰이 `branch:<id>` 키로 내려준다).
-- 옛 프로젝트 ID 를 릴레이 대상으로 적어 둔 다른 담당 프롬프트는 자동으로 안 바뀐다 — `to_project: 부모, to_branch_id: 새id` 로 고쳐야 한다.
+- 옛 프로젝트 ID 를 릴레이 대상으로 적어 둔 다른 담당 프롬프트는 자동으로 안 바뀐다 — `to_project: 부모, to_branch_id: 새 번호` 로 고쳐야 한다.
 
 ---
 
@@ -530,7 +542,7 @@ curl -s -X POST "$API_URL/api/kanban" -H "X-Api-Key: $API_KEY" -H "Content-Type:
   "description": "<배경 2~4줄. 왜 지금 결정이 필요한지, 각 선택지의 결과>",
   "meta": { "decision": {
     "question": "<질문 한 줄>", "options": ["A …", "B …"], "default": "B …", "default_after": "YYYY-MM-DD",
-    "session": "branch:<내 내부 id> 또는 <프로젝트ID>", "link": "/?project=<프로젝트ID>&branch=<N>" } } }'
+    "session": "branch:<내 브랜치 번호> 또는 <프로젝트ID>", "link": "/?project=<프로젝트ID>&branch=<같은 번호>" } } }'
 ```
 - `options` 1~6개, `default` 는 선택지 중 하나(없어도 됨), `default_after` 는 기본값이 있을 때만. `session` 은 답을 받을 내 세션.
 - **같은 질문은 한 장만**: 제목이 같은 열린 카드가 있으면 API 가 그 카드를 돌려준다(`existing: true`). 담당(세션)당 열린 결정 카드 **3장까지**(429 `decision_cap`). 일이 막히는 결정만 올린다.

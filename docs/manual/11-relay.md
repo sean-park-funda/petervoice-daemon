@@ -108,6 +108,7 @@ curl -s -X POST "$API_URL/api/relay/message" \
 ### 브랜치→프로젝트/브랜치 릴레이
 
 브랜치 에이전트도 릴레이를 보낼 수 있다. `from_branch_id`와 `to_branch_id` 파라미터로 브랜치 간 직접 통신 가능.
+브랜치 번호는 사이드바의 `#N` 과 같다(2026-11-16 통일 — 내부 id 와 프로젝트 내 순번의 구분이 없어졌다, 매뉴얼 17장).
 
 ```
 POST /api/relay/message
