@@ -81,6 +81,24 @@ check(pol4.in_boot_grace(), "in boot grace at t=0")
 clk.t = 901
 check(not pol4.in_boot_grace(), "out of boot grace at t=901")
 
+# ── 1b. 복구(repair) 판단 — 실행 파일이 없으면 턴 유무·6h 백오프와 무관하게, 부팅 완충과 30분 간격만 (2026-11-17) ──
+print("\n[CliUpdatePolicy.decide_repair]")
+clk5 = Clock(0.0)
+pol5 = CliUpdatePolicy(boot_grace_sec=900, retry_sec=6 * 3600, repair_retry_sec=1800, clock=clk5)
+check(pol5.decide_repair() == (False, "boot grace"), "t=0: repair waits for boot grace")
+clk5.t = 901
+pol5.note_failure("2.1.326")                      # 같은 버전 설치가 방금 실패했어도
+check(pol5.decide_repair() == (True, ""), "after boot grace: repair goes even though the version failed earlier")
+pol5.note_repair_attempt()
+ok, why = pol5.decide_repair()
+check(not ok and why.startswith("repair tried"), f"right after an attempt: deferred ({why})")
+clk5.t = 901 + 1799
+check(not pol5.decide_repair()[0], "29m59s later: still deferred")
+clk5.t = 901 + 1800
+check(pol5.decide_repair()[0], "30m later: retried")
+pol5.note_repair_attempt(); pol5.note_success()
+check(pol5.decide_repair()[0], "note_success clears the repair back-off")
+
 # ── 2. 두 벌 플랫폼 패키지 감지 ──
 print("\n[stray platform packages]")
 up = AutoUpdater()
@@ -97,6 +115,39 @@ with tempfile.TemporaryDirectory() as tmp:
           "every top-level claude-code-* sibling listed")
     check(up._stray_platform_packages({}, root=os.path.join(tmp, "nope")) == [], "missing root → none, no exception")
 check(up._stray_platform_packages({}, root="") == [], "empty root → none")
+
+# ── 2b. 실행 파일 없음 판별 · 죽은 npm 찌꺼기 정리 · 설치 타임아웃 처리 (2026-11-17) ──
+print("\n[missing binary / leftovers / install timeout]")
+with tempfile.TemporaryDirectory() as td:
+    empty_env = {"PATH": td}
+    check(up._claude_version(empty_env) == "", "claude missing → _claude_version returns '' (no exception)")
+    check(up._claude_present(empty_env) is None, "claude missing → _claude_present None")
+    fake = Path(td) / "claude"
+    fake.write_text("#!/bin/sh\necho \"9.9.9 (Claude Code)\"\n"); fake.chmod(0o755)
+    check(up._claude_present(empty_env) == str(fake), "executable on PATH → _claude_present finds it")
+    check(up._claude_version(empty_env) == "9.9.9", "fake claude --version parsed")
+    root = Path(td) / "node_modules"
+    scope = root / "@anthropic-ai"
+    for n in (".claude-code-2DTsDk1V", ".claude-code-abc", "claude-code", "claude-code-darwin-arm64"):
+        (scope / n).mkdir(parents=True)
+    gone = up._remove_retired_leftovers(str(root))
+    check(gone == [".claude-code-2DTsDk1V", ".claude-code-abc"], f"retired dot-dirs removed: {gone}")
+    check(sorted(os.listdir(scope)) == ["claude-code", "claude-code-darwin-arm64"], "live package dirs untouched")
+    check(up._remove_retired_leftovers("") == [] and up._remove_retired_leftovers(str(Path(td) / "nope")) == [], "no root / no scope → nothing")
+
+import subprocess as _sp
+import daemon.globals as _g
+_real_run = _sp.run
+def _timeout_run(cmd, **kw):
+    raise _sp.TimeoutExpired(cmd, kw.get("timeout"))
+_sp.run = _timeout_run
+try:
+    ok, why = up._npm_install_claude({"PATH": "/nonexistent"}, "2.1.326")
+finally:
+    _sp.run = _real_run
+check(not ok and "timed out" in why, f"npm install timeout → (False, …timed out…): {why[:60]}")
+check(_g.cli_install_inflight is False, "cli_install_inflight reset after timeout")
+check(up._install_timeout() >= 300, f"install timeout floor 300s (got {up._install_timeout()})")
 
 # ── 3. 실행 파일 공백 재시도 ──
 print("\n[popen_retry_missing_binary]")
@@ -147,6 +198,36 @@ try:
 except FileNotFoundError:
     check(True, f"raised after deadline ({n[0]} attempts over {clk.t}s)")
 check(n[0] == 5, f"attempts bounded by retry_sec/interval (+1): {n[0]}")
+
+# 설치 중(extend_while True)에는 기한을 max_sec 까지 늘린다 (2026-11-17)
+clk_e = Clock(0.0)
+busy_until = [20.0]
+calls_e = [0]
+def popen_until_20(c):
+    calls_e[0] += 1
+    if clk_e.t < 20.0:
+        raise FileNotFoundError(2, "No such file or directory", c[0])
+    return {"ok": clk_e.t}
+def sleep_e(sec):
+    clk_e.t += sec
+res = popen_retry_missing_binary(popen_until_20, ["claude"], retry_sec=6, interval=3, max_sec=60,
+                                 extend_while=lambda: clk_e.t < busy_until[0], sleep=sleep_e, clock=clk_e, log=log)
+check(res == {"ok": 21.0}, f"kept waiting past 6s while the install ran, succeeded at t={res}")
+check(any("install in progress" in w for w in log.warned), "logged the extension once")
+clk_e.t = 0.0
+try:
+    popen_retry_missing_binary(lambda c: (_ for _ in ()).throw(FileNotFoundError(2, "x", c[0])), ["claude"], retry_sec=6, interval=3,
+                               max_sec=30, extend_while=lambda: True, sleep=sleep_e, clock=clk_e)
+    check(False, "should have raised at max_sec")
+except FileNotFoundError:
+    check(30.0 <= clk_e.t <= 33.0, f"install never finished → raised at max_sec ({clk_e.t}s)")
+clk_e.t = 0.0
+try:
+    popen_retry_missing_binary(lambda c: (_ for _ in ()).throw(FileNotFoundError(2, "x", c[0])), ["claude"], retry_sec=6, interval=3,
+                               max_sec=60, extend_while=lambda: False, sleep=sleep_e, clock=clk_e)
+    check(False, "should have raised at retry_sec")
+except FileNotFoundError:
+    check(6.0 <= clk_e.t <= 9.0, f"no install running → raised at retry_sec ({clk_e.t}s)")
 
 n[0] = 0
 try:

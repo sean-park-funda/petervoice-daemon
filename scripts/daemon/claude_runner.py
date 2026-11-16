@@ -460,6 +460,9 @@ def run_claude(
             ),
             cmd, resolve=g._find_claude_cmd, retry_sec=config.get("claude_spawn_retry_sec", 120),
             log=logger, should_stop=shutdown_event.is_set,
+            # 업데이터가 CLI 를 설치·복구하는 중이면 설치가 끝날 때까지 더 기다린다 — 고객 맥에서 3~5분 (2026-11-17)
+            extend_while=lambda: getattr(g, "cli_install_inflight", False),
+            max_sec=int(config.get("cli_install_timeout_sec", 900) or 900) + 60,
         )
 
         # ── 멈춤 감지 폴러 (2초 간격, 별도 스레드 — 스트리밍 루프를 API 지연으로 막지 않기 위함) ──

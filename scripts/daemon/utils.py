@@ -11,7 +11,8 @@ from daemon.globals import DOWNLOADS_DIR, logger
 
 def popen_retry_missing_binary(popen, cmd: list, *, resolve=None, retry_sec: float = 120.0,
                                interval: float = 3.0, log=None, should_stop=None,
-                               sleep=time.sleep, clock=time.monotonic):
+                               sleep=time.sleep, clock=time.monotonic,
+                               extend_while=None, max_sec: float | None = None):
     """Popen 인데 실행 파일이 잠깐 없을 때(FileNotFoundError) 기다렸다 다시 시도한다.
 
     배경(2026-11-16): 업데이터가 `npm install -g @anthropic-ai/claude-code@…` 를 돌리는 동안 npm 이 옛 패키지
@@ -20,15 +21,32 @@ def popen_retry_missing_binary(popen, cmd: list, *, resolve=None, retry_sec: flo
     (11/10~11/15 Sean 맥 16건 — 설치가 매 5분 실패·롤백을 반복하며 공백을 만들었다).
     popen(cmd) 는 subprocess.Popen 을 감싼 호출자. resolve() 가 있으면 재시도마다 실행 파일 경로를 다시 찾아
     cmd[0] 을 바꾼다(심링크가 다른 곳에 다시 생기는 경우). 기한이 지나면 마지막 예외를 그대로 올린다.
+    extend_while() 이 True 인 동안(업데이터가 CLI 를 설치·복구하는 중, globals.cli_install_inflight)에는 기한을
+    max_sec 까지 늘린다 — 고객 맥에서 설치가 3~5분 걸려 120초 재시도로는 모자랐다(2026-11-17).
     """
     cmd = list(cmd)
-    deadline = clock() + max(0.0, float(retry_sec or 0))
-    warned = False
+    start = clock()
+    base = max(0.0, float(retry_sec or 0))
+    deadline = start + base
+    hard = start + max(base, float(max_sec or 0))
+    warned = extended = False
     while True:
         try:
             return popen(cmd)
         except FileNotFoundError as e:
-            if clock() >= deadline or (should_stop and should_stop()):
+            now = clock()
+            if now >= deadline and extend_while is not None and now < hard:
+                try:
+                    busy = bool(extend_while())
+                except Exception:
+                    busy = False
+                if busy:
+                    deadline = min(hard, now + interval + 0.001)   # 설치가 도는 동안은 계속 기다린다
+                    if not extended and log:
+                        log.warning(f"[spawn] {cmd[0]} still missing after {base:.0f}s — CLI install in progress, "
+                                    f"waiting up to {hard - start:.0f}s")
+                        extended = True
+            if now >= deadline or (should_stop and should_stop()):
                 raise
             if not warned and log:
                 log.warning(f"[spawn] {cmd[0]} missing ({e}) — updater reinstalling? retrying up to {retry_sec:.0f}s")

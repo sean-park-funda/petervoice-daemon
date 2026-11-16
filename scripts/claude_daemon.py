@@ -1140,6 +1140,13 @@ def main():
             logger.warning(f"Drain window elapsed with {_remaining} turn(s) still running — exiting; queued messages will auto-resume")
         elif _inflight:
             logger.info("Drain complete — all in-flight turns finished")
+        # 업데이터가 CLI 를 npm 으로 교체하는 중이면 끝날 때까지 기다린다 — 설치 중 프로세스가 죽으면 실행 파일이
+        # 없는 채로 남아 다음 턴부터 전부 Errno 2 다 (2026-11-17 고객 맥 3곳 30시간 정지의 원인)
+        if getattr(g, "cli_install_inflight", False):
+            _cli_deadline = _time.time() + int(config.get("cli_install_timeout_sec", 900) or 900) + 30
+            logger.info("Waiting for the in-progress CLI install (npm) to finish before exit...")
+            while getattr(g, "cli_install_inflight", False) and _time.time() < _cli_deadline:
+                _time.sleep(1)
         worker.join(timeout=5)
 
     except KeyboardInterrupt:

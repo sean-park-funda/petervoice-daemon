@@ -197,6 +197,8 @@ claude_inflight_lock = threading.Lock()
 # 엔진 무관 '지금 도는 턴' 수 (worker 가 올리고 내린다) — 업데이터가 CLI 교체 시점(턴 없을 때)을 고르는 데 쓴다 (2026-11-16)
 turns_inflight: int = 0
 turns_inflight_lock = threading.Lock()
+# 업데이터가 CLI 를 npm 으로 교체하는 동안 True — 종료 드레인이 이걸 보고 기다린다(설치 중 죽으면 실행 파일이 없는 채로 남는다, 2026-11-17)
+cli_install_inflight: bool = False
 last_claude_ok: float = 0.0   # 마지막으로 claude 가 정상 완료한 시각(토큰 신선도 추정)
 project_locks: dict = {}
 project_locks_lock = threading.Lock()

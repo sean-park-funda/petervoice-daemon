@@ -21,6 +21,9 @@ def _find_repo_dir():
     return None
 
 
+NPM_INSTALL_TIMEOUT_DEFAULT = 900   # npm install -g 상한(초) — config cli_install_timeout_sec
+
+
 class CliUpdatePolicy:
     """CLI(claude·codex) npm 교체를 '언제' 할지 — 순수 판단만 (시험: scripts/test_auto_updater_policy.py).
 
@@ -35,22 +38,40 @@ class CliUpdatePolicy:
     - 턴이 도는 중(inflight > 0)에는 미룬다. 새 버전을 처음 본 뒤 max_defer_sec(기본 6시간)가 지나면 그래도 한다
       (바쁜 기계에서 영영 안 올라가는 일은 없게).
     - 설치가 실패한 버전은 retry_sec(기본 6시간) 동안 다시 시도하지 않는다. 다른 버전이 나오면 바로 다시 본다.
+    - **복구(repair)는 다른 규칙이다(2026-11-17).** 실행 파일이 아예 없거나 돌지 않는 것은 '업데이트'가 아니라 장애다 —
+      턴 유무·6시간 백오프를 기다리지 않고, 부팅 완충과 repair_retry_sec(기본 30분)만 지킨다.
+      배경: 11/15~16 고객 맥 3곳에서 `npm install -g` 가 우리 180초 타임아웃에 죽어(138MB 플랫폼 바이너리 내려받기가
+      3~5분) 실행 파일이 사라졌는데, 업데이터는 `claude --version` 실패를 '건너뜀'으로 처리해 30시간 넘게 아무도 다시 깔지 않았다.
     """
 
     def __init__(self, boot_grace_sec: float = 900, max_defer_sec: float = 6 * 3600,
-                 retry_sec: float = 6 * 3600, clock=time.monotonic):
+                 retry_sec: float = 6 * 3600, clock=time.monotonic, repair_retry_sec: float = 1800):
         self._clock = clock
         self.boot_grace_sec = max(0.0, float(boot_grace_sec or 0))
         self.max_defer_sec = max(0.0, float(max_defer_sec or 0))
         self.retry_sec = max(0.0, float(retry_sec or 0))
+        self.repair_retry_sec = max(0.0, float(repair_retry_sec or 0))
         self._started_at = clock()
         self._pending_version: str | None = None
         self._pending_since: float = 0.0
         self._fail: dict | None = None
         self._logged: tuple | None = None   # (version, reason) — 같은 미룸 사유는 한 번만 INFO 로 남긴다
+        self._repair_at: float | None = None
 
     def in_boot_grace(self) -> bool:
         return self._clock() - self._started_at < self.boot_grace_sec
+
+    def decide_repair(self) -> tuple[bool, str]:
+        """실행 파일이 없거나 돌지 않을 때 지금 복구 설치를 할지 — 장애이므로 턴 유무·실패 백오프는 보지 않는다."""
+        now = self._clock()
+        if self.in_boot_grace():
+            return False, "boot grace"
+        if self._repair_at is not None and now - self._repair_at < self.repair_retry_sec:
+            return False, f"repair tried {int((now - self._repair_at) // 60)}m ago"
+        return True, ""
+
+    def note_repair_attempt(self):
+        self._repair_at = self._clock()
 
     def decide(self, latest: str, inflight: int) -> tuple[bool, str]:
         """(지금 설치해도 되나, 미루는 이유). 이유는 로그용."""
@@ -71,6 +92,7 @@ class CliUpdatePolicy:
     def note_success(self):
         self._fail = None
         self._pending_version, self._pending_since = None, 0.0
+        self._repair_at = None
 
     def should_log_defer(self, version: str, reason: str) -> bool:
         key = (version, reason.split(" ")[-1] if "in flight" in reason else reason)
@@ -94,7 +116,9 @@ class AutoUpdater(threading.Thread):
             boot_grace_sec=config.get("cli_update_boot_grace_sec", 900),
             max_defer_sec=config.get("cli_update_max_defer_sec", 6 * 3600),
             retry_sec=config.get("cli_update_retry_sec", 6 * 3600),
+            repair_retry_sec=config.get("cli_repair_retry_sec", 1800),
         )
+        self._claude_broken_seen = 0   # `claude --version` 연속 실패 수 (복구 판단)
         self._claude_policy = CliUpdatePolicy(**_policy_kw)
         self._codex_policy = CliUpdatePolicy(**_policy_kw)
 
@@ -354,29 +378,144 @@ class AutoUpdater(threading.Thread):
             logger.warning(f"[updater] stray platform package check failed: {e}")
             return []
 
+    def _npm_root(self, _env: dict) -> str:
+        try:
+            r = subprocess.run(["npm", "root", "-g"], capture_output=True, text=True, timeout=20, env=_env)
+            return r.stdout.strip() if r.returncode == 0 else ""
+        except Exception:
+            return ""
+
     def _remove_stray_platform_packages(self, _env: dict) -> list[str]:
         stray = self._stray_platform_packages(_env)
+        root = self._npm_root(_env) if stray else ""
         for name in stray:
             logger.info(f"[updater] removing stray top-level @anthropic-ai/{name} (install.cjs rejects two copies)")
             subprocess.run(["npm", "rm", "-g", f"@anthropic-ai/{name}"],
                            capture_output=True, text=True, timeout=120, env=_env)
+            # package.json 이 없는 깨진 사본(죽은 npm 이 남긴 것)은 npm rm 이 못 지운다 — 직접 지운다
+            left = os.path.join(root, "@anthropic-ai", name) if root else ""
+            if left and os.path.isdir(left):
+                import shutil
+                shutil.rmtree(left, ignore_errors=True)
         return stray
 
+    def _remove_retired_leftovers(self, root: str) -> list[str]:
+        """npm 이 교체 중 죽으면 옛 패키지를 `.claude-code-XXXX` 로 돌려놓은 채 남긴다(각 300MB+). 복구 설치 전에 치운다."""
+        scope = os.path.join(root, "@anthropic-ai") if root else ""
+        if not scope or not os.path.isdir(scope):
+            return []
+        import shutil
+        gone = []
+        for n in sorted(os.listdir(scope)):
+            path = os.path.join(scope, n)
+            if n.startswith(".claude-code-") and os.path.isdir(path):
+                shutil.rmtree(path, ignore_errors=True)
+                gone.append(n)
+        if gone:
+            logger.info(f"[updater] removed retired npm leftovers: {gone}")
+        return gone
+
     def _claude_version(self, _env: dict, path: str = "claude") -> str:
-        v = subprocess.run([path, "--version"], capture_output=True, text=True, timeout=10, env=_env)
+        try:
+            v = subprocess.run([path, "--version"], capture_output=True, text=True, timeout=10, env=_env)
+        except FileNotFoundError:
+            return ""
         return v.stdout.strip().split()[0] if v.returncode == 0 and v.stdout.strip() else ""
 
+    @staticmethod
+    def _claude_present(_env: dict) -> str | None:
+        import shutil
+        return shutil.which("claude", path=_env.get("PATH"))
+
+    def _install_timeout(self) -> int:
+        # 11/17 실측: 고객 맥에서 `npm install -g @anthropic-ai/claude-code` 가 3~5분(플랫폼 바이너리 138MB). 180초는 npm 을 죽였다.
+        return max(300, int(config.get("cli_install_timeout_sec", NPM_INSTALL_TIMEOUT_DEFAULT) or NPM_INSTALL_TIMEOUT_DEFAULT))
+
+    def _npm_install_claude(self, _env: dict, latest: str) -> tuple[bool, str]:
+        """`npm install -g @anthropic-ai/claude-code@<latest>` 를 끝까지 기다린다. (성공 여부, 오류 요약).
+        도중에 죽이면(타임아웃·데몬 종료) 실행 파일이 없는 채로 남으므로 상한은 넉넉히, 종료 드레인은 g.cli_install_inflight 를 본다."""
+        import daemon.globals as g
+        timeout = self._install_timeout()
+        g.cli_install_inflight = True
+        try:
+            r = subprocess.run(["npm", "install", "-g", f"@anthropic-ai/claude-code@{latest}", "--no-audit", "--no-fund"],
+                               capture_output=True, text=True, timeout=timeout, env=_env)
+        except subprocess.TimeoutExpired:
+            return False, f"npm install timed out after {timeout}s (killed — the claude binary may be missing until the repair runs)"
+        finally:
+            g.cli_install_inflight = False
+        if r.returncode != 0:
+            err = (r.stderr or "").strip()
+            hint = " (two copies of the platform package — official fix: npm rm -g both, then reinstall)" if "Two copies" in err else ""
+            return False, f"npm error code {r.returncode}: {err[:200]}{hint}"
+        return True, ""
+
+    def _clean_reinstall_claude(self, _env: dict, latest: str) -> str:
+        """공식 처방: 본체·플랫폼 패키지·죽은 npm 의 찌꺼기를 전부 지우고 다시 깐다. 설치된 버전(실행 확인) 또는 ""."""
+        import shutil
+        root = self._npm_root(_env)
+        self._remove_stray_platform_packages(_env)
+        self._remove_retired_leftovers(root)
+        subprocess.run(["npm", "rm", "-g", "@anthropic-ai/claude-code"],
+                       capture_output=True, text=True, timeout=120, env=_env)
+        main_dir = os.path.join(root, "@anthropic-ai", "claude-code") if root else ""
+        if main_dir and os.path.isdir(main_dir):
+            shutil.rmtree(main_dir, ignore_errors=True)
+        ok, why = self._npm_install_claude(_env, latest)
+        if not ok:
+            logger.warning(f"[updater] clean reinstall failed: {why}")
+        new_path = self._claude_present(_env)
+        return self._claude_version(_env, new_path or "claude")
+
+    def _latest_claude_version(self, _env: dict) -> str:
+        r = subprocess.run(["npm", "view", "@anthropic-ai/claude-code", "version"],
+                           capture_output=True, text=True, timeout=15, env=_env)
+        return r.stdout.strip() if r.returncode == 0 else ""
+
+    def _repair_claude_cli(self, _env: dict, reason: str):
+        """실행 파일이 없거나 돌지 않을 때 — 장애 복구. 턴 유무·6h 백오프를 기다리지 않는다 (2026-11-17)."""
+        ok, why = self._claude_policy.decide_repair()
+        if not ok:
+            if self._claude_policy.should_log_defer("repair", why):
+                logger.error(f"[updater] Claude CLI {reason} — repair deferred ({why})")
+            return
+        self._claude_policy.note_repair_attempt()
+        latest = self._latest_claude_version(_env) or "latest"
+        logger.error(f"[updater] Claude CLI {reason} — repairing now with a clean reinstall of @anthropic-ai/claude-code@{latest} "
+                     f"(up to {self._install_timeout()}s; turns fail with Errno 2 until this finishes)")
+        v = self._clean_reinstall_claude(_env, latest)
+        if v:
+            logger.info(f"[updater] Claude CLI repaired: {v}")
+            self._claude_policy.note_success()
+            self._claude_broken_seen = 0
+            new_path = self._claude_present(_env)
+            if new_path:
+                import daemon.globals as g
+                g.CLAUDE_CMD = new_path
+        else:
+            logger.error(f"[updater] Claude CLI still broken after the clean reinstall — next try in "
+                         f"{self._claude_policy.repair_retry_sec / 60:.0f}m; manual fix: "
+                         "npm rm -g @anthropic-ai/claude-code @anthropic-ai/claude-code-darwin-arm64 && "
+                         "npm i -g @anthropic-ai/claude-code")
+
     def _update_claude_cli(self, _env: dict):
-        """Update @anthropic-ai/claude-code to latest — 시점은 CliUpdatePolicy 가 정한다."""
+        """Update @anthropic-ai/claude-code to latest — 시점은 CliUpdatePolicy 가 정한다.
+        실행 파일이 없거나(Errno 2) 돌지 않으면 업데이트가 아니라 복구다 — _repair_claude_cli (2026-11-17)."""
         current = self._claude_version(_env)
         if not current:
+            path = self._claude_present(_env)
+            if path is None:
+                self._claude_broken_seen = 2          # 파일 자체가 없다 — 바로 복구
+                reason = "binary missing (Errno 2)"
+            else:
+                self._claude_broken_seen += 1         # 파일은 있는데 --version 이 실패 — 두 번 연속이면 복구(일시 오류 제외)
+                reason = f"binary at {path} not runnable"
+            if self._claude_broken_seen >= 2:
+                self._repair_claude_cli(_env, reason)
             return
+        self._claude_broken_seen = 0
 
-        r = subprocess.run(
-            ["npm", "view", "@anthropic-ai/claude-code", "version"],
-            capture_output=True, text=True, timeout=15, env=_env,
-        )
-        latest = r.stdout.strip() if r.returncode == 0 else ""
+        latest = self._latest_claude_version(_env)
         if not latest or current == latest:
             self._claude_policy.note_success()
             return
@@ -386,35 +525,26 @@ class AutoUpdater(threading.Thread):
             self._log_defer("Claude CLI", self._claude_policy, latest, why)
             return
 
-        logger.info(f"[updater] Updating Claude CLI: {current} → {latest}")
+        logger.info(f"[updater] Updating Claude CLI: {current} → {latest} (up to {self._install_timeout()}s)")
         # 플랫폼 패키지는 본체의 optionalDependencies 로 따라온다. 전역에 따로 깔지 않는다(두 벌이면 install.cjs 가 거절).
         self._remove_stray_platform_packages(_env)
-        r = subprocess.run(
-            ["npm", "install", "-g", f"@anthropic-ai/claude-code@{latest}"],
-            capture_output=True, text=True, timeout=180, env=_env,
-        )
-        if r.returncode != 0:
+        ok, why = self._npm_install_claude(_env, latest)
+        if not ok:
             self._claude_policy.note_failure(latest)
-            err = r.stderr.strip()
-            hint = " (two copies of the platform package — official fix: npm rm -g both, then reinstall)" \
-                if "Two copies" in err else ""
-            logger.warning(f"[updater] Claude CLI update failed: {err[:200]}{hint} — "
-                           f"next try for {latest} in {self._claude_policy.retry_sec / 3600:.0f}h")
+            logger.warning(f"[updater] Claude CLI update failed: {why} — next try for {latest} in "
+                           f"{self._claude_policy.retry_sec / 3600:.0f}h")
+            if self._claude_present(_env) is None:
+                # 죽은 npm 이 실행 파일을 없앴다 — 다음 점검(5분)에서 복구 경로가 바로 다시 깐다
+                logger.error("[updater] claude binary is missing after the failed update — repair will run on the next check")
             return
 
-        import shutil
-        new_path = shutil.which("claude", path=_env["PATH"])
+        new_path = self._claude_present(_env)
         v = self._claude_version(_env, new_path or "claude")
         if not v:
             # 설치는 됐다는데 실행이 안 됨 — 공식 처방(본체·플랫폼 패키지 둘 다 지우고 재설치)을 한 번만 해 본다
             logger.warning("[updater] Claude CLI binary broken after update — trying the clean reinstall once")
-            self._remove_stray_platform_packages(_env)
-            subprocess.run(["npm", "rm", "-g", "@anthropic-ai/claude-code"],
-                           capture_output=True, text=True, timeout=120, env=_env)
-            subprocess.run(["npm", "install", "-g", f"@anthropic-ai/claude-code@{latest}"],
-                           capture_output=True, text=True, timeout=180, env=_env)
-            new_path = shutil.which("claude", path=_env["PATH"])
-            v = self._claude_version(_env, new_path or "claude")
+            v = self._clean_reinstall_claude(_env, latest)
+            new_path = self._claude_present(_env)
         if v:
             logger.info(f"[updater] Claude CLI updated to {v}")
             self._claude_policy.note_success()
@@ -429,6 +559,9 @@ class AutoUpdater(threading.Thread):
 
     def _update_codex_cli(self, _env: dict):
         """Update @openai/codex to latest, repairing the install if npm left it broken."""
+        import shutil
+        if shutil.which("codex", path=_env.get("PATH")) is None and not self._codex_installed_per_npm(_env):
+            return   # 이 기계엔 codex 가 없다(설치한 적 없음) — 고칠 것도 올릴 것도 없다. 매 5분 Errno 2 경고를 남기지 않는다 (2026-11-17)
         current = self._codex_version(_env)
         if not current:
             # Installed but not runnable: repair instead of giving up here, otherwise
@@ -457,11 +590,21 @@ class AutoUpdater(threading.Thread):
             self._log_defer("Codex CLI", self._codex_policy, latest, why)
             return
 
-        logger.info(f"[updater] Updating Codex CLI: {current} \u2192 {latest}")
-        r = subprocess.run(
-            ["npm", "install", "-g", f"@openai/codex@{latest}"],
-            capture_output=True, text=True, timeout=180, env=_env,
-        )
+        logger.info(f"[updater] Updating Codex CLI: {current} → {latest} (up to {self._install_timeout()}s)")
+        import daemon.globals as g
+        g.cli_install_inflight = True
+        try:
+            r = subprocess.run(
+                ["npm", "install", "-g", f"@openai/codex@{latest}", "--no-audit", "--no-fund"],
+                capture_output=True, text=True, timeout=self._install_timeout(), env=_env,
+            )
+        except subprocess.TimeoutExpired:
+            self._codex_policy.note_failure(latest)
+            logger.warning(f"[updater] Codex CLI update timed out after {self._install_timeout()}s (killed) — "
+                           f"next try for {latest} in {self._codex_policy.retry_sec / 3600:.0f}h")
+            return
+        finally:
+            g.cli_install_inflight = False
         if r.returncode != 0:
             self._codex_policy.note_failure(latest)
             logger.warning(f"[updater] Codex CLI update failed: {r.stderr.strip()[:200]} — "
@@ -475,12 +618,24 @@ class AutoUpdater(threading.Thread):
         else:
             self._codex_policy.note_failure(latest)
 
+    def _codex_installed_per_npm(self, _env: dict) -> bool:
+        """npm 전역 목록에 @openai/codex 가 있나(실행 파일이 없어도 — 죽은 npm 이 남긴 상태)."""
+        try:
+            r = subprocess.run(["npm", "ls", "-g", "--depth=0", "@openai/codex"],
+                               capture_output=True, text=True, timeout=30, env=_env)
+            return "@openai/codex@" in (r.stdout or "")
+        except Exception:
+            return False
+
     def _codex_version(self, _env: dict) -> str:
-        """Installed codex version, or "" when the binary refuses to run."""
-        r = subprocess.run(
-            ["codex", "--version"],
-            capture_output=True, text=True, timeout=10, env=_env,
-        )
+        """Installed codex version, or "" when the binary refuses to run (or is missing)."""
+        try:
+            r = subprocess.run(
+                ["codex", "--version"],
+                capture_output=True, text=True, timeout=10, env=_env,
+            )
+        except FileNotFoundError:
+            return ""
         if r.returncode != 0:
             return ""
         # `codex --version` prints e.g. "codex-cli 0.144.3" \u2014 extract the semver token,
