@@ -544,7 +544,11 @@ curl -s -X POST "$API_URL/api/kanban" -H "X-Api-Key: $API_KEY" -H "Content-Type:
     "question": "<질문 한 줄>", "options": ["A …", "B …"], "default": "B …", "default_after": "YYYY-MM-DD",
     "session": "branch:<내 브랜치 번호> 또는 <프로젝트ID>", "link": "/?project=<프로젝트ID>&branch=<같은 번호>" } } }'
 ```
-- `options` 1~6개, `default` 는 선택지 중 하나(없어도 됨), `default_after` 는 기본값이 있을 때만. `session` 은 답을 받을 내 세션.
+- `options` 1~6개, `default` 는 선택지 중 하나(**필수**), `default_after` 는 YYYY-MM-DD(**필수**). `session` 은 답을 받을 내 세션.
+  **기본값·적용일은 필수다 (2026-11-18, 결정 카드 822 기본값 A)** — 없으면 `POST /api/kanban` 이 400 `decision_default_required` 로 거절한다. 10/26~11/11 실측으로 기본값 없는 카드는 대표가 누르지 않으면 영원히 남았다(열린 24장).
+  고를 수 없으면 선택지에 「보류(지금은 안 함)」를 넣고 그것을 기본값으로, 적용일은 7~14일 뒤. 되돌릴 수 없는 것(과금·삭제·대외 발송)은 기본값을 보류로 둔다.
+  보류로 적용일이 지나면 `docs/` 에 한 줄 남기고 카드를 닫는다(다시 필요해지면 새로 올린다).
+  기본값 없이 열려 있는 옛 카드는 담당이 채운다: `PATCH $API_URL/api/kanban/<id>` body `{"meta":{"decision":{"default":"<선택지 중 하나>","default_after":"YYYY-MM-DD"}}}` — `meta.decision` 은 한 단계 부분 갱신이라 question·options 가 남는다(보류 선택지를 새로 넣으려면 `options` 전체를 함께). 합친 결과가 모양에 맞지 않으면 400.
 - **같은 질문은 한 장만**: 제목이 같은 열린 카드가 있으면 API 가 그 카드를 돌려준다(`existing: true`). 담당(세션)당 열린 결정 카드 **3장까지**(429 `decision_cap`). 일이 막히는 결정만 올린다.
 - 칸반을 끈 프로젝트에서도 결정 카드는 만들어진다.
 - 답이 오면(카드 또는 채팅) 카드를 닫는다: `PATCH $API_URL/api/kanban/<id>/status {"status":"done"}`. `default_after` 가 지났는데 답이 없으면 기본값으로 진행하고 같은 방법으로 닫는다. 유저가 카드에서 「기본값 끄기」를 누르면 `meta.decision.default` 가 비워지므로 계속 기다린다.
