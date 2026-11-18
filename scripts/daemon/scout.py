@@ -30,7 +30,7 @@ from datetime import datetime
 from pathlib import Path
 
 from daemon.globals import config, logger, CLAUDE_CMD, DAEMON_DIR, PROMPTS_DIR, IS_WINDOWS
-from daemon.limits import build_claude_env, seat_config_dir, account_cooldown_notice
+from daemon.limits import build_claude_env, seat_config_dir, account_cooldown_notice, resolve_account_name
 from daemon.supabase import get_project_dir, _fetch_project_settings, _fetch_recent_conversation, fetch_prompt_from_supabase
 from daemon.utils import _strip_ansi
 
@@ -105,16 +105,8 @@ def parse_verdict(text: str) -> tuple[bool | None, str]:
 
 
 def account_for(project: str) -> tuple[str, str | None]:
-    """프로젝트/브랜치가 쓰는 계정 라벨과 CLAUDE_CONFIG_DIR (본 턴과 같은 해석)."""
-    settings_project = project
-    try:
-        if project.startswith("branch:"):
-            from daemon.branches import fetch_branch
-            br = fetch_branch(int(project.split(":")[1])) or {}
-            settings_project = br.get("project_id") or project
-        account = _fetch_project_settings(settings_project).get("account") or "default"
-    except Exception:
-        account = "default"
+    """프로젝트/브랜치가 쓰는 계정 라벨과 CLAUDE_CONFIG_DIR (본 턴과 같은 해석 — limits.resolve_account_name: 브랜치 → 부모 → 루트)."""
+    account = resolve_account_name(project)
     return account, seat_config_dir(account)
 
 

@@ -181,7 +181,7 @@ def ensure_agents_md_ignored(config_dir: str | None = None) -> bool:
 # 세션 키는 계정 라벨이라 자리를 바꿔도 세션이 리셋되지 않고, 자리 폴더의 projects/ 는
 # ~/.claude/projects 로 심링크돼 있어(peter-voice scripts/claude-seat.py prepare) --resume 이 이어진다.
 # 기준 문서: peter-voice docs/plans/2026-10-14-claude-account-seats.md
-_seat_state: dict = {"mtime": None, "seat": None, "seats": {}, "hook": None}
+_seat_state: dict = {"mtime": None, "seat": None, "seats": {}, "hook": None, "accounts": None}
 _seat_lock = threading.Lock()
 _seat_warned: set[str] = set()
 
@@ -201,7 +201,9 @@ def _live_seat_settings() -> tuple[str | None, dict]:
                 seats = data.get("claude_seats") if isinstance(data.get("claude_seats"), dict) else {}
                 if seat != _seat_state["seat"]:
                     logger.info(f"[seat] 계정 자리 {_seat_state['seat'] or '(기본)'} → {seat or '(기본)'}")
-                _seat_state.update(mtime=mtime, seat=seat, seats=seats, hook=data.get("claude_seat_limit_hook") or None)
+                accounts = data.get("accounts") if isinstance(data.get("accounts"), dict) else {}
+                _seat_state.update(mtime=mtime, seat=seat, seats=seats, hook=data.get("claude_seat_limit_hook") or None,
+                                   accounts=accounts)
             except Exception as e:  # noqa: BLE001 — 쓰는 도중의 반쪽 JSON 일 수 있다: 직전 값 유지, 다음 호출에 재시도
                 logger.warning(f"[seat] config.json 읽기 실패 — 직전 자리 유지: {e!r}")
         return _seat_state["seat"], _seat_state["seats"]
@@ -232,9 +234,135 @@ def seat_config_dir(account_name: str | None = "default", config: dict | None = 
     name = account_name or "default"
     if name == "default":
         return None
-    if config is None:
+    accounts = config.get("accounts", {}) if config is not None else _live_accounts()
+    return ((accounts or {}).get(name) or {}).get("config_dir") or None
+
+
+def _live_accounts() -> dict:
+    """config.json 의 accounts 를 mtime 기준으로 다시 읽은 값 (파일을 못 읽으면 시작 때 적재한 config 의 값).
+
+    2026-11-18 카드 823: 팀원 폴더(accounts.<라벨>)를 config.json 에 적으면 재시작 없이 다음 턴부터 그 폴더·정책으로
+    돈다 — 자리(claude_seats)와 같은 mtime 감시를 탄다. 라벨→폴더(seat_config_dir)와 폴더→정책(account_policy)이
+    같은 사본을 읽어야 「안내는 터미널, 엔진은 채팅」 같은 엇갈림이 없다.
+    """
+    _live_seat_settings()
+    accounts = _seat_state.get("accounts")
+    if accounts is None:
         from daemon.globals import config
-    return (config.get("accounts", {}).get(name) or {}).get("config_dir") or None
+        accounts = config.get("accounts") if isinstance(config.get("accounts"), dict) else {}
+    return accounts or {}
+
+
+def _norm_config_dir(d) -> str:
+    """CLAUDE_CONFIG_DIR 비교용 정규화 — relogin._norm_dir 와 같은 규칙 ("" = 기본 ~/.claude)."""
+    return os.path.expanduser(d).rstrip("/") if d else ""
+
+
+# ── 계정별 재로그인 정책 (2026-11-18 카드 823 기본값 A — 팀원 폴더의 로그인은 그 사람 것) ──────────
+# config.json accounts.<라벨> 에 두 칸이 더 생긴다(둘 다 선택, 없으면 지금 동작):
+#   "email":   이 폴더의 주인 계정 — 안내문·대조에 쓴다(값만 적는다, 자격증명 아님)
+#   "relogin": "chat"(기본, 지금 동작) | "terminal"(채팅·설정 재로그인을 띄우지 않고 터미널 안내만)
+# 해석은 폴더(config_dir) 기준 이 함수 하나 — 본 턴·명시 트리거·엔진 가드·대조가 전부 이것을 쓴다.
+# 기본 폴더(~/.claude, config_dir None/"")는 accounts 에 없으므로 정책도 없다(소유자 기본 계정은 그대로 채팅 재로그인).
+# 계획: peter-voice docs/plans/2026-11-11-team-member-folder-terminal-login.md
+def account_policy(config_dir: str | None) -> dict | None:
+    """폴더 → {"label", "config_dir"(절대경로), "email"|None, "relogin": "chat"|"terminal"} 또는 None(해당 라벨 없음)."""
+    want = _norm_config_dir(config_dir)
+    if not want:
+        return None
+    for label, spec in _live_accounts().items():
+        if not isinstance(spec, dict) or not spec.get("config_dir"):
+            continue
+        if _norm_config_dir(spec.get("config_dir")) != want:
+            continue
+        mode = str(spec.get("relogin") or "chat").strip().lower()
+        return {
+            "label": label,
+            "config_dir": want,
+            "email": (str(spec.get("email")).strip() or None) if spec.get("email") else None,
+            "relogin": "terminal" if mode == "terminal" else "chat",
+        }
+    return None
+
+
+def is_terminal_only(config_dir: str | None) -> bool:
+    pol = account_policy(config_dir)
+    return bool(pol and pol.get("relogin") == "terminal")
+
+
+# 폴더 → 마지막으로 경고한 (잘못 들어온) 계정. 같은 조합이면 다시 경고하지 않고, 바뀌면 다시 한다.
+_mismatch_warned: dict[str, str] = {}
+
+
+def account_mismatch_warning(config_dir: str | None, policy: dict | None = None) -> str | None:
+    """정책에 email 이 있으면 그 폴더의 .claude.json 로그인 계정과 대조한다(**파일만**, CLI 호출 없음, mtime 캐시).
+
+    다르면 경고문(폴더·계정 조합당 1회, 바뀌면 다시) — 턴은 그대로 돈다(차단은 Sean 결정, 기본 경고).
+    같거나 못 읽으면 None. 정책이 없는 폴더(고객 기본 계정·자리 폴더)는 늘 None 이라 동작이 그대로다.
+    """
+    pol = policy if policy is not None else account_policy(config_dir)
+    if not pol or not pol.get("email"):
+        return None
+    folder = pol["config_dir"]
+    want = pol["email"]
+    got = claude_account_email(folder)
+    if not got or got.lower() == want.lower():
+        _mismatch_warned.pop(folder, None)
+        return None
+    if _mismatch_warned.get(folder) == got.lower():
+        return None
+    _mismatch_warned[folder] = got.lower()
+    logger.warning(f"[account] 폴더 {folder} 는 {want} 용인데 {got} 가 로그인돼 있음 (라벨 {pol['label']}) — 경고만, 턴은 진행")
+    return (f"⚠️ 이 방은 **{want}** 전용 계정으로 도는데, 지금 그 폴더에는 **{got}** 계정이 로그인돼 있어요. "
+            f"이 방의 대화가 {got} 의 사용량으로 돕니다.\n"
+            f"본인이 이 맥의 터미널에서 `CLAUDE_CONFIG_DIR={folder} claude auth login` 을 실행해 {want} 로 다시 로그인해 주세요.")
+
+
+def resolve_account_name(project: str, branch_data: dict | None = None, proj_settings: dict | None = None,
+                         kanban_card: dict | None = None) -> str:
+    """프로젝트/브랜치/칸반 키 → 계정 라벨. 브랜치 → 부모 브랜치 사슬 → 루트 프로젝트 순으로 **첫 account**, 없으면 "default".
+
+    2026-11-18 카드 823: 팀 고객의 팀원 방은 브랜치라(branches.account, 웹 6a00253) 브랜치 자체 계정을 먼저 본다.
+    자식에 값이 없을 때만 부모를 본다 — 팀원 방 아래 하위 방도 같은 사람 것. 열이 없는 옛 서버/값 없음이면 지금처럼 루트 계정.
+    호출처 5곳(본 턴·재로그인 해석·세션 요약·정찰·칸반)이 전부 이 함수를 쓴다 — 해석이 갈리면 「턴은 A 계정, 요약은 B 계정」이 된다.
+    이미 받아 둔 branch_data / proj_settings / kanban_card 를 넘기면 API 를 다시 부르지 않는다.
+    """
+    try:
+        real = project
+        if project.startswith("branch:"):
+            from daemon.branches import fetch_branch
+            bd = branch_data if branch_data is not None else fetch_branch(int(project.split(":")[1]))
+            real = (bd or {}).get("project_id") or "general"
+            seen: set = set()
+            while isinstance(bd, dict) and len(seen) < 50:
+                acct = str(bd.get("account") or "").strip()
+                if acct:
+                    return acct
+                pid = bd.get("parent_branch_id")
+                if not pid or pid in seen:
+                    break
+                seen.add(pid)
+                bd = fetch_branch(int(pid))
+        elif project.startswith("kanban:"):
+            from daemon.kanban import _fetch_kanban_card
+            kc = kanban_card if kanban_card is not None else _fetch_kanban_card(int(project.split(":")[1]))
+            real = (kc or {}).get("project_id") or "general"
+            sb = (kc or {}).get("scope_branch_id")
+            if sb:
+                # 브랜치 보드의 카드는 그 브랜치 폴더에서 돈다(_kanban_card_dir) — 계정도 그 브랜치 사슬을 따른다
+                acct = resolve_account_name(f"branch:{sb}", proj_settings=proj_settings or {"account": None})
+                if acct != "default":
+                    return acct
+        settings = proj_settings if proj_settings is not None else _fetch_project_settings_lazy(real)
+        return str((settings or {}).get("account") or "default").strip() or "default"
+    except Exception as e:  # noqa: BLE001 — 해석 실패는 지금 동작(기본 계정)으로, 턴을 막지 않는다
+        logger.warning(f"[account] {project}: 계정 해석 실패 — default 로 진행: {e!r}")
+        return "default"
+
+
+def _fetch_project_settings_lazy(project: str) -> dict:
+    from daemon.supabase import _fetch_project_settings
+    return _fetch_project_settings(project) or {}
 
 
 # 자동 교체 (2026-10-14 Sean 사전 승인 「A」): 지금 자리가 한도에 막히면 config.json 의

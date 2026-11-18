@@ -15,7 +15,7 @@ from daemon.globals import (
     config, shutdown_event, logger, PROMPTS_DIR, SECRETS_ENV_PATH,
     DAEMON_DIR, CLAUDE_CMD, IS_WINDOWS,
 )
-from daemon.limits import build_claude_env, seat_config_dir
+from daemon.limits import build_claude_env, seat_config_dir, resolve_account_name
 from daemon.api import api_request
 from daemon.supabase import (
     resolve_user_id, get_project_dir, fetch_prompt_from_supabase,
@@ -308,7 +308,8 @@ def run_kanban_claude(
     cmd.extend(["--", prompt])
 
     # Environment — use account config dir if specified, otherwise default ~/.claude
-    account_name = proj_settings.get("account") or "default"
+    # 브랜치 보드의 카드(scope_branch_id)는 그 브랜치 사슬의 계정, 아니면 루트 프로젝트 계정 (카드 823)
+    account_name = resolve_account_name(f"kanban:{card_id}", proj_settings=proj_settings, kanban_card=card)
     account_config_dir = seat_config_dir(account_name)
 
     claude_env = build_claude_env(config, account_config_dir)

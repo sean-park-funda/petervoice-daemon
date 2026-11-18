@@ -260,8 +260,10 @@ stderr에 "context" 포함 감지
 }
 ```
 - 프로젝트별 `account` 필드 → 해당 계정의 config_dir 사용
+- **브랜치도 `account` 를 가질 수 있다**(2026-11-18, 카드 823): 브랜치 → 부모 브랜치 → 루트 프로젝트 순으로 첫 값. 없으면 지금처럼 루트 계정
 - `CLAUDE_CONFIG_DIR` 환경변수로 Claude CLI에 전달
 - 계정 변경 시 세션 자동 리셋
+- `accounts.<라벨>` 에 `email`(그 폴더의 주인)·`relogin: "terminal"`(채팅 재로그인 대신 터미널 안내만)을 적을 수 있다 — 아래 「팀원 방」 절
 - **자동 비우기(`daemon/autoreset.py`, 2시간 주기)** 임계: 수명 48h · 메시지 500 · 전사 10MB · **문맥 25만 토큰**(2026-10-31 추가 — 전사 꼬리의 마지막
   assistant usage = 입력+캐시 쓰기+캐시 읽기. 파일 크기보다 문맥이 비용을 정한다). 컨텍스트 저장이 3회 연속 실패하면 저장 없이 리셋(좀비 세션).
   config: `session_max_context_tokens`(0=끔) · `session_summary_max_failures`.
@@ -564,6 +566,11 @@ CLAUDE_CONFIG_DIR=~/.claude-account-b/.claude claude
   "accounts": {
     "secondary": {
       "config_dir": "~/.claude-account-b/.claude"
+    },
+    "kim": {
+      "config_dir": "~/.claude-accounts/kim",
+      "email": "kim@example.com",
+      "relogin": "terminal"
     }
   },
 
@@ -571,17 +578,29 @@ CLAUDE_CONFIG_DIR=~/.claude-account-b/.claude claude
 }
 ```
 
-- `"secondary"` — 계정 이름. 웹 UI에서 이 이름으로 표시됨. 원하는 이름 사용 가능
+- `"secondary"` — 계정 이름(라벨). 프로젝트·브랜치의 `account` 값으로 쓴다. 원하는 이름 사용 가능
 - `"config_dir"` — 3단계에서 인증한 폴더 경로
+- `"email"` — (선택) 이 폴더의 주인 계정. 값만 적는다(자격증명 아님). 재로그인 안내문에 「누구 계정으로」를 적고, 턴을 띄울 때 폴더의 로그인 계정과 대조해 다르면 그 방에 경고 1회(턴은 돈다)
+- `"relogin"` — (선택) `"chat"`(기본, 지금 동작) 또는 `"terminal"`: 그 폴더는 채팅·설정 화면 재로그인을 띄우지 않고 「본인이 터미널에서 로그인하세요」 안내만 보낸다. 팀원 폴더용(아래 절)
 - 기본 계정(`~/.claude/`)은 여기에 넣지 않는다 — Claude Code가 알아서 쓰는 경로이므로 추가 계정만 등록
+- 저장하면 **재시작 없이** 다음 턴부터 반영된다(2026-11-18부터 config.json 의 `accounts` 를 mtime 으로 다시 읽는다)
 
-#### 5단계: 웹 UI에서 프로젝트 배정
+#### 5단계: 프로젝트(또는 브랜치)에 계정 라벨 걸기 — API
 
-1. 웹 UI에서 프로젝트 설정 (톱니바퀴) 열기
-2. "계정" 드롭다운에서 `secondary` 선택
-3. 저장
+화면 칸은 없다(2026-11-11 확인 — 설정 모달은 값을 보내기만 하고 「계정 드롭다운」을 그리지 않는다). API 키로 건다:
 
-사용량이 많은 프로젝트를 secondary로 옮기면 된다. 예시:
+```bash
+API_URL=$(python3 -c "import json; c=json.load(open('$HOME/.claude-daemon/config.json')); print(c.get('api_url','https://www.peter-voice.site'))")
+API_KEY=$(python3 -c "import json; print(json.load(open('$HOME/.claude-daemon/config.json'))['api_key'])")
+# 프로젝트
+curl -s -X PATCH "$API_URL/api/projects" -H "X-Api-Key: $API_KEY" -H "Content-Type: application/json" \
+  -d '{"id": "willy", "account": "secondary"}'
+# 브랜치 (2026-11-18부터 — 값이 없으면 부모 브랜치 → 루트 프로젝트 순으로 상속, 빈 문자열 = 상속으로 되돌림)
+curl -s -X PATCH "$API_URL/api/branches/123" -H "X-Api-Key: $API_KEY" -H "Content-Type: application/json" \
+  -d '{"account": "kim"}'
+```
+
+계정이 바뀐 방은 다음 턴에 세션이 한 번 리셋된다(정상 — 이전 대화 요약이 주입된다). 사용량이 많은 프로젝트를 secondary로 옮기면 된다. 예시:
 
 ```
 default 유지:    general (기본), system-admin
@@ -601,9 +620,8 @@ tail -20 ~/.claude-daemon/daemon.log | grep account
 
 ```
 유저가 메시지 전송
-  → 데몬이 해당 프로젝트 설정 조회 (매번 API로 최신값 fetch)
-  → account 값 확인 (null이면 "default")
-  → config.json의 accounts에서 config_dir 조회
+  → 데몬이 계정 라벨을 해석 (브랜치 account → 부모 브랜치 사슬 → 루트 프로젝트 설정, 전부 null이면 "default")
+  → config.json의 accounts에서 config_dir 조회 (mtime 감시 — 재시작 없이 반영)
   → CLAUDE_CONFIG_DIR 환경변수를 설정한 채로 Claude CLI 실행
   → Claude CLI가 해당 폴더의 인증 정보를 사용
 ```
@@ -615,9 +633,24 @@ tail -20 ~/.claude-daemon/daemon.log | grep account
 
 ### 웹 UI
 
-- 프로젝트 설정 모달에 "계정" 드롭다운
+- 계정 라벨 칸은 화면에 없다 — 프로젝트·브랜치 모두 위 5단계의 API 로 건다(수요가 보이면 화면 칸을 함께 만든다)
 - 프로젝트 목록에서 계정이 지정된 프로젝트는 보라색 뱃지 표시
-- 브랜치 생성 시 부모 프로젝트의 계정을 자동 계승
+- 브랜치는 자기 `account` 가 없으면 부모(브랜치 사슬 → 루트 프로젝트)의 계정을 따른다
+
+### 팀원 방 하나 열기 — 「그 폴더의 로그인은 그 사람 것」 (2026-11-18, 결정 카드 823 기본값 A)
+
+팀 고객의 팀원 방은 브랜치다. 팀원마다 **자기 계정 폴더**를 두고, 그 폴더의 로그인은 본인이 터미널에서 한다(채팅 재로그인 링크를 쓰지 않는다 — Claude 약관 준수 판정 ②·§3(d)). 설정이 없는 폴더·고객은 아무것도 바뀌지 않는다.
+
+1. 소유자 맥에서 폴더를 만들고, 팀원이 **그 자리에서 자기 브라우저로** 로그인한다:
+   `mkdir -p ~/.claude-accounts/<이름>` → `CLAUDE_CONFIG_DIR=~/.claude-accounts/<이름> claude auth login`
+2. `config.json` 의 `accounts.<이름>` 에 `config_dir`·`email`·`"relogin": "terminal"` 을 적는다(4단계 예시의 `kim`). 재시작 불필요
+3. 팀원 방(브랜치)에 라벨을 건다: `PATCH /api/branches/{id}` body `{"account": "<이름>"}` (5단계). 그 방의 세션이 1회 리셋된다(정상). 방을 루트 프로젝트로 따로 만들었다면 `PATCH /api/projects` 의 `account`
+4. 팀원은 그 방에서만 말한다. 소유자·다른 담당자는 그 방에 하트비트·릴레이·칸반을 걸지 않는다(안내로 지킨다, 코드 차단 없음)
+5. 약 29일 뒤 로그인이 만료되면 데몬이 그 방에 **터미널 안내문**을 보낸다(링크 없음, 데몬 로그 `[relogin] … terminal-only`). 팀원이 1의 명령을 다시 실행하고 방에 말을 걸면 이어진다. 「로그인」「재로그인」을 입력해도 같은 안내만 온다
+6. 그 폴더에 다른 사람 계정이 로그인돼 있으면(email 과 다름) 턴은 돌되 방에 경고가 1회 온다 — 맞는 계정으로 다시 로그인하면 사라진다
+
+되돌리기: `accounts.<이름>` 의 `relogin` 칸을 지우면 그 폴더는 채팅 재로그인(지금 동작)으로, 브랜치 `account` 를 `""` 로 PATCH 하면 부모 계정으로 돌아간다.
+한계: 팀원 폴더의 로그인 만료일은 사용량 보드(`login_expires_at`)에 안 잡힌다(기본 계정만 잼). 계획서: peter-voice `docs/plans/2026-11-11-team-member-folder-terminal-login.md`.
 
 ### 트러블슈팅
 
@@ -625,7 +658,9 @@ tail -20 ~/.claude-daemon/daemon.log | grep account
 |------|------|------|
 | 계정 전환 후 이전 대화 맥락이 없다 | 정상 — 계정이 바뀌면 세션이 리셋됨 | 이전 대화 요약이 자동 주입되므로 맥락은 유지됨 |
 | "authentication required" 에러 | config_dir 폴더에서 인증을 안 했음 | 3단계 다시 수행: `CLAUDE_CONFIG_DIR=... claude` |
-| 드롭다운에 secondary가 안 보인다 | config.json에 accounts를 안 넣었음 | 4단계 확인 후 데몬 재시작 |
+| 라벨을 걸었는데 기본 계정으로 돈다 | config.json `accounts.<라벨>` 이 없거나 라벨 오타 | 4단계 확인(저장 뒤 다음 턴부터 반영, 재시작 불필요). 로그 `account=<라벨>` 로 확인 |
+| 팀원 방에 재로그인 링크가 안 오고 터미널 안내만 온다 | 정상 — 그 폴더가 `relogin: "terminal"` | 본인이 터미널에서 `CLAUDE_CONFIG_DIR=… claude auth login` |
+| 「다른 계정이 로그인돼 있다」 경고가 방에 온다 | 폴더의 로그인 계정 ≠ `email` | 그 폴더에서 맞는 계정으로 다시 로그인(턴은 그동안도 돈다) |
 | 계정을 바꿨는데 반영이 안 된다 | — | 다음 메시지부터 반영됨 (설정은 매번 fetch) |
 | 두 계정 다 한도가 찼다 | 주간 리셋 대기 | 리셋까지 대기, 또는 3번째 계정 추가 |
 | config_dir 경로에 오타 | 폴더를 못 찾아서 인증 실패 | `ls ~/.claude-account-b/.claude/` 로 폴더 존재 확인 |

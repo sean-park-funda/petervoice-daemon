@@ -64,7 +64,13 @@ def poll_relogin(user_id: int):
         # 채팅이 아닌 DB 로 URL/결과 전달 (on_event) — 기본 계정(계정 자리가 걸려 있으면 그 자리)으로 로그인
         patch_relogin({"relogin_state": "starting", "relogin_url": None})
         from daemon.limits import seat_config_dir
-        relogin.start("general", config_dir=seat_config_dir("default"), on_event=_on_event)
+        res = relogin.start("general", config_dir=seat_config_dir("default"), on_event=_on_event)
+        if res.get("state") == "terminal_only":
+            # 카드 823: 기본 폴더가 터미널 전용으로 설정돼 있으면 엔진이 거절한다 — DB 를 failed 로 닫아 「starting」에 멈추지 않게
+            patch_relogin({"relogin_state": "failed", "relogin_url": None})
+            _starting = False
+            logger.warning("[relogin-settings] refused — default account folder is terminal-only (relogin: terminal)")
+            return
         logger.info("[relogin-settings] engine started (requested->starting)")
         return
 

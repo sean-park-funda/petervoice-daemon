@@ -23,6 +23,7 @@ from daemon.limits import (
     detect_usage_limit, usage_limit_notice,
     start_account_cooldown, clear_account_cooldown, account_cooldown_notice,
     seat_config_dir, active_seat, run_seat_limit_hook,
+    account_policy, account_mismatch_warning, resolve_account_name,
 )
 import daemon.globals as g
 import signal
@@ -126,20 +127,10 @@ def _probe_auth_expired(config_dir: str | None = None) -> bool:
 
 
 def resolve_account_config_dir(project: str) -> str | None:
-    """프로젝트의 account 설정에 해당하는 CLAUDE_CONFIG_DIR 반환 (default 면 None).
-    worker 의 명시적 재로그인 트리거에서 멀티계정을 올바른 config 로 띄우기 위함."""
+    """프로젝트/브랜치/칸반의 계정(브랜치 → 부모 → 루트, limits.resolve_account_name)에 해당하는 CLAUDE_CONFIG_DIR (default 면 None).
+    worker 의 명시적 재로그인 트리거에서 멀티계정을 올바른 config 로 띄우기 위함 — 본 턴과 같은 해석이어야 한다."""
     try:
-        real = project
-        if project.startswith("branch:"):
-            from daemon.branches import fetch_branch
-            bd = fetch_branch(int(project.split(":")[1]))
-            real = bd.get("project_id", "general") if bd else "general"
-        elif project.startswith("kanban:"):
-            from daemon.kanban import _fetch_kanban_card
-            kc = _fetch_kanban_card(int(project.split(":")[1]))
-            real = kc.get("project_id", "general") if kc else "general"
-        settings = _fetch_project_settings(real)
-        cd = seat_config_dir(settings.get("account") or "default")
+        cd = seat_config_dir(resolve_account_name(project))
         return os.path.expanduser(cd) if cd else None
     except Exception:
         return None
@@ -151,6 +142,13 @@ def _trigger_relogin(project: str, config_dir: str | None = None) -> str:
     macOS 전용 — Windows 는 기존 수동 안내 유지."""
     if IS_WINDOWS:
         return "(Claude 인증이 만료되었습니다. 관리자에게 재로그인을 요청해주세요.)"
+    # 카드 823(2026-11-18): 터미널 전용 폴더(팀원 방)는 엔진을 부르지 않고 터미널 안내문만 돌려준다.
+    # 세 호출처(본문 401·stderr·프로브)는 그대로 — 정책 해석은 limits.account_policy 하나.
+    pol = account_policy(config_dir)
+    if pol and pol.get("relogin") == "terminal":
+        logger.warning(f"[relogin] {project}: account {pol['label']} is terminal-only — terminal notice, no chat relogin")
+        from daemon import relogin
+        return relogin.terminal_login_notice(pol)
     try:
         from daemon import relogin
         relogin.start(project, config_dir=config_dir)
@@ -385,7 +383,9 @@ def run_claude(
     bot_name = config.get("bot_name", "bot")
 
     # Resolve account — auto-reset session if account changed (must happen before --resume)
-    account_name = proj_settings.get("account") or "default"
+    # 브랜치 자체 계정 → 부모 브랜치 사슬 → 루트 프로젝트 (2026-11-18 카드 823, 팀원 방은 브랜치)
+    account_name = resolve_account_name(project, branch_data=(branch_data if is_branch else None),
+                                        proj_settings=proj_settings, kanban_card=(kanban_card if is_kanban else None))
     if sid:
         # D9-C: use _sid_key (not hardcoded session_key) for account lookup
         with sessions_lock:
@@ -415,6 +415,15 @@ def run_claude(
     if _cooldown_msg:
         logger.warning(f"[limits] {project}: 계정 한도 쿨다운 중 — 스폰 생략 (account={account_name})")
         return (_cooldown_msg, sid, [], False)
+
+    # 카드 823 ④ 계정 대조(경고만, 2026-11-18): 정책에 email 이 있는 폴더는 .claude.json 의 로그인 계정과 비교해
+    # 다르면 그 방에 1회 알린다(폴더·계정 조합당 1회). 턴은 그대로 돈다 — 차단은 Sean 결정. 정책 없는 폴더는 늘 None.
+    _mismatch = account_mismatch_warning(account_config_dir)
+    if _mismatch:
+        try:
+            api_request(api_key, "POST", "/api/bot/reply", {"text": _mismatch, "project": project, "is_final": True})
+        except Exception as e:  # noqa: BLE001 — 알림 실패가 턴을 막으면 안 된다
+            logger.warning(f"[account] mismatch notice failed for {project}: {e}")
 
     total_usage = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "model": ""}
     _counted = False

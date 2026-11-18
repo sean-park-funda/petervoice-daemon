@@ -175,7 +175,16 @@ class Worker(threading.Thread):
         # (b) 명시적 트리거: "재로그인"/"로그인"/"클로드 로그인" 등 (401 발생 전 선제 갱신용)
         if relogin.is_login_trigger(text):
             from daemon.claude_runner import resolve_account_config_dir
-            relogin.start(project, config_dir=resolve_account_config_dir(project))
+            from daemon.limits import account_policy
+            _cd = resolve_account_config_dir(project)
+            _pol = account_policy(_cd)
+            if _pol and _pol.get("relogin") == "terminal":
+                # 카드 823(2026-11-18): 팀원 폴더(터미널 전용)는 채팅 재로그인을 띄우지 않고 터미널 안내만 — 엔진을 부르지 않는다
+                logger.info(f"[{self.bot_name}] login trigger in terminal-only account {_pol['label']} ({project}) — notice only, no pty")
+                self.reply(relogin.terminal_login_notice(_pol, expired=False), reply_to=[msg_id], project=project)
+                dequeue_message(msg_id)
+                return
+            relogin.start(project, config_dir=_cd)
             self.reply("클로드 로그인을 시작합니다. 잠시 후 안내 링크를 보내드릴게요...", reply_to=[msg_id], project=project)
             dequeue_message(msg_id)
             return

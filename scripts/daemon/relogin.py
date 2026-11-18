@@ -27,6 +27,7 @@ import threading
 import daemon.globals as g
 from daemon.globals import config, logger, CLAUDE_CMD
 from daemon.api import api_request
+from daemon.limits import account_policy
 
 
 # ── 상수 ────────────────────────────────────────────────────────
@@ -64,7 +65,28 @@ def expected_email(config_dir: str = None) -> str | None:
     for spec in (seats or {}).values():
         if isinstance(spec, dict) and spec.get("email") and _norm_dir(spec.get("config_dir")) == want:
             return spec["email"]
-    return None
+    # 자리가 없으면 accounts.<라벨>.email (2026-11-18 카드 823 — 고객 맥의 팀원 폴더에 값이 생긴다. 없으면 None 그대로)
+    pol = account_policy(config_dir)
+    return pol.get("email") if pol else None
+
+
+def terminal_login_notice(policy: dict, expired: bool = True) -> str:
+    """카드 823 ③ — 터미널 전용 폴더(팀원 방)의 로그인 안내. 채팅 재로그인 링크 대신 본인이 터미널에서 로그인하라는 문안.
+
+    `_trigger_relogin`(만료 감지)과 worker 의 명시 트리거(「로그인」 입력)가 같은 문안을 쓴다 — 두 곳이 따로 쓰면 어긋난다.
+    명령은 petervoice-biz compliance §7-4 판정 ② 「로그인 방법」 줄과 같다."""
+    folder = policy.get("config_dir") or os.path.expanduser("~/.claude")
+    email = policy.get("email")
+    who = f"**{email}** 전용 계정으로" if email else "이 방 전용 계정으로"
+    head = ("⚠️ 이 방의 Claude 로그인이 만료되었습니다.\n" if expired
+            else "ℹ️ 이 방의 Claude 로그인은 채팅에서 하지 않습니다.\n")
+    return (
+        head +
+        f"이 방은 {who} 돌기 때문에 채팅 재로그인을 쓰지 않습니다. **본인이** 이 맥의 터미널(또는 화면공유)에서 아래를 실행하고 "
+        "**본인 브라우저**에서 로그인해 주세요.\n"
+        f"`CLAUDE_CONFIG_DIR={folder} claude auth login`\n"
+        "끝나면 이 방에 다시 말을 걸어 주세요. 다른 분 계정으로 로그인하면 이 방의 대화가 그분 사용량으로 돕니다."
+    )
 
 
 def _logged_in_email(config_dir: str = None) -> str | None:
@@ -254,6 +276,12 @@ class ReloginSession:
     def start(self, project: str, config_dir: str = None, on_event=None) -> dict:
         """재로그인 플로우 시작. 이미 진행 중이면 현재 상태를 반환(재안내).
         on_event: 설정 UI 모드용 콜백. 지정 시 URL/결과를 채팅 대신 콜백으로 전달."""
+        # 카드 823 가드(2026-11-18): 터미널 전용 폴더는 어느 경로(본 턴·명시 트리거·설정 화면·앞으로 생길 호출처)로 와도
+        # pty 를 띄우지 않는다. 안내문은 호출처가 보낸다 — 여기서는 거절 사실만 돌려주고 로그 1줄.
+        pol = account_policy(config_dir)
+        if pol and pol.get("relogin") == "terminal":
+            logger.warning(f"[relogin] start refused: {_norm_dir(config_dir)} is terminal-only (account {pol['label']}, project={project})")
+            return {"state": "terminal_only", "label": pol["label"], "started": False}
         with self.lock:
             active = self.state in ("pending_url", "waiting_code", "verifying")
             fresh = time.time() - self.started_at <= SESSION_TTL_SEC

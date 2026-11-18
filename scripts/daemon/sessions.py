@@ -9,7 +9,7 @@ from datetime import datetime
 from pathlib import Path
 
 import daemon.globals as g
-from daemon.limits import build_claude_env, seat_config_dir
+from daemon.limits import build_claude_env, seat_config_dir, resolve_account_name
 from daemon.globals import (
     config, sessions_lock, shutdown_event, logger,
     DAEMON_DIR, SESSIONS_PATH, PENDING_RESETS_PATH, CODEX_SESSIONS_PATH, GEMINI_SESSIONS_PATH,
@@ -207,8 +207,8 @@ def save_session_context(project: str) -> bool:
     sid = sess["session_id"]
     project_dir = get_project_dir(project)
 
-    proj_settings = _fetch_project_settings(project)
-    account_name = proj_settings.get("account") or "default"
+    # 브랜치 → 부모 → 루트 (카드 823). 전엔 "branch:N" 으로 프로젝트 설정을 조회해 브랜치 요약이 늘 기본 계정으로 돌았다
+    account_name = resolve_account_name(project)
     account_config_dir = seat_config_dir(account_name)
 
     # 다음 세션이 요약을 원본과 대조할 수 있도록 이전 세션 대화 파일 경로를 함께 남긴다.
