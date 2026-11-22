@@ -132,6 +132,13 @@ def merge_messages(msgs: list[dict]) -> dict:
     merged["text"] = "\n\n".join(parts)
     merged["merged_ids"] = [m.get("id") for m in msgs]
     merged["merged_count"] = n
+    # 칸별 원본 필드 — 합친 메시지는 첫 칸의 subtype·from_username 을 물려받으므로, 「누가 보낸 글인가」는 여기서 읽는다
+    # (external_notice.turn_parts). 본문은 외부 relay 칸만 남긴다(안내에 넣을 앞부분용).
+    merged["merged_parts"] = [
+        {"id": m.get("id"), "subtype": m.get("subtype"), "from_username": m.get("from_username"),
+         "text": m.get("text") if m.get("subtype") == "external" else None}
+        for m in msgs
+    ]
     return merged
 
 

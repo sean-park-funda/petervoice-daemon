@@ -30,6 +30,8 @@ import daemon.globals as g
 import signal
 import threading
 
+import external_notice  # scripts/ 바로 아래 — 외부 relay 가 고정 문구로 끝났다는 표시 (2026-11-23)
+
 from daemon.utils import _strip_ansi, count_dirty_files, mark_interrupted, popen_retry_missing_binary
 from daemon.api import api_request
 from daemon.supabase import (
@@ -142,6 +144,8 @@ def _trigger_relogin(project: str, config_dir: str | None = None) -> str:
     """인증만료 확정 시 재로그인 플로우를 시작하고, 유저에게 보낼 즉시 안내문을 반환.
     실제 로그인 URL 은 relogin 엔진이 준비되는 대로 채팅에 별도 안내한다.
     macOS 전용 — Windows 는 기존 수동 안내 유지."""
+    # 이 턴은 실제 답 없이 끝난다 — 외부 relay 로 온 글이면 워커가 보낸 쪽에 알린다 (external_notice.py)
+    external_notice.mark_dead_end("auth")
     if IS_WINDOWS:
         return "(Claude 인증이 만료되었습니다. 관리자에게 재로그인을 요청해주세요.)"
     # 카드 823(2026-11-18): 터미널 전용 폴더(팀원 방)는 엔진을 부르지 않고 터미널 안내문만 돌려준다.
@@ -158,6 +162,13 @@ def _trigger_relogin(project: str, config_dir: str | None = None) -> str:
     except Exception as e:
         logger.error(f"[relogin] trigger failed: {e}", exc_info=True)
         return "(Claude 인증이 만료되었습니다. 관리자에게 재로그인을 요청해주세요.)"
+
+
+def _limit_dead_end(limit: dict) -> str:
+    """계정 한도 안내문으로 턴을 끝낼 때 — 실제 답이 없었다는 표시를 남기고 안내문을 돌려준다
+    (자리 교체·모델 폴백으로 다시 돌아 성공한 턴은 여기로 오지 않는다)."""
+    external_notice.mark_dead_end("limited")
+    return usage_limit_notice(limit)
 
 
 def _kanban_card_dir(card: dict | None) -> str | None:
@@ -427,6 +438,7 @@ def run_claude(
     _cooldown_msg = account_cooldown_notice(account_name, account_config_dir)
     if _cooldown_msg:
         logger.warning(f"[limits] {project}: 계정 한도 쿨다운 중 — 스폰 생략 (account={account_name})")
+        external_notice.mark_dead_end("limited")
         return (_cooldown_msg, sid, [], False)
 
     # 카드 823 ④ 계정 대조(경고만, 2026-11-18): 정책에 email 이 있는 폴더는 .claude.json 의 로그인 계정과 비교해
@@ -804,7 +816,7 @@ def run_claude(
                                     session_key_override=session_key_override, prompt_override=prompt_override,
                                     stream_to_chat=stream_to_chat, segments_out=segments_out,
                                     model_override=_fb, _limit_retry=_limit_retry + 1)
-                            return (usage_limit_notice(_limit), new_session_id, tool_lines, False)
+                            return (_limit_dead_end(_limit), new_session_id, tool_lines, False)
                         _moved = _switch_seat_and_retry(_seat, _limit_retry, project, api_key, stream_to_chat)
                         if _moved:
                             return run_claude(prompt, project, _retry_count, 0,
@@ -812,7 +824,7 @@ def run_claude(
                                 stream_to_chat=stream_to_chat, segments_out=segments_out,
                                 model_override=model_override, _limit_retry=_limit_retry + 1)
                         start_account_cooldown("세션 한도", _limit.get("resets", ""), account_name, account_config_dir)
-                        return (usage_limit_notice(_limit), new_session_id, tool_lines, False)
+                        return (_limit_dead_end(_limit), new_session_id, tool_lines, False)
                     if "could not process image" in error_text.lower() or "invalid_request_error" in error_text.lower():
                         logger.warning(f"[{bot_name}] Image/request error for {project}, resetting session (retry {_retry_count + 1})")
                         conv = _fetch_recent_conversation(project, limit=10)
@@ -913,7 +925,7 @@ def run_claude(
                         session_key_override=session_key_override, prompt_override=prompt_override,
                         stream_to_chat=stream_to_chat, segments_out=segments_out,
                         model_override=_fb, _limit_retry=_limit_retry + 1)
-                return (usage_limit_notice(_limit), new_session_id, tool_lines, False)
+                return (_limit_dead_end(_limit), new_session_id, tool_lines, False)
             # stderr 에 인증만료 텍스트가 직접 보이면 즉시 재로그인
             if _text_signals_auth_expired(stderr_output):
                 logger.warning(f"[{bot_name}] Auth expired (stderr) for {project}: starting self-service re-login {_auth_diag(_spawn_concurrency)}")

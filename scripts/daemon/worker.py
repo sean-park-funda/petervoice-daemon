@@ -31,6 +31,7 @@ from daemon.dispatch import (TurnDispatcher, turn_message_ids, BOOT_GRACE_SEC_DE
                              BOOT_GRACE_UPTIME_SEC_DEFAULT)
 from daemon.utils import resolve_files, cleanup_downloads, _split_text_chunks, _read_json, _write_json, with_sender
 from daemon.encryption import decrypt_message, get_encryptor
+import external_notice  # scripts/ 바로 아래 (usage_api 와 같은 자리)
 # kanban messages now flow through messages table — no separate kanban import needed
 
 
@@ -100,6 +101,21 @@ class Worker(threading.Thread):
             payload["to_member_name"] = to_member_name
         api_request(self.api_key, "POST", "/api/bot/reply", payload)
 
+    def _notify_external_dead_end(self, parts: list, from_project: str, project: str, kind: str):
+        """외부 relay 로 온 글이 실제 답 없이 끝났을 때 보낸 핸들에게 안내 한 통 (사유는 밝히지 않는다).
+        from_project 는 루트 프로젝트 — /api/relay/external 은 브랜치 키(branch:N)를 발신 프로젝트로 받지 않는다."""
+        try:
+            def _send(handle: str, notice: str) -> bool:
+                return api_request(self.api_key, "POST", "/api/relay/external", {
+                    "to_handle": f"@{handle}", "from_project": from_project,
+                    "kind": "message", "text": notice,
+                }, timeout=15) is not None
+            for handle, ok in external_notice.notify_dead_end(parts, "self", _send):
+                logger.info(f"[{self.bot_name}] external relay ended without a real answer ({kind}) in {project} "
+                            f"→ notice to @{handle}: {'sent' if ok else 'FAILED'}")
+        except Exception as e:
+            logger.error(f"[{self.bot_name}] external dead-end notice failed ({project}): {e}")
+
     def heartbeat(self, is_working=False, current_task=None, project=None):
         with active_projects_lock:
             projects_list = sorted(active_projects)
@@ -122,6 +138,8 @@ class Worker(threading.Thread):
         # 묶음 턴(디스패처가 합친 자동 메시지)이면 이 턴이 소비하는 id 전부 — 처리완료·reply_to 에 쓴다
         turn_ids = turn_message_ids(msg)
         text = msg.get("text", "").strip()
+        # 이 턴이 소비하는 메시지들의 서버 필드(subtype·from_username) — 외부 relay 무응답 안내의 「보낸 사람」 판별용
+        _turn_parts = external_notice.turn_parts(msg)
         project = msg.get("project", "general") or "general"
 
         if msg_id in processed_ids:
@@ -449,6 +467,7 @@ class Worker(threading.Thread):
         # (없으면 아래 `if timed_out ...` 이 UnboundLocalError 로 팀 프로젝트를 크래시시킴)
         timed_out = False
         _segments: list[str] = []
+        external_notice.reset_dead_end()   # 이 스레드의 앞선 턴이 남긴 표시를 지운다
         if _is_team and process_team_message:
             response, tool_lines = process_team_message(
                 prompt_text, project, self, msg_id, _branch_id,
@@ -468,6 +487,9 @@ class Worker(threading.Thread):
         if response == SHUTDOWN_INTERRUPTED:
             logger.info(f"[{self.bot_name}] msg #{msg_id} interrupted by shutdown — left in queue for auto-resume")
             return
+
+        # 이 턴이 고정 문구(로그인 만료·계정 한도)로 끝났는가 — 러너가 남긴 표시를 꺼내 둔다(안내는 답장·dequeue 뒤에 보낸다)
+        _dead_end = external_notice.take_dead_end()
 
         # Timeout auto-followup: 타임아웃 시 자동으로 1회 후속 질문
         from daemon.globals import SESSION_MANAGER_PROJECT
@@ -503,6 +525,12 @@ class Worker(threading.Thread):
         dequeue_message(msg_id)
 
         logger.info(f"[{self.bot_name}] Replied msg #{msg_id}: {len(response)} chars, team={_is_team}")
+
+        # 외부 relay 로 온 글이 고정 문구로 끝났으면 보낸 쪽에 알린다 — 그 문구는 이 채팅에만 남아 보낸 쪽 담당은 답을
+        # 계속 기다린다 (2026-11-23, external_notice.py). 팀 프로젝트는 한 턴에 엔진을 여러 번 불러 표시만으로는
+        # 「답이 나갔는지」를 알 수 없어 뺀다(멀쩡한데 「답할 수 없는 상태」라고 알리는 오탐 방지).
+        if _dead_end and not _is_team:
+            self._notify_external_dead_end(_turn_parts, _proj, project, _dead_end)
 
         # Timeout auto-followup: 타임아웃 후 자동 1회 후속 질문 실행 (종료 중엔 새 턴 시작 금지)
         if timed_out and not is_timeout_followup and not _is_team and not _is_manager_project and not shutdown_event.is_set():

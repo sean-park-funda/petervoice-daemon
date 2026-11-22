@@ -42,6 +42,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import cloud_container as ctr
+import external_notice
 import usage_api
 
 CONFIG_PATH = Path(os.environ.get("PV_CLOUD_CONFIG", "/etc/pv-cloud/config.json"))
@@ -2619,6 +2620,34 @@ class CloudWorker:
         logger.info(f"[consult] user={user_id} project={project} 상담 티켓 생성")
         self.reply(api_key, CONSULT_ACK_MESSAGE, [msg_id], project)
 
+    def notify_external_dead_end(self, api_key: str, user_id: int, project: str, msg: dict):
+        """외부 relay 로 온 글이 실제 답 없이(고정 문구로) 끝났을 때 보낸 핸들에게 안내 한 통 (2026-11-23).
+        고정 문구는 받는 사람 채팅에만 남아, 보낸 쪽 담당은 답을 계속 기다린다(11/19 실례 — 40시간).
+        사유(로그인 만료·한도)는 밝히지 않는다. 외부 relay 가 아니면 아무것도 하지 않는다 — 규칙은 external_notice.py.
+        보낸 사람은 본문이 아니라 서버가 채운 msg 의 subtype·from_username 으로 정한다. 받는 사람 채팅 답장 뒤에 부른다."""
+        try:
+            parts = external_notice.turn_parts(msg)
+            if not external_notice.external_senders(parts):
+                return
+            from_project = project
+            m = _BRANCH_RE.match(project or "")
+            if m:   # /api/relay/external 은 발신 프로젝트로 루트 프로젝트만 받는다 (branch:N 은 404)
+                branch = _fetch_branch_settings(user_id, api_key).get(int(m.group(1))) or {}
+                from_project = str(branch.get("project_id") or "")
+            if not from_project:
+                logger.warning(f"[ext-notice] user={user_id} project={project}: 발신 프로젝트를 못 정해 안내 생략")
+                return
+
+            def _send(handle: str, notice: str) -> bool:
+                return user_api(api_key, "POST", "/api/relay/external", {
+                    "to_handle": f"@{handle}", "from_project": from_project,
+                    "kind": "message", "text": notice,
+                }) is not None
+            for handle, ok in external_notice.notify_dead_end(parts, user_id, _send):
+                logger.info(f"[ext-notice] user={user_id} project={project} → @{handle}: {'sent' if ok else 'FAILED'}")
+        except Exception as e:
+            logger.error(f"[ext-notice] user={user_id} project={project} failed: {e}", exc_info=True)
+
     def reply(self, api_key: str, text: str, reply_to, project: str):
         user_api(api_key, "POST", "/api/bot/reply", {
             "text": text, "reply_to": reply_to, "project": project, "is_final": True,
@@ -2659,6 +2688,7 @@ class CloudWorker:
         except Exception as e:
             logger.error(f"provision failed user={user_id}: {e}")
             self.reply(api_key, "(일시적 오류로 준비에 실패했어요. 잠시 후 다시 시도해주세요.)", [msg_id], project)
+            self.notify_external_dead_end(api_key, user_id, project, msg)
             return
         # 로그인 코드 대기 중에 온 메시지는 본문을 남기지 않는다 — 채팅으로 붙여넣은 OAuth 코드가
         # 저널에 평문으로 남았다 (2026-09-17 sean3 재로그인에서 확인)
@@ -2750,6 +2780,7 @@ class CloudWorker:
         if code_match and not (session and session.state == "waiting_code") and (
                 not connected() or text.strip() == code_match.group(0)):
             self.reply(api_key, LOGIN_LINK_EXPIRED_MESSAGE, [msg_id], project)
+            self.notify_external_dead_end(api_key, user_id, project, msg)
             return
 
         # ── '상담': 유료 구독이 없어 연결을 못 하는 가입자 → 헬프데스크 help 티켓 (갈래 A 안내문이 이 낱말을 요청한다) ──
@@ -2761,11 +2792,13 @@ class CloudWorker:
         # 연결된 유저(계정 교체 중)가 일반 질문을 하면 평소대로 턴을 돈다 — 코드처럼 생긴(공백 없는 긴) 문자열일 때만 안내.
         if session and session.state == "waiting_code" and (not connected() or _looks_like_code_attempt(text)):
             self.reply(api_key, LOGIN_NOT_CODE_MESSAGE, [msg_id], project)
+            self.notify_external_dead_end(api_key, user_id, project, msg)
             return
 
         # ── 미연결 유저: 안내만 ──
         if not connected():
             self.reply(api_key, NEED_LOGIN_MESSAGE, [msg_id], project)
+            self.notify_external_dead_end(api_key, user_id, project, msg)
             return
 
         # ── 티어 월 턴 한도 초과 → 차단 안내 (턴 미소비) ──
@@ -2778,6 +2811,7 @@ class CloudWorker:
                             "다음 달 1일에 초기화돼요. 더 많은 턴이 필요하면 "
                             "**요금제 업그레이드**를 문의해주세요 (설정 > 문의하기)."),
                            [msg_id], project)
+                self.notify_external_dead_end(api_key, user_id, project, msg)
                 return
 
         # ── 디스크 쿼터 초과 → 전환 안내 ──
@@ -2794,6 +2828,7 @@ class CloudWorker:
             })
             user_api(api_key, "POST", "/api/cloud/heavy-event",
                      {"kind": "heavy_disk", "project": project, "context": "disk quota exceeded"})
+            self.notify_external_dead_end(api_key, user_id, project, msg)
             return
 
         # ── 일반 턴 ──
@@ -2818,6 +2853,7 @@ class CloudWorker:
             self.reply(api_key,
                        "클로드 로그인이 만료됐어요. `클로드 로그인` 이라고 입력해 다시 연결해주세요.",
                        [msg_id], project)
+            self.notify_external_dead_end(api_key, user_id, project, msg)
             return
         if status in ("heavy_mem", "heavy_time"):
             self.report_heavy(api_key, user_id, project, msg_id, status, text)
@@ -2846,6 +2882,9 @@ class CloudWorker:
                 "text": "\n".join(tool_lines), "reply_to": [msg_id], "project": project,
                 "is_final": True, "subtype": "tool_log",
             })
+        # 계정 한도 안내문으로 끝난 턴 — 외부 relay 로 온 글이면 보낸 쪽에도 알린다(받는 사람 채팅 답장 뒤)
+        if status == "limited":
+            self.notify_external_dead_end(api_key, user_id, project, msg)
 
     def maybe_warn_quota(self, api_key, user_id, project, msg_id):
         """턴 한도 90% 도달 시 월 1회 경고 (한도 초과 전에 미리 알린다)."""
