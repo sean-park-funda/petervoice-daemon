@@ -2,7 +2,7 @@
 name: agent-browser
 description: Browser automation CLI for AI agents. Use when the user needs to interact with websites, including navigating pages, filling forms, clicking buttons, taking screenshots, extracting data, testing web apps, or automating any browser task. Triggers include requests to "open a website", "fill out a form", "click a button", "take a screenshot", "scrape data from a page", "test this web app", "login to a site", "automate browser actions", or any task requiring programmatic web interaction.
 allowed-tools: Bash(npx agent-browser:*), Bash(agent-browser:*)
-pv_version: "1.4.0"
+pv_version: "1.4.1"
 ---
 
 # Browser Automation with agent-browser
@@ -173,8 +173,8 @@ agent-browser session list
 agent-browser --auto-connect open https://example.com
 agent-browser --auto-connect snapshot
 
-# Or with explicit CDP port
-agent-browser --cdp 9222 snapshot
+# Or with explicit CDP port — 피터보이스에서는 데몬이 주입한 PV_CDP_PORT 를 쓴다(공유 맥 테넌트는 19000+uid)
+agent-browser --cdp "${PV_CDP_PORT:-9222}" snapshot
 ```
 
 ### Visual Browser (Debugging)
@@ -250,6 +250,10 @@ When dealing with consistently slow websites, use `wait --load networkidle` afte
 
 여러 에이전트가 같은 머신에서 동시에 브라우저를 쓸 때의 규칙. 맥미니에서 탭 덮어쓰기 사고 3건 후 실측으로 확정됨.
 
+0. **공유 맥(OS 계정이 여럿인 머신)에서 9222 는 다른 계정의 브라우저일 수 있다 (2026-11-22 실사고, KI-122).**
+   맥의 127.0.0.1 포트는 계정 사이에 공유된다. 붙을 포트는 반드시 `${PV_CDP_PORT:-9222}`(데몬 주입)이고, 붙기 전에 소유를 한 줄로 확인한다:
+   `/usr/sbin/lsof -nP -a -u $(id -u) -iTCP:${PV_CDP_PORT:-9222} -sTCP:LISTEN` 이 비어 있는데 `curl -s 127.0.0.1:${PV_CDP_PORT:-9222}/json/version` 이
+   응답하면 남의 브라우저 — 붙지 않는다(`start-browser.sh` 는 이 경우 exit 2). `--auto-connect` 는 공유 맥에서 금지(남의 CDP 를 찾아 붙는다).
 1. **CDP 공유 브라우저(`--cdp 9222`)의 활성 탭 포인터는 모든 접속자가 공유한다.** `--session`을 나눠도 다른 에이전트가 `open`을 실행하면 활성 탭이 그쪽으로 이동해 내 명령이 남의 탭에 들어간다. 공유 브라우저에서는:
    - `tab new`로 내 탭을 만들고 탭 id(tN)를 확보
    - **매 명령 직전 `tab tN`으로 내 탭을 다시 활성화**

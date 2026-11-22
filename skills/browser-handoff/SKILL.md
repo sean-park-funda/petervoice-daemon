@@ -1,7 +1,7 @@
 ---
 name: browser-handoff
 description: 브라우저 자동화 중 로그인/인증 벽에 막혔을 때 사용자에게 원격 로그인을 넘기는 스킬. 웹사이트 로그인이 필요한 작업, "로그인해서 데이터 가져와줘", 인증이 필요한 사이트 자동화, 로그인 세션 만료 시 사용. 사용자가 폰/PC에서 서버 브라우저 화면을 직접 보고 로그인해주면 세션(쿠키)을 이어받아 작업을 계속한다.
-pv_version: "1.3.2"
+pv_version: "1.3.3"
 ---
 
 # 브라우저 세션 인계 (Browser Session Handoff)
@@ -12,7 +12,8 @@ pv_version: "1.3.2"
 ## 0. 브라우저 준비 (최초 1회 + 세션마다)
 
 ```bash
-# CDP(9222) 포함 헤드리스 브라우저 기동 (이미 떠 있으면 no-op)
+# CDP(${PV_CDP_PORT:-9222}) 포함 헤드리스 브라우저 기동 (내 것이 이미 떠 있으면 no-op)
+# exit 2 = 그 포트가 다른 OS 계정의 브라우저(공유 맥, 2026-11-22 실사고) — 붙지 말고 PV_CDP_PORT 가 주입됐는지 확인
 # 이 스킬 폴더의 scripts/start-browser.sh 를 실행한다:
 #  - 클라우드: bash /srv/pv/shared/skills/browser-handoff/scripts/start-browser.sh
 #  - 맥(설치형): bash ~/.claude/skills/browser-handoff/scripts/start-browser.sh
@@ -35,6 +36,10 @@ npx -y agent-browser --cdp $CDP click @e1
 ```
 
 (자체적으로 새 브라우저를 띄우는 `agent-browser open`(--cdp 없이)을 쓰면 인계와 세션이 분리된다 — 금지)
+
+**공유 맥(OS 계정이 여럿인 머신)**: 127.0.0.1 포트는 계정 사이에 공유되므로 9222 가 다른 계정의 브라우저일 수 있다.
+포트는 반드시 데몬이 주입한 `PV_CDP_PORT`(테넌트 = 19000+uid)를 쓰고, `start-browser.sh` 가 exit 2 를 내면 멈춘다(KI-122).
+`--auto-connect` 는 쓰지 않는다 — 남의 CDP 를 찾아 붙는다.
 
 ## 1. 로그인 벽을 만나면
 

@@ -1546,14 +1546,33 @@ const CDP_PORT_BASE = 19000;
 const cdpSessions = new Map(); // port -> session
 
 function cdpPortForDir(dir) {
-  if (!CLOUD_MODE) return 9222;
-  if (!dir) return null;
-  const root = path.resolve(CLOUD_USERS_ROOT);
-  const resolved = path.resolve(dir);
-  if (!resolved.startsWith(root + path.sep)) return null;
-  const uid = parseInt(resolved.slice(root.length + 1).split(path.sep)[0], 10);
-  if (!Number.isInteger(uid) || uid <= 0 || uid > 100000) return null;
-  return CDP_PORT_BASE + uid;
+  if (CLOUD_MODE) {
+    if (!dir) return null;
+    const root = path.resolve(CLOUD_USERS_ROOT);
+    const resolved = path.resolve(dir);
+    if (!resolved.startsWith(root + path.sep)) return null;
+    const uid = parseInt(resolved.slice(root.length + 1).split(path.sep)[0], 10);
+    if (!Number.isInteger(uid) || uid <= 0 || uid > 100000) return null;
+    return CDP_PORT_BASE + uid;
+  }
+  // 공유 맥(MULTI_MODE): 테넌트 홈 아래 dir 는 그 OS 계정의 포트(19000+uid) — 테넌트 데몬이 PV_CDP_PORT 로
+  // 같은 수를 주입한다(limits.cdp_port_for_daemon). 전에는 비클라우드면 무조건 9222 라 테넌트의 로그인 인계가
+  // 소유자 계정 크롬에 붙어 그 안에서 끝났다(2026-11-22 실사고, KI-122). uid 를 못 읽으면 소유자 포트로
+  // 떨어뜨리지 않고 거절한다.
+  if (MULTI_MODE && dir) {
+    const resolved = path.resolve(dir);
+    for (const u of Object.values(multiUsers())) {
+      if (!u || !u.home) continue;
+      const home = path.resolve(u.home);
+      if (resolved !== home && !resolved.startsWith(home + path.sep)) continue;
+      try {
+        const uid = fs.statSync(home).uid;
+        if (Number.isInteger(uid) && uid > 0) return CDP_PORT_BASE + uid;
+      } catch {}
+      return null;
+    }
+  }
+  return 9222;
 }
 
 function cdpHttpJson(port, pathName) {
@@ -1619,7 +1638,8 @@ async function cdpConnect(port, matchUrl) {
     existing.lastUsed = Date.now();
     return existing;
   }
-  if (!target) target = pages[0];
+  // chrome://newtab 등 chrome:// 탭은 캡처가 끝나지 않는다(2026-09-23 실측) — 후순위
+  if (!target) target = pages.find(t => !/^chrome:/.test(t.url || "")) || pages[0];
   if (existing && existing.ws.readyState === 1) {
     if (existing.targetId === target.id) {
       existing.lastUsed = Date.now();
@@ -2871,13 +2891,26 @@ document.addEventListener('click', e => {
           await cdpSend(s, "Emulation.setDeviceMetricsOverride", {
             width: vw, height: vh, deviceScaleFactor: dpr, mobile: vw < 768,
           });
+          // 리사이즈 직후엔 새 프레임이 그려져야 캡처가 끝난다. 화면이 잠겼거나 창이
+          // 가려진 맥에서는 그 프레임이 영영 나오지 않아 캡처가 8초 타임아웃 → 인계
+          // 화면이 검은 채로 멈춘다 (2026-09-23 지원#19 joory 맥 실측: 오버라이드→캡처
+          // TIMEOUT, 오버라이드→bringToFront→캡처 성공). 뷰포트가 바뀔 때만 부른다.
+          try { await cdpSend(s, "Page.bringToFront", {}); } catch {}
           s.appliedViewport = want;
         }
       }
-      const [shot, metrics] = await Promise.all([
-        cdpSend(s, "Page.captureScreenshot", { format: "jpeg", quality: 60 }),
-        cdpSend(s, "Page.getLayoutMetrics", {}),
-      ]);
+      let shot, metrics;
+      try {
+        [shot, metrics] = await Promise.all([
+          cdpSend(s, "Page.captureScreenshot", { format: "jpeg", quality: 60 }),
+          cdpSend(s, "Page.getLayoutMetrics", {}),
+        ]);
+      } catch (e) {
+        // 한번 멈추면 뷰포트가 이미 적용된 것으로 남아 다음 폴링이 위 복구 경로를
+        // 건너뛴다 → 표식을 지워 다음 폴링이 오버라이드+bringToFront 를 다시 태운다
+        s.appliedViewport = "";
+        throw e;
+      }
       let pageInfo = {};
       try {
         const t = await cdpHttpJson(port, "/json/list");

@@ -1,6 +1,7 @@
 #!/bin/bash
-# 헤드리스 chromium 을 CDP(9222)와 함께 기동한다 (이미 떠 있으면 no-op).
+# 헤드리스 chromium 을 CDP(PV_CDP_PORT, 기본 9222)와 함께 기동한다 (내 것이 이미 떠 있으면 no-op).
 # 에이전트(브라우저 자동화 시작 시)와 데몬(인계 중 컨테이너 재생성 후)이 같은 스크립트를 쓴다.
+# 종료 코드: 0 = 떠 있음/띄웠음 · 1 = 못 띄움 · 2 = 그 포트가 다른 OS 계정의 브라우저(공유 맥) — 붙지 말 것.
 # 프로필($HOME/.pv-browser)은 유저 홈에 있어 로그인 세션(쿠키)이 컨테이너 재시작에도 유지된다.
 #
 # 크롬(151+)은 CDP 를 127.0.0.1 에만 바인딩한다(원격 바인딩 플래그 무시 — 보안 변경).
@@ -12,6 +13,37 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # CDP 포트: 데몬이 주입한 PV_CDP_PORT 우선 (컨테이너=9222 고정, 비컨테이너 클라우드=19000+uid,
 # 맥 설치형=9222 기본). 포탈이 유저별로 유도하는 포트와 일치해야 한다.
 CDP_PORT="${PV_CDP_PORT:-9222}"
+
+# ── 포트 소유권 판정 (2026-11-22, KI-122) ──
+# 맥의 127.0.0.1 TCP 포트는 OS 계정 사이에 공유된다. 공유 맥(테넌트 계정 여럿)에서 PV_CDP_PORT 가 없으면
+# 전원이 9222 로 수렴하고, 먼저 뜬 다른 계정의 크롬이 응답하면 "already running" 으로 끝나 그 뒤의
+# agent-browser --cdp 가 전부 남의 브라우저에 들어갔다(11/22 실사고 — 남의 쿠키·탭을 읽고 썼다).
+# 그래서 "응답이 있나" 가 아니라 "리스너의 uid 가 내 uid 인가" 로 판정한다. 비루트는 자기 프로세스의
+# 소켓만 볼 수 있으므로, 응답은 오는데 내 리스너가 안 보이면 남의 것이다.
+cdp_port_is_mine() {
+  local port="$1"
+  # 컨테이너는 계정이 하나다(클라우드) — 판정 생략
+  if [ -f /run/.containerenv ] || [ "$HOME" = "/home/agent" ]; then return 0; fi
+  if [ "$(uname)" = "Darwin" ]; then
+    [ -n "$(/usr/sbin/lsof -nP -a -u "$(id -u)" -iTCP:"$port" -sTCP:LISTEN -t 2>/dev/null)" ]
+    return
+  fi
+  if command -v ss >/dev/null 2>&1; then
+    # 비루트 ss -p 는 자기 프로세스에만 users:(…) 를 붙인다
+    ss -Hltnp "sport = :$port" 2>/dev/null | grep -q 'users:(('
+    return
+  fi
+  # 최후: /proc/net/tcp 의 LISTEN(0A) 행 중 로컬 포트(hex)가 같은 것의 uid 열
+  local hex; hex="$(printf '%04X' "$port")"
+  awk -v hex=":$hex" -v uid="$(id -u)" '$2 ~ hex"$" && $4=="0A" && $8==uid {found=1} END{exit !found}' \
+    /proc/net/tcp /proc/net/tcp6 2>/dev/null
+}
+
+if curl -sf -m 2 "http://127.0.0.1:$CDP_PORT/json/version" >/dev/null 2>&1 && ! cdp_port_is_mine "$CDP_PORT"; then
+  echo "CDP port $CDP_PORT answers but its listener is not owned by uid $(id -u) — another OS account's browser (shared Mac)." >&2
+  echo "Refusing to treat it as mine. Use this account's own port: PV_CDP_PORT (daemon-injected; shared-Mac tenant = 19000+uid)." >&2
+  exit 2
+fi
 
 started=""
 
@@ -105,7 +137,7 @@ if { [ "$HOME" = "/home/agent" ] || [ -f /run/.containerenv ]; } && ! pgrep -f "
 fi
 
 if [ -z "$started" ]; then
-  echo "already running"
+  echo "already running (cdp $CDP_PORT, uid $(id -u))"
   exit 0
 fi
 

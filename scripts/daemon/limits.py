@@ -11,6 +11,7 @@ config.json 으로 언제든 풀 수 있게 한다(고객이 걸리면 코드 �
 둘 다 걸면 긴 정상 작업이 예고 없이 끊긴다.
 """
 
+import getpass
 import json
 import os
 import re
@@ -403,6 +404,38 @@ def run_seat_limit_hook(limited_seat: str | None) -> str | None:
         return new if new and new != limited_seat else None
 
 
+# ── 브라우저 CDP 포트 (2026-11-22, KI-122) ──
+# 비컨테이너 클라우드(cloud_daemon: 19000+user_id)·공유 맥 테넌트(19000+uid)가 같은 대역을 쓴다.
+CDP_PORT_BASE = 19000
+
+
+def is_shared_mac_tenant(config: dict) -> bool:
+    """공유 맥의 테넌트 계정(pv-<name>, config portal_shared)에서 돌고 있나. 1맥 1유저 설치·소유자는 False."""
+    if config.get("portal_shared"):
+        return True
+    try:
+        return getpass.getuser().startswith("pv-")
+    except Exception:  # noqa: BLE001 — 계정 이름을 못 읽는 환경(Windows 서비스 등)은 테넌트가 아니다
+        return False
+
+
+def cdp_port_for_daemon(config: dict, uid: int | None = None) -> int:
+    """이 데몬이 띄우는 에이전트가 붙을 CDP 포트(PV_CDP_PORT).
+
+    1맥 1유저(지금까지의 전부)는 9222 그대로. 공유 맥 테넌트는 19000+uid — 같은 머신의 다른 OS 계정과 겹치지 않는다.
+    맥의 127.0.0.1 포트는 계정 사이에 공유돼, 전원이 9222 를 쓰면 먼저 뜬 다른 계정의 크롬에 붙는다(11/22 실사고:
+    테넌트가 소유자 브라우저의 쿠키를 읽고 그 안에서 로그인 인계까지 끝냈다). 포탈(home-portal.js cdpPortForDir)은
+    테넌트 홈의 uid 로 같은 수를 만들어 인계 화면이 같은 브라우저를 본다. start-browser.sh 도 이 값을 쓴다.
+    """
+    if not is_shared_mac_tenant(config):
+        return 9222
+    if uid is None:
+        uid = os.getuid() if hasattr(os, "getuid") else 0
+    if not isinstance(uid, int) or uid <= 0:
+        return 9222
+    return CDP_PORT_BASE + uid
+
+
 def build_claude_env(config: dict, account_config_dir: str | None = None) -> dict[str, str]:
     """claude CLI 를 띄울 때 쓰는 공용 env.
 
@@ -425,6 +458,11 @@ def build_claude_env(config: dict, account_config_dir: str | None = None) -> dic
     # 되돌리려면 config.json 에 "claudeai_connectors": true (대화형 CLI 는 이 env 를 안 거치므로 영향 없음).
     if not config.get("claudeai_connectors", False):
         env["ENABLE_CLAUDEAI_MCP_SERVERS"] = "false"
+    # 브라우저 CDP 포트 — 공유 맥 테넌트는 자기 포트를 강제, 그 외는 기본 9222(이미 있으면 존중). KI-122
+    if is_shared_mac_tenant(config):
+        env["PV_CDP_PORT"] = str(cdp_port_for_daemon(config))
+    else:
+        env.setdefault("PV_CDP_PORT", "9222")
     # Claude Code 자동 압축 창 (2026-10-31 세션 위생 검토). 기본은 모델 창(1M)이라 이 맥 실측 24건 전부 96.5만~99.1만 토큰에서야
     # 압축됐다. config "claude_auto_compact_window": 400000 처럼 두면 그 근처에서 CLI 가 **같은 세션 안에서** 요약·압축한다
     # (CLI 2.1.314 `CLAUDE_CODE_AUTO_COMPACT_WINDOW`, 헤드리스 -p 에도 적용). 미설정(0)이면 손대지 않는다 — 값은 Sean 결정.
