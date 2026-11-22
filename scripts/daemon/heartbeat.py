@@ -338,8 +338,10 @@ class HeartbeatThread(threading.Thread):
                 logger.info(f"[scout] {project} still scouting → skip this tick")
                 return
             forced = scout.should_force_main(task.get("run_count") or 0, scout.settings().get("force_every"))
-            if not forced and scout.account_in_cooldown(project):
+            if scout.account_in_cooldown(project):
                 # 계정 한도 쿨다운 중 — 정찰도 본 세션도 못 돈다. busy 처럼 조금 미룬다(간격만큼 넘기면 일일 태스크가 하루를 건너뛴다)
+                # 강제(force_every) 회차도 같이 미룬다 — 전에는 이 검사를 건너뛰어, 본 세션을 깨워 봐야 쿨다운 안내만 받고
+                # 그 회차(일일 태스크면 하루치)가 소비됐다. run_count 를 올리지 않으므로 쿨다운이 풀린 뒤에도 강제 회차다 (2026-11-23)
                 delay = self._busy_postpone_min(interval)
                 self._update_task(task["id"], {"next_run_at": (datetime.now(timezone.utc) + timedelta(minutes=delay)).isoformat()})
                 logger.info(f"[scout] {project} account cooldown → postponed {delay}m")
