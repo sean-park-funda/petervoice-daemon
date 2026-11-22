@@ -1072,6 +1072,8 @@ _CODEX_FULL = ["low", "medium", "high", "xhigh", "max", "ultra"]
 _CODEX_NO_ULTRA = ["low", "medium", "high", "xhigh", "max"]
 _CODEX_BASIC = ["low", "medium", "high", "xhigh"]
 CODEX_MODEL_EFFORTS = {
+    "gpt-6.2-astra": _CODEX_FULL,   # 2026-11-18 웹 목록 등재분 — effort 표는 GPT-6 Astra 와 같다고 둔다(웹과 같은 가정)
+    "gpt-6.2-sol": _CODEX_FULL,
     "gpt-6-astra": _CODEX_FULL,
     "gpt-6-sol": _CODEX_FULL,
     "gpt-6-luna": _CODEX_NO_ULTRA,
