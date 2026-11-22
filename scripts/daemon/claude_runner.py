@@ -6,6 +6,7 @@ import glob
 import json
 import time
 import base64
+import hashlib
 from datetime import datetime, timezone
 import select
 import subprocess
@@ -40,10 +41,11 @@ from daemon.sessions import (
     get_session_id, update_session, update_session_by_key,
     reset_session, session_key,
     save_session_context, _save_session_summary, _build_session_context_prompt,
-    get_codex_session_id, update_codex_session, reset_codex_session,
+    get_codex_session_id, get_codex_session_ctx, update_codex_session, reset_codex_session,
     get_gemini_session_id, update_gemini_session, reset_gemini_session,
 )
 from daemon.tasks import get_current_task, get_task_description
+from daemon.advisor import get_advisor, clear_advisor, stderr_blames_advisor
 from daemon.prompts import get_prompt_file, build_system_prompt, build_connected_services_note, apply_roster_placeholder
 
 
@@ -275,8 +277,11 @@ def run_claude(
     # 계정 한도(모델별) 폴백 재시도용 — 원래 모델 대신 이 모델로 1회 다시 띄운다
     model_override: str | None = None,
     _limit_retry: int = 0,
+    # --advisor 때문에 CLI 가 죽어 플래그 없이 다시 띄우는 턴 (아래 안전망 전용)
+    _skip_advisor: bool = False,
 ) -> tuple[str, str | None, list[str], bool]:
     api_key = config["api_key"]
+    _orig_prompt = prompt  # 새 세션이면 아래에서 맥락이 앞에 붙는다 — 재시도는 원문으로
 
     # branch:{branch_id} → 부모 프로젝트 디렉토리 사용
     is_branch = project.startswith("branch:")
@@ -331,7 +336,15 @@ def run_claude(
     effort = branch_effort or proj_settings.get("effort") or config.get("claude_effort")
     if effort:
         cmd.extend(["--effort", effort])
-    logger.info(f"[claude] project={project} model={model} effort={effort or '(none)'}")
+    # 조언 모델(advisor): 이 담당에 켜 둔 값만, 본 세션 턴에만 붙인다(daemon/advisor.py — 플래그는 세션 한정).
+    # 한도 폴백으로 모델을 바꿔 다시 띄운 턴·팀 세션·외부 조립 프롬프트·데모에는 붙이지 않는다.
+    advisor_model = None
+    if not (_skip_advisor or model_override or session_key_override or prompt_override is not None or is_demo):
+        advisor_model = get_advisor(project)
+        if advisor_model:
+            cmd.extend(["--advisor", advisor_model])
+    logger.info(f"[claude] project={project} model={model} effort={effort or '(none)'}"
+                + (f" advisor={advisor_model}" if advisor_model else ""))
 
     if prompt_override is not None:
         # D7: externally assembled prompt (team lead / team member)
@@ -681,6 +694,10 @@ def run_claude(
                                 api_request(api_key, "POST", "/api/bot/reply", {
                                     "text": _stream_txt, "project": project, "is_final": False,
                                 })
+                    elif block.get("type") == "server_tool_use" and block.get("name") == "advisor":
+                        # 조언 모델 호출(서버 도구) — 비용이 따로 드는 행동이라 도구줄에 보이게 한다
+                        last_tool_time = time.time()
+                        tool_lines.append("🔧 Advisor")
                     elif block.get("type") == "text":
                         # 도구 앞뒤의 모든 텍스트를 여기서 수집한다 (유일하게 완전한 소스)
                         _t = block.get("text", "")
@@ -836,6 +853,23 @@ def run_claude(
         stderr_output = proc.stderr.read().decode("utf-8", errors="replace").strip()
         if proc.returncode != 0 and not response_text:
             logger.error(f"[{bot_name}] Claude exited {proc.returncode}: {stderr_output[:500]}")
+            if advisor_model and stderr_blames_advisor(stderr_output):
+                # --advisor 때문에 CLI 가 뜨지 못했다(구형 CLI 가 플래그를 모르거나 그 모델이 막힘).
+                # 켜 둔 값 하나가 이 담당의 모든 턴을 죽이지 않도록 값을 걷어내고 플래그 없이 한 번 다시 띄운다.
+                logger.warning(f"[{bot_name}] CLI rejected --advisor {advisor_model} for {project} — clearing and retrying without it")
+                clear_advisor(project, f"CLI rejected --advisor {advisor_model}")
+                _release_semaphore()
+                _r = run_claude(_orig_prompt, project, _retry_count, 0,
+                    session_key_override=session_key_override, prompt_override=prompt_override,
+                    stream_to_chat=stream_to_chat, segments_out=segments_out,
+                    model_override=model_override, _limit_retry=_limit_retry, _skip_advisor=True)
+                if _r[0] == SHUTDOWN_INTERRUPTED:
+                    # 워커가 이 값을 문자열 일치로 본다(큐에 남겨 재개) — 앞에 글을 붙이면 센티널이 깨진다
+                    return _r
+                _note = f"(조언 모델 {advisor_model} 을 이 기기의 Claude 가 받지 못해 껐습니다.)"
+                if segments_out:
+                    segments_out[0] = f"{_note}\n\n{segments_out[0]}"
+                return (f"{_note}\n\n{_r[0]}", _r[1], _r[2], _r[3])
             if "context" in stderr_output.lower() or "prompt is too long" in stderr_output.lower():
                 logger.warning(f"[{bot_name}] Context overflow (stderr) for {project}, resetting (retry {_retry_count + 1})")
                 conv = _fetch_recent_conversation(project, limit=10)
@@ -1167,37 +1201,108 @@ def _resolve_codex_effort(effort: str | None, model: str | None) -> str | None:
 
 _AGENTS_MD_MARKER_START = "<!-- PETERVOICE-DAEMON-PROMPT-START -->"
 _AGENTS_MD_MARKER_END = "<!-- PETERVOICE-DAEMON-PROMPT-END -->"
+# 예전 데몬이 쓴 모양: 표지가 각각 한 줄을 통째로 차지한다
+_AGENTS_MD_BLOCK_RE = re.compile(
+    r"^[ \t]*" + re.escape(_AGENTS_MD_MARKER_START) + r"[ \t]*\r?\n"
+    r"(?:.*?\r?\n)??"
+    r"[ \t]*" + re.escape(_AGENTS_MD_MARKER_END) + r"[ \t]*\r?$",
+    re.DOTALL | re.MULTILINE,
+)
 
 
-def _prepare_agents_md(project_dir: str, prompt_content: str):
-    """Write daemon prompt into AGENTS.md in the project directory.
+def _strip_agents_md_block(project_dir: str) -> str:
+    """예전 데몬이 프로젝트 폴더 AGENTS.md 에 써 둔 프롬프트 스냅샷(표지 사이 블록)을 걷어낸다.
 
-    If AGENTS.md already exists, the daemon section (between markers) is
-    replaced while preserving the rest of the file.
+    2026-11-23 부터 코덱스 지침은 파일이 아니라 stdin 으로 넘긴다(아래 _codex_ctx_*). 그런데 코덱스는
+    실행할 때마다(resume 포함) 작업 폴더의 AGENTS.md 를 다시 읽는다(0.171 실측). 쓰기만 멈추고 블록을
+    남기면 낡은 지침을 끝없이 읽고, 같은 폴더를 쓰는 다른 브랜치의 역할이 섞인다 → 코덱스를 띄우기 전에
+    데몬 블록만 걷어낸다. 예전에도 이 블록은 턴마다 통째로 덮어쓰던 자리다.
+
+    - 표지는 **줄 전체가 표지일 때만** 인정한다(예전 데몬이 쓴 모양). 본문에서 표지 문자열을 언급만 한 파일은 안 건드린다.
+    - 시작 표지만 있고 끝 표지가 없으면 지우지 않는다(어디까지가 데몬 것인지 알 수 없다) → "unterminated".
+    - 표지 밖(유저가 직접 쓴 내용)과 줄바꿈 방식은 그대로 둔다. 블록을 빼면 아무것도 남지 않을 때만 파일을 지운다
+      (그 파일은 데몬이 만든 것이다).
+    반환: "none" | "stripped" | "removed" | "unterminated" | "error".
     """
     agents_path = os.path.join(project_dir, "AGENTS.md")
-    existing = ""
-    if os.path.exists(agents_path):
-        try:
-            with open(agents_path, "r", encoding="utf-8") as f:
-                existing = f.read()
-        except Exception:
-            existing = ""
+    try:
+        if not os.path.isfile(agents_path):
+            return "none"
+        with open(agents_path, "r", encoding="utf-8", newline="") as f:
+            existing = f.read()
+        if _AGENTS_MD_MARKER_START not in existing:
+            return "none"
+        rest, n = _AGENTS_MD_BLOCK_RE.subn("\x00", existing)
+        if not n:
+            if re.search(r"(?m)^[ \t]*" + re.escape(_AGENTS_MD_MARKER_START) + r"[ \t]*\r?$", existing):
+                logger.warning(f"Daemon prompt block in {agents_path} has no end marker — left untouched")
+                return "unterminated"
+            return "none"
+        nl = "\r\n" if "\r\n" in existing else "\n"
+        # 블록이 있던 자리(\x00) 앞뒤의 빈 줄을 한 줄 간격으로 잇는다
+        parts = [p for p in (seg.strip("\r\n") for seg in rest.split("\x00")) if p.strip()]
+        rest = (nl + nl).join(parts)
+        if not rest.strip():
+            if os.path.islink(agents_path):
+                # 링크는 지우지 않는다(다른 파일을 가리킨다) — 내용만 비운다
+                with open(agents_path, "w", encoding="utf-8", newline="") as f:
+                    f.write("")
+                return "stripped"
+            os.remove(agents_path)
+            return "removed"
+        with open(agents_path, "w", encoding="utf-8", newline="") as f:
+            f.write(rest + nl)
+        return "stripped"
+    except Exception as e:
+        logger.warning(f"Failed to strip daemon block from {agents_path}: {e}")
+        return "error"
 
-    daemon_block = f"{_AGENTS_MD_MARKER_START}\n{prompt_content}\n{_AGENTS_MD_MARKER_END}"
 
-    if _AGENTS_MD_MARKER_START in existing:
-        pattern = re.escape(_AGENTS_MD_MARKER_START) + r".*?" + re.escape(_AGENTS_MD_MARKER_END)
-        # 치환 문자열을 템플릿으로 해석하지 않도록 함수로 넘긴다 — 프롬프트 속 `C:\AI` 같은
-        # 백슬래시가 "bad escape" 로 턴 전체를 죽이거나 `\n` 이 실제 줄바꿈으로 바뀐다
-        merged = re.sub(pattern, lambda _m: daemon_block, existing, flags=re.DOTALL)
-    elif existing.strip():
-        merged = f"{existing}\n\n{daemon_block}"
+# 코덱스 지침 전달(2026-11-23): 프로젝트 폴더에 파일을 쓰지 않고 stdin 으로 대화에 넣는다 (제미나이와 같은 처방).
+#  - 새 세션 첫 턴: 지침 + 세션 맥락 + 유저 메시지를 stdin 으로 (PROMPT 자리에 "-").
+#  - 재개 턴: 세션이 기억하므로 유저 메시지만 argv 로. 단 두 경우엔 지침을 다시 넣는다 —
+#      legacy  : 표식(ctx_hash)이 없는 세션 = AGENTS.md 시절 세션. 지침을 대화로 받은 적이 없다.
+#      refresh : 지침이 바뀌었다(해시 다름). 대화가 불어나지 않게 최소 간격(기본 6시간)을 둔다.
+#  - 한계: 코덱스가 긴 대화를 자동 압축하면 stdin 으로 넣은 지침이 요약될 수 있다(제미나이와 같음). `/reset` 으로 회복.
+_CODEX_CTX_OPEN = "<petervoice_system_instructions>"
+_CODEX_CTX_CLOSE = "</petervoice_system_instructions>"
+_CODEX_CTX_REFRESH_MIN_SEC = 6 * 3600
+
+
+def _codex_ctx_hash(stable: str) -> str:
+    return hashlib.sha256((stable or "").encode("utf-8")).hexdigest()[:16]
+
+
+def _codex_ctx_decision(stable: str, sid: str | None, sess_ctx: dict, now: float,
+                        min_refresh_sec: float = _CODEX_CTX_REFRESH_MIN_SEC) -> tuple[bool, str, str]:
+    """이 턴에 지침을 stdin 으로 넣을지: (넣는다?, 사유, 해시).
+    사유: new | legacy | refresh | same | throttled | empty. stable = 세션 맥락을 뺀 지침 본문."""
+    if not (stable or "").strip():
+        return (False, "empty", "")
+    h = _codex_ctx_hash(stable)
+    if not sid:
+        return (True, "new", h)
+    stored = (sess_ctx or {}).get("ctx_hash")
+    if not stored:
+        return (True, "legacy", h)
+    if stored == h:
+        return (False, "same", h)
+    fed_at = (sess_ctx or {}).get("ctx_fed_at") or 0
+    if now - float(fed_at) >= min_refresh_sec:
+        return (True, "refresh", h)
+    return (False, "throttled", h)
+
+
+def _codex_ctx_payload(instructions: str, prompt: str, mode: str) -> str:
+    """stdin 으로 넘길 한 덩어리: 머리말 + 지침(태그) + 유저 메시지."""
+    if mode == "new":
+        head = ("아래 태그 안은 피터보이스가 넣은 시스템 지침입니다(유저가 쓴 글이 아닙니다). "
+                "이 대화 전체에 적용됩니다. 닫는 태그 뒤가 유저의 메시지입니다.")
     else:
-        merged = daemon_block
-
-    with open(agents_path, "w", encoding="utf-8") as f:
-        f.write(merged)
+        head = ("아래 태그 안은 피터보이스가 넣은 최신 시스템 지침입니다(유저가 쓴 글이 아닙니다). "
+                "앞서 받은 지침이 있으면 이것으로 대체하고, 이 대화의 이후 턴 전체에 적용합니다. "
+                "닫는 태그 뒤가 유저의 메시지입니다.")
+    return f"{head}\n{_CODEX_CTX_OPEN}\n{instructions}\n{_CODEX_CTX_CLOSE}\n\n{prompt}"
 
 
 def run_codex(prompt: str, project: str, _retry_count: int = 0) -> tuple[str, str | None, list[str], bool]:
@@ -1230,14 +1335,18 @@ def run_codex(prompt: str, project: str, _retry_count: int = 0) -> tuple[str, st
     proj_settings = _fetch_project_settings(settings_project)
 
     # Build system prompt (reuse existing logic)
+    # ctx_stable = 세션 맥락을 뺀 지침 본문 — 「지침이 바뀌었나」 해시는 이것으로만 낸다
+    # (세션 맥락은 새 세션에만 붙으므로 넣으면 재개 턴마다 해시가 달라진다).
     if is_branch and branch_data:
         combined = build_branch_prompt(branch_data)
+        ctx_stable = combined
         if not sid:
             context_block = build_branch_context(branch_data)
             prompt = f"{context_block}\n\n---\n\n{prompt}"
     elif is_kanban and kanban_card:
         from daemon.kanban import build_kanban_card_context
         combined = build_kanban_prompt(kanban_card)
+        ctx_stable = combined
         if not sid:
             card_context = build_kanban_card_context(kanban_card)
             prompt = f"{card_context}\n\n---\n\n{prompt}"
@@ -1260,11 +1369,22 @@ def run_codex(prompt: str, project: str, _retry_count: int = 0) -> tuple[str, st
         session_context = ""
         if not sid:
             session_context = _build_session_context_prompt(project)
-        combined = "\n\n".join(p for p in [sys_prompt, system_prompt_pv, common_prompt, prompt_content, session_context] if p)
+        ctx_stable = "\n\n".join(p for p in [sys_prompt, system_prompt_pv, common_prompt, prompt_content] if p)
+        combined = "\n\n".join(p for p in [ctx_stable, session_context] if p)
 
-    # Write AGENTS.md with daemon prompt
-    if combined:
-        _prepare_agents_md(project_dir, combined)
+    bot_name = config.get("bot_name", "bot")
+
+    # 지침은 프로젝트 폴더 AGENTS.md 에 쓰지 않는다(2026-11-23) — 예전 데몬이 남긴 블록은 걷어내고 stdin 으로 넣는다.
+    _stripped = _strip_agents_md_block(project_dir)
+    if _stripped in ("stripped", "removed"):
+        logger.info(f"[{bot_name}] Codex: daemon prompt block {_stripped} from {os.path.join(project_dir, 'AGENTS.md')}")
+    feed_ctx, ctx_mode, ctx_hash = _codex_ctx_decision(
+        ctx_stable or combined, sid, get_codex_session_ctx(project), time.time(),
+        float(config.get("codex_ctx_refresh_min_sec", _CODEX_CTX_REFRESH_MIN_SEC)),
+    )
+    # 지침을 넣는 턴은 PROMPT 자리에 "-" 를 주고 전체를 stdin 으로 넘긴다(argv 에 지침이 실리지 않는다)
+    stdin_payload = _codex_ctx_payload(combined, prompt, ctx_mode) if feed_ctx else None
+    prompt_arg = "-" if feed_ctx else prompt
 
     # Build command
     # Codex 모델 해석: model 컬럼 우선(통합 UI가 여기에 gpt-* 저장), codex_model은 하위호환 fallback.
@@ -1291,7 +1411,6 @@ def run_codex(prompt: str, project: str, _retry_count: int = 0) -> tuple[str, st
         common_flags.extend(["-m", model])
     if effort:
         common_flags.extend(["-c", f"model_reasoning_effort={effort}"])
-    bot_name = config.get("bot_name", "bot")
 
     if sid:
         cmd = [
@@ -1301,7 +1420,7 @@ def run_codex(prompt: str, project: str, _retry_count: int = 0) -> tuple[str, st
             "--skip-git-repo-check",
         ]
         cmd.extend(common_flags)
-        cmd.extend(["resume", sid, prompt])
+        cmd.extend(["resume", sid, prompt_arg])
     else:
         cmd = [
             CODEX_CMD, "exec",
@@ -1311,9 +1430,9 @@ def run_codex(prompt: str, project: str, _retry_count: int = 0) -> tuple[str, st
             "-C", project_dir,
         ]
         cmd.extend(common_flags)
-        cmd.append(prompt)
+        cmd.append(prompt_arg)
 
-    logger.info(f"[{bot_name}] Codex: project={project}, dir={project_dir}, session={sid or 'new'}, model={model or 'default'}, effort={effort or '(model default)'}")
+    logger.info(f"[{bot_name}] Codex: project={project}, dir={project_dir}, session={sid or 'new'}, model={model or 'default'}, effort={effort or '(model default)'}, ctx={ctx_mode}")
 
     # run_claude 와 동일한 이유로 한 번만 반납한다 (세션 오류 재시도 시 이중 release → 동시성 누수)
     _sem_held = False
@@ -1341,16 +1460,35 @@ def run_codex(prompt: str, project: str, _retry_count: int = 0) -> tuple[str, st
 
         proc = subprocess.Popen(
             cmd,
+            stdin=subprocess.PIPE if feed_ctx else subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             cwd=project_dir,
             env=codex_env,
             shell=IS_WINDOWS,
         )
+        if feed_ctx:
+            # 큰 프롬프트로 파이프가 차도 stdout 읽기와 교착하지 않도록 별도 스레드로 흘려 넣는다
+            # stdin 은 무슨 일이 있어도 닫는다 — 안 닫히면 코덱스가 EOF 를 기다리며 출력 없이 멈춘다(600초 뒤 kill).
+            # 깨진 이모지(단독 서로게이트)가 섞인 프롬프트는 encode 가 예외를 내므로 replace 로 넘긴다.
+            def _feed(p=proc, data=stdin_payload):
+                try:
+                    p.stdin.write(data.encode("utf-8", errors="replace"))
+                except Exception as e:
+                    logger.warning(f"[{bot_name}] Codex stdin feed failed: {e}")
+                finally:
+                    try:
+                        p.stdin.close()
+                    except Exception:
+                        pass
+            threading.Thread(target=_feed, daemon=True).start()
 
         response_text = ""
         new_session_id = sid
         tool_lines = []
+        turn_completed = False
+        saw_error = False
+        got_message = False
         last_stream_time = time.time()
         last_activity_time = time.time()
         process_start_time = time.time()
@@ -1448,6 +1586,7 @@ def run_codex(prompt: str, project: str, _retry_count: int = 0) -> tuple[str, st
                 item_type = item.get("type", "")
 
                 if item_type == "agent_message":
+                    got_message = True
                     msg = item.get("text", "")
                     response_text = response_text + "\n\n" + msg if response_text else msg
                     streaming = "\n".join(tool_lines) + "\n\n" + response_text if tool_lines else response_text
@@ -1468,10 +1607,12 @@ def run_codex(prompt: str, project: str, _retry_count: int = 0) -> tuple[str, st
                     tool_lines.append(f"🔧 FileChange: {fp}")
 
             elif etype == "turn.completed":
+                turn_completed = True
                 usage = event.get("usage", {})
                 logger.info(f"[{bot_name}] Codex turn done for {project}: input={usage.get('input_tokens', '?')}, output={usage.get('output_tokens', '?')}")
 
             elif etype == "error":
+                saw_error = True
                 error_msg = event.get("message", str(event))
                 logger.error(f"[{bot_name}] Codex error for {project}: {error_msg}")
                 if not response_text:
@@ -1496,7 +1637,12 @@ def run_codex(prompt: str, project: str, _retry_count: int = 0) -> tuple[str, st
             response_text = "(작업 완료)" if tool_lines else "(응답 없음)"
 
         if new_session_id:
-            update_codex_session(project, new_session_id)
+            # 지침을 넣은 턴이 끝까지 돌았을 때만 표식을 남긴다 — 중간에 깨진 턴이면 다음 턴에 다시 넣는다
+            # (두 번 들어가는 쪽이 지침 없는 세션보다 낫다).
+            # turn.completed 를 안 내는 버전이어도 오류 없이 답이 왔으면 들어간 것으로 본다
+            # (표식이 안 남으면 재개 턴마다 지침 전체를 다시 넣는 조용한 낭비가 된다).
+            _ctx_ok = feed_ctx and (turn_completed or (got_message and not saw_error and proc.returncode == 0))
+            update_codex_session(project, new_session_id, ctx_hash=ctx_hash if _ctx_ok else None)
 
         return (response_text, new_session_id, tool_lines, False)
 
@@ -1699,10 +1845,15 @@ def run_gemini(prompt: str, project: str, _retry_count: int = 0) -> tuple[str, s
             # 파이프 버퍼(64KB)보다 큰 컨텍스트를 동기로 쓰면 자식이 stdout 을 채울 때 교착할 수 있어 스레드로 흘린다.
             def _feed(p=proc, data=combined + "\n\n---\n\n"):
                 try:
-                    p.stdin.write(data.encode("utf-8"))
-                    p.stdin.close()
+                    p.stdin.write(data.encode("utf-8", errors="replace"))
                 except Exception as e:
                     logger.warning(f"[{bot_name}] Gemini stdin feed failed: {e}")
+                finally:
+                    # 무슨 일이 있어도 닫는다 — 안 닫히면 CLI 가 EOF 를 기다리며 멈춘다
+                    try:
+                        p.stdin.close()
+                    except Exception:
+                        pass
             threading.Thread(target=_feed, daemon=True).start()
 
         response_text = ""

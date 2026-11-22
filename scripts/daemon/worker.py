@@ -196,6 +196,24 @@ class Worker(threading.Thread):
             dequeue_message(msg_id)
             return
 
+        # /advisor [모델|off] — CLI 로 보내면 ~/.claude/settings.json 에 저장돼 이 기기의 모든 세션에
+        # 퍼진다. 데몬이 받아 이 담당의 값으로만 두고 턴마다 --advisor 플래그로 넘긴다(daemon/advisor.py).
+        from daemon import advisor as _advisor
+        _adv = _advisor.parse_advisor_command(text)
+        if _adv:
+            from daemon.claude_runner import resolve_account_config_dir as _racd
+            _dev = _advisor.device_advisor_model(_racd(project))
+            if _adv[0] == "off" and _dev:
+                # 이 장치 전에 CLI 가 기기 설정에 저장해 둔 값이 있다. 그것은 CLI 만 지울 수 있으므로
+                # 담당 값을 지우고 이번 `/advisor off` 만 CLI 로 흘려보낸다(끄는 쪽이라 퍼져도 해가 없다).
+                _advisor.clear_advisor(project, "user /advisor off")
+                logger.info(f"[{self.bot_name}] /advisor off → device-level advisorModel={_dev} found, passing through to CLI ({project})")
+            else:
+                self.reply(_advisor.handle_command(_adv[0], _adv[1], project, device_model=_dev),
+                           reply_to=[msg_id], project=project)
+                dequeue_message(msg_id)
+                return
+
         # Special commands
         if text.startswith("/restart"):
             g.restart_requested = True

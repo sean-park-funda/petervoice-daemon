@@ -364,13 +364,25 @@ def get_codex_session_id(project: str) -> str | None:
         return _codex_sessions.get(project, {}).get("session_id")
 
 
-def update_codex_session(project: str, session_id: str):
+def get_codex_session_ctx(project: str) -> dict:
+    """이 세션에 마지막으로 넣어 준 시스템 지침의 표식: {"ctx_hash": str|None, "ctx_fed_at": float|None}.
+    표식이 없으면 AGENTS.md 시절에 만들어진 세션이다(지침을 대화에 받은 적이 없다)."""
+    with _codex_sessions_lock:
+        sess = _codex_sessions.get(project, {})
+        return {"ctx_hash": sess.get("ctx_hash"), "ctx_fed_at": sess.get("ctx_fed_at")}
+
+
+def update_codex_session(project: str, session_id: str, ctx_hash: str | None = None):
+    """ctx_hash 를 주면 「이 턴에 시스템 지침을 stdin 으로 넣었다」는 표식을 함께 남긴다."""
     now = datetime.now().isoformat()
     with _codex_sessions_lock:
         sess = _codex_sessions.setdefault(project, {"created_at": now, "message_count": 0})
         sess["session_id"] = session_id
         sess["last_used"] = now
         sess["message_count"] = sess.get("message_count", 0) + 1
+        if ctx_hash:
+            sess["ctx_hash"] = ctx_hash
+            sess["ctx_fed_at"] = time.time()
     _save_codex_sessions()
 
 

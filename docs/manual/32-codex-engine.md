@@ -59,6 +59,35 @@ curl -X PATCH "$API_URL/api/projects" \
 - 세션 ID: Codex 세션 UUID
 - 출력: JSONL result 이벤트 파싱
 - OPENAI_API_KEY 환경변수 필요
+- **지침(시스템 가이드·공통·역할·세션 맥락) 전달 = stdin** (2026-11-23, 아래 절)
+
+#### Codex 지침은 프로젝트 폴더에 쓰지 않는다 (2026-11-23)
+
+예전에는 턴마다 전체 프롬프트를 프로젝트 폴더 `AGENTS.md` 의 표지 블록
+(`<!-- PETERVOICE-DAEMON-PROMPT-START -->` ~ `END`)에 썼다. 디스크에 남은 스냅샷이 다른 세션·지식 그래프·git 으로 새고
+(2026-09-19 사고), 같은 폴더를 쓰는 브랜치끼리 서로 덮어썼다. 지금은 제미나이와 같이 **stdin 으로 대화에 넣는다.**
+
+| 턴 | 지침 | 실행 모양 | 로그 `ctx=` |
+|---|---|---|---|
+| 새 세션 첫 턴 | 넣음 (세션 맥락 포함) | `codex exec … -` + stdin | `new` |
+| 재개, 지침 그대로 | 안 넣음 (세션이 기억) | `codex exec … resume <sid> "<메시지>"` | `same` |
+| 재개, 표식 없는 세션 (AGENTS.md 시절에 만든 세션) | 넣음 | `… resume <sid> -` + stdin | `legacy` |
+| 재개, 지침이 바뀜 + 마지막 주입 뒤 6시간 지남 | 넣음 (「앞선 지침을 대체」 머리말) | `… resume <sid> -` + stdin | `refresh` |
+| 재개, 지침이 바뀜 + 6시간 안 됨 | 안 넣음 | argv | `throttled` |
+
+- stdin 덩어리: 머리말 한 줄 + `<petervoice_system_instructions>…</petervoice_system_instructions>` + 유저 메시지.
+  지침은 argv 에 실리지 않는다(`ps` 로 안 보인다).
+- 「지침이 바뀌었나」는 세션 맥락을 뺀 본문의 해시로 본다. 표식은 `~/.claude-daemon/codex_sessions.json` 의
+  `ctx_hash`·`ctx_fed_at` — **턴이 끝까지 돈(`turn.completed`) 경우에만** 남긴다(깨진 턴이면 다음 턴에 다시 넣는다).
+- 최소 간격은 config `codex_ctx_refresh_min_sec`(기본 21600). 0 이면 바뀐 다음 턴에 바로 넣는다. 급하면 `/reset`.
+- **예전 블록은 걷어낸다.** 코덱스는 실행할 때마다(resume 포함) 작업 폴더의 `AGENTS.md` 를 다시 읽는다(0.171 실측) —
+  블록을 남기면 낡은 지침을 끝없이 읽는다. 그래서 코덱스 턴을 띄우기 직전에 **데몬 표지 블록만** 지운다. 유저가 직접 쓴 내용과
+  줄바꿈 방식은 그대로 두고, 블록을 빼면 빈 파일이 될 때만 파일을 지운다. 표지는 줄 전체가 표지일 때만 인정하고(본문에서 언급만 한
+  파일은 안 건드림), 끝 표지가 없으면 지우지 않고 로그에 `has no end marker` 만 남긴다. 지우지 못하면(읽기 전용 등) 로그에
+  `Failed to strip daemon block` — 그 폴더의 코덱스는 낡은 블록과 새 지침을 함께 읽으니 손으로 블록을 지운다.
+  코덱스를 돌리지 않는 폴더의 옛 `AGENTS.md` 는 건드리지 않는다.
+- 한계: 코덱스가 긴 대화를 자동 압축하면 stdin 으로 넣은 지침이 요약될 수 있다(제미나이와 같음) → `/reset`.
+- 시험: `python3 scripts/test_codex_stdin_context.py`
 
 ## 자동 업데이트
 
@@ -88,7 +117,7 @@ curl -X PATCH "$API_URL/api/projects" \
 - 필요: `npm install -g @google/gemini-cli` + 시크릿 `GEMINI_API_KEY`. 둘 중 하나가 없으면 그 턴에 안내 메시지로 답하고 끝난다.
 - 모델: 브랜치 `model` > 프로젝트 `model` > config `gemini_default_model` > 기본 `gemini-4-argon`. `gemini-` 로 시작하지 않는 코드(옛 claude/gpt 잔재)는 무시.
 - 세션: `~/.claude-daemon/gemini_sessions.json` 에 프로젝트/브랜치별 UUID, 다음 턴은 `--resume <uuid>`. `/reset`(`/새세션`)으로 초기화. 세션 파일이 사라져 재개에 실패하면 자동으로 새 세션 1회 재시도.
-- 컨텍스트 주입: 시스템 가이드·공통·역할·세션 맥락을 **프로젝트 폴더에 파일로 쓰지 않고** 새 세션 첫 턴에 stdin 으로 넘긴다(코덱스 AGENTS.md 와 다른 점). 재개 턴은 메시지만 보낸다 → 세션이 살아 있는 동안의 프롬프트 수정은 `/reset` 뒤에 반영된다.
+- 컨텍스트 주입: 시스템 가이드·공통·역할·세션 맥락을 **프로젝트 폴더에 파일로 쓰지 않고** 새 세션 첫 턴에 stdin 으로 넘긴다(코덱스도 2026-11-23 부터 같은 방식). 재개 턴은 메시지만 보낸다 → 세션이 살아 있는 동안의 프롬프트 수정은 `/reset` 뒤에 반영된다.
 - 출력: `--output-format stream-json` 을 줄 단위로 읽어 도구 로그(🔧)와 본문을 웹에 스트리밍한다.
 - 스킬: Gemini CLI 는 에이전트 스킬 표준(SKILL.md)을 `~/.gemini/skills/`·`~/.agents/skills/`·워크스페이스 `.gemini/skills/` 에서 읽는다. 피터보이스 스킬을 쓰려면 `~/.gemini/skills/<name> → ~/.claude/skills/<name>` 심링크.
 - 상태: 하트비트 payload 의 `gemini_available`(설치+키, 5분 캐시).
