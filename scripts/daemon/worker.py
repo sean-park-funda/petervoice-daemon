@@ -64,7 +64,11 @@ class Worker(threading.Thread):
             # 부팅 완충 (2026-11-16): 기계가 막 켜졌으면 데몬 시작 뒤 boot_grace_sec 동안 자동 턴을 boot_auto_lanes 개로 제한
             boot_grace_sec=config.get("boot_grace_sec", BOOT_GRACE_SEC_DEFAULT),
             boot_auto_lanes=config.get("boot_auto_lanes", BOOT_AUTO_LANES_DEFAULT),
-            boot_grace_uptime_sec=config.get("boot_grace_uptime_sec", BOOT_GRACE_UPTIME_SEC_DEFAULT))
+            boot_grace_uptime_sec=config.get("boot_grace_uptime_sec", BOOT_GRACE_UPTIME_SEC_DEFAULT),
+            # 급한 자동 메시지 먼저 (2026-11-25, revenue-lab 카드 981): auto_priority_patterns(정규식 목록, 기본 없음)에 본문 머리가
+            # 맞는 자동 메시지는 사람 다음·나머지 자동 앞에 서고, auto_priority_extra_lanes(기본 0)만큼 사람 예비 칸을 빌린다
+            priority_patterns=config.get("auto_priority_patterns"),
+            priority_extra_lanes=config.get("auto_priority_extra_lanes", 0))
         self._spawned_ids: set[int] = set()
         self._spawned_lock = threading.Lock()
         # 실제 처리 중인 턴 수 — 종료 드레인 시 main()이 0이 될 때까지 대기

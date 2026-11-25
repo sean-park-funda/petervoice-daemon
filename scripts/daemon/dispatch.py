@@ -35,6 +35,21 @@
   (전사·크롤링)까지 즉시 재개하면 16GB 기계가 넘친다. 배포 재시작(따뜻한 기계)에는 적용하지 않는다.
 - 재시작 복구 메시지의 머리말 `[안내: 직전 턴이 데몬 재시작으로 중단되었습니다. …]` 은 분류 전에 벗긴다 — 전에는 이 머리말
   때문에 복구된 릴레이·하트비트가 '사람 메시지' 로 분류돼 우선순위·예비 칸·묶기 규칙을 전부 건너뛰었다.
+
+급한 자동 메시지 먼저 (2026-11-25 — revenue-lab #946 카드 981: 숨고 고객 알림이 자동 줄 25통 뒤에서 20~45분 대기):
+- 배경: 자동 칸(12칸 중 10)이 20~60분짜리 긴 턴(하부 5개 동시 작업·조사 하트비트)으로 차면, 고객이 기다리는 알림 릴레이도
+  도착순 맨 뒤에 섰다. 11/25 11:00~15:50 자동 턴 164개의 대기 중앙값 22분(전 주 낮은 1~3분), 고객이 결제 요청을 20분에 5번 재촉.
+- config `auto_priority_patterns`(정규식 목록, 기본 없음): 본문 **머리부터**(re.match — 복구 머리말은 벗긴 뒤) 맞는 자동 메시지는
+  「급한 자동」으로 센다. 순서는 사람 → 급한 자동 → 나머지 자동(같은 종류끼리 도착순). 담당이 달라도, 같은 담당 안에서도.
+  무엇이 급한지는 보내는 쪽이 아니라 **받는 기계의 주인이 config 로 정한다** — 보내는 쪽 표식으로 받으면 담당마다 자기 릴레이를
+  급하다고 붙여 순서가 다시 무너진다. 머리에 보낸 담당까지 넣어 좁게 쓴다(예시 식은 매뉴얼 03 「급한 자동 메시지」).
+- config `auto_priority_extra_lanes`(기본 0): 급한 자동 턴은 자동 칸이 다 차도 사람 예비 칸을 이만큼 빌려 시작한다. 사람 예비 칸은
+  최소 1개 남긴다(예비 2 → 최대 1칸). 전체 동시 실행은 여전히 max_workers 를 넘지 않는다. 부팅 완충 중에는 빌리지 않는다.
+- 급한 대우로 동시에 도는 턴은 자동 칸의 절반까지다. 넘으면 급한 메시지도 보통 자동처럼 도착순으로 선다 — 알림이 몰리거나 패턴을
+  넓게 써도 하트비트·릴레이가 굶지 않는다. 같은 supersede 키로 급한 옛 메시지를 대체한 새 메시지는 급한 등급을 물려받는다.
+- 묶기는 그대로다: 급한 메시지가 턴을 열 때 같은 담당에 쌓인 다른 릴레이·알림도 **도착순으로** 같이 묶인다(바로잡는 글을 놓치지 않게).
+  그 담당이 이미 긴 턴을 돌고 있으면 그 턴이 끝나야 시작한다 — 담당당 한 턴 규칙은 넘지 않는다.
+- 로그: 급한 자동 턴은 기다린 시간과 상관없이 `[queue] … started after Ns wait (…) [priority #급한 메시지 id]` 한 줄을 남긴다.
 """
 import itertools
 import re
@@ -62,6 +77,9 @@ RESUME_NOTICE = (
 )
 _NOTICE_RE = re.compile(r"^\s*\[안내:[^\]]*\]\s*")
 
+# 급한 자동 메시지 판정이 보는 본문 앞 글자 수
+PRIORITY_MATCH_CHARS = 400
+
 # 부팅 완충 기본값 (config 키와 같은 이름)
 BOOT_GRACE_SEC_DEFAULT = 180
 BOOT_AUTO_LANES_DEFAULT = 1
@@ -77,6 +95,31 @@ def body_text(msg: dict) -> str:
 def is_automatic(msg: dict) -> bool:
     text = body_text(msg)
     return text.startswith(AUTO_PREFIXES) and not WORKBENCH_HUMAN.match(text)
+
+
+def compile_priority_patterns(patterns, logger=None) -> list:
+    """config `auto_priority_patterns` → 컴파일된 정규식 목록. 틀린 식·빈 값은 경고만 남기고 건너뛴다
+    (설정 한 줄 오타로 데몬이 못 뜨거나 대기열이 서는 일은 없어야 한다)."""
+    if isinstance(patterns, str):
+        patterns = [patterns]
+    out = []
+    for p in (patterns if isinstance(patterns, (list, tuple)) else []):
+        if not isinstance(p, str) or not p.strip():
+            continue
+        try:
+            out.append(re.compile(p))
+        except re.error as e:
+            if logger:
+                logger.warning(f"[queue] auto_priority_patterns: bad regex skipped ({e}): {p[:80]}")
+    return out
+
+
+def is_priority_auto(msg: dict, patterns) -> bool:
+    """급한 자동 메시지인가 — 자동 메시지이고 본문 머리가 패턴 중 하나에 맞을 때만."""
+    if not patterns or not is_automatic(msg):
+        return False
+    text = body_text(msg)[:PRIORITY_MATCH_CHARS]   # 머리만 본다 — 느린 식이 긴 본문에서 폴링 스레드를 붙잡지 않게
+    return any(p.match(text) for p in patterns)
 
 
 def is_mergeable(msg: dict) -> bool:
@@ -162,13 +205,14 @@ def system_uptime_sec() -> float | None:
 
 
 class _Item:
-    __slots__ = ("seq", "msg", "project", "auto", "enqueued_at")
+    __slots__ = ("seq", "msg", "project", "auto", "prio", "enqueued_at")
 
-    def __init__(self, seq, msg, project, auto):
+    def __init__(self, seq, msg, project, auto, prio=False):
         self.seq = seq
         self.msg = msg
         self.project = project
         self.auto = auto
+        self.prio = bool(prio and auto)   # 급한 자동 (사람 메시지는 이미 맨 앞이라 해당 없음)
         self.enqueued_at = time.monotonic()
 
 
@@ -176,7 +220,8 @@ class TurnDispatcher:
     def __init__(self, max_workers: int, reserve: int, run_turn, submit, logger=None, shutdown_event=None,
                  merge_enabled: bool = True, merge_max: int = MERGE_MAX_DEFAULT, on_superseded=None,
                  boot_grace_sec: float = 0, boot_auto_lanes: int = BOOT_AUTO_LANES_DEFAULT,
-                 boot_grace_uptime_sec: float = BOOT_GRACE_UPTIME_SEC_DEFAULT, uptime_fn=None):
+                 boot_grace_uptime_sec: float = BOOT_GRACE_UPTIME_SEC_DEFAULT, uptime_fn=None,
+                 priority_patterns=None, priority_extra_lanes: int = 0):
         self.max_workers = max(1, int(max_workers))
         # 자동 턴 칸은 최소 1개는 남긴다 (reserve 가 커도 하트비트·릴레이가 영영 안 도는 일은 없게)
         self.reserve = max(0, min(int(reserve or 0), self.max_workers - 1))
@@ -203,11 +248,26 @@ class TurnDispatcher:
         self.boot_grace_uptime_sec = max(0.0, float(boot_grace_uptime_sec or 0))
         self._uptime_fn = uptime_fn or system_uptime_sec
         self._boot_until = 0.0
+        # 급한 자동 메시지 (2026-11-25) — 패턴이 없으면 전부 꺼진 것과 같다
+        self._prio_patterns = compile_priority_patterns(priority_patterns, logger)
+        try:
+            _extra = int(priority_extra_lanes or 0)
+        except (TypeError, ValueError):
+            _extra = 0
+        # 빌리는 칸은 사람 예비 칸을 최소 1개 남긴다 — 급한 턴이 예비 칸을 다 쓰면 사람 메시지가 긴 자동 턴 뒤에 선다
+        self.priority_extra = max(0, min(_extra, self.reserve - 1)) if self._prio_patterns else 0
+        # 급한 대우(앞줄·빌리기)를 받으며 동시에 도는 턴 상한 = 자동 칸의 절반. 넘으면 급한 메시지도 보통 자동처럼 도착순으로 선다
+        # — 패턴이 넓거나 알림이 몰려도 하트비트·릴레이가 자동 칸의 절반은 쓴다(포화가 급한 쪽으로 옮겨 가지 않게).
+        self.priority_max_running = max(1, (self.max_workers - self.reserve) // 2)
+        self._prio_running = 0
+        self._prio_started = 0
 
     # ── 바깥 API ──
     def enqueue(self, msg: dict, project: str | None = None):
         project = project or msg.get("project") or "general"
-        item = _Item(next(self._seq), msg, project, is_automatic(msg))
+        auto = is_automatic(msg)
+        item = _Item(next(self._seq), msg, project, auto,
+                     prio=auto and is_priority_auto(msg, self._prio_patterns))
         key = supersede_key(msg) if item.auto else None
         dropped: list[_Item] = []
         with self._cv:
@@ -218,6 +278,9 @@ class TurnDispatcher:
                         self._pending.remove(it)
                         dropped.append(it)
                 self._superseded += len(dropped)
+                # 급한 옛 메시지를 대체한 새 메시지는 급한 등급을 물려받는다 (같은 방의 바로잡는 글이 줄 맨 뒤로 가지 않게)
+                if any(it.prio for it in dropped):
+                    item.prio = True
             self._pending.append(item)
             self._cv.notify()
         for it in dropped:
@@ -233,6 +296,11 @@ class TurnDispatcher:
 
     def start(self):
         if self._thread is None:
+            if self._log and self._prio_patterns:
+                _cap = self.max_workers - self.reserve
+                self._log.info(f"[queue] priority auto: {len(self._prio_patterns)} pattern(s), "
+                               f"auto cap {_cap} → priority cap {_cap + self.priority_extra} of {self.max_workers}, "
+                               f"at most {self.priority_max_running} priority turns at once")
             self._arm_boot_grace()
             self._thread = threading.Thread(target=self._loop, daemon=True, name="dispatch")
             self._thread.start()
@@ -273,23 +341,30 @@ class TurnDispatcher:
                 "merged_msgs": self._merged_msgs,
                 "superseded": self._superseded,
                 "boot_grace_left": round(self.boot_grace_left(), 1),
+                "priority_patterns": len(self._prio_patterns),
+                "priority_extra": self.priority_extra,
+                "priority_running": self._prio_running,
+                "priority_started": self._prio_started,
             }
 
     # ── 내부 ──
     def _pick(self):
-        """cv 를 쥔 채 호출. 지금 시작할 수 있는 것 중 (사람 먼저, 그 다음 도착 순) 하나를 고른다."""
+        """cv 를 쥔 채 호출. 지금 시작할 수 있는 것 중 (사람 → 급한 자동 → 나머지 자동, 그 다음 도착 순) 하나를 고른다."""
         if self._running >= self.max_workers:
             return None
         auto_cap = self.max_workers - self.reserve
+        prio_cap = auto_cap + self.priority_extra     # 급한 자동은 사람 예비 칸을 priority_extra 개까지 빌린다
         if self._boot_until and time.monotonic() < self._boot_until:
-            auto_cap = min(auto_cap, self.boot_auto_lanes)
+            auto_cap = prio_cap = min(auto_cap, self.boot_auto_lanes)   # 부팅 완충 중에는 빌리지 않는다
         best = None
+        prio_open = self._prio_running < self.priority_max_running   # 급한 대우 자리가 남았나
         for it in self._pending:
             if it.project in self._running_projects:
                 continue
-            if it.auto and self._auto_running >= auto_cap:
+            fast = it.prio and prio_open
+            if it.auto and self._auto_running >= (prio_cap if fast else auto_cap):
                 continue
-            key = (1 if it.auto else 0, it.seq)
+            key = ((1 if fast else 2) if it.auto else 0, it.seq)
             if best is None or key < best[0]:
                 best = (key, it)
         return best[1] if best else None
@@ -322,11 +397,19 @@ class TurnDispatcher:
                     self._cv.wait(timeout=1.0)
                     continue
                 self._pending.remove(item)
+                # 급한 대우(앞줄·빌리기)로 시작하는가 — _pick 과 같은 조건. 끝날 때 _release 가 같은 표식으로 뺀다
+                item.prio = bool(item.prio and self._prio_running < self.priority_max_running)
+                prio_id = item.msg.get("id")
                 extra = self._collect_merge(item)
                 if extra:
-                    item.msg = merge_messages([item.msg] + [it.msg for it in extra])
+                    # 급한 메시지가 턴을 열면 먼저 와 있던 릴레이가 extra 에 있을 수 있다 — 묶음은 늘 도착순
+                    group = sorted([item] + extra, key=lambda x: x.seq)
+                    item.msg = merge_messages([it.msg for it in group])
                     self._merged_turns += 1
                     self._merged_msgs += 1 + len(extra)
+                if item.prio:
+                    self._prio_running += 1
+                    self._prio_started += 1
                 self._running_projects.add(item.project)
                 self._running += 1
                 if item.auto:
@@ -337,10 +420,11 @@ class TurnDispatcher:
                 ids = ",".join(f"#{i}" for i in item.msg.get("merged_ids") or [])
                 self._log.info(f"[queue] merged {1 + len(extra)} auto msgs → {item.project}: {ids} "
                                f"(one turn; pending {pending})")
-            if self._log and waited > 5:
+            if self._log and (waited > 5 or item.prio):
                 self._log.info(
                     f"[queue] msg #{item.msg.get('id')} → {item.project} started after {waited:.0f}s wait "
-                    f"(running {running}/{self.max_workers}, auto {auto_running}, pending {pending})")
+                    f"(running {running}/{self.max_workers}, auto {auto_running}, pending {pending})"
+                    + (f" [priority #{prio_id}]" if item.prio else ""))
             try:
                 self._submit(self._run, item)
             except RuntimeError:
@@ -360,4 +444,6 @@ class TurnDispatcher:
             self._running -= 1
             if item.auto:
                 self._auto_running -= 1
+            if item.prio:
+                self._prio_running -= 1
             self._cv.notify()

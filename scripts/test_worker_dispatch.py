@@ -19,7 +19,7 @@ sys.path.insert(0, str(ROOT))
 
 from daemon.dispatch import (  # noqa: E402
     TurnDispatcher, is_automatic, is_mergeable, merge_messages, supersede_key, turn_message_ids,
-    RESUME_NOTICE, body_text,
+    RESUME_NOTICE, body_text, compile_priority_patterns, is_priority_auto,
 )
 
 FAILS = []
@@ -308,6 +308,122 @@ m = merge_messages([{"id": 1, "text": "[relay from:a] 하나", "created_at": "20
                     {"id": 2, "text": "[relay from:b] 둘", "created_at": None, "project": "P"}])
 check(m["merged_ids"] == [1, 2] and m["project"] == "P" and m["id"] == 1, "merge keeps first id/project")
 check("━━━ 2/2 · #2 ━━━" in m["text"], "missing created_at → no time stamp, no crash")
+
+# ── 2026-11-25 급한 자동 메시지 먼저 (revenue-lab #946 카드 981 — 숨고 고객 알림이 자동 줄 25통 뒤에서 20~45분 대기) ──
+PRIO = [r"^\[relay from:revenue-lab branch:(959|1085)\]\s*\[숨고 (고객 추가 메시지|진행 중 방)"]
+CUST = "[relay from:revenue-lab branch:959]\n[숨고 고객 추가 메시지 · 자동] 인쇄물 디자인 · 홍길동 님"
+ROOM = "[relay from:revenue-lab branch:959]\n[숨고 진행 중 방 · 담당 턴 10분째 · 자동] 인쇄물 디자인"
+
+# 14. 분류기: 머리가 맞는 자동 메시지만 급함 — 사람 글·다른 발신·본문 중간 언급·틀린 식은 아님
+pp = compile_priority_patterns(PRIO)
+check(is_priority_auto({"text": CUST}, pp) and is_priority_auto({"text": ROOM}, pp), "customer alert / in-progress room = priority auto")
+check(is_priority_auto({"text": RESUME_NOTICE + CUST}, pp), "resumed customer alert = priority auto")
+check(not is_priority_auto({"text": "[relay from:revenue-lab branch:1085]\n[시각 알림 · 자동] 견적만 나간 방"}, pp), "other alert from the same sender = ordinary auto")
+check(not is_priority_auto({"text": "[relay from:game-develop]\n[숨고 고객 추가 메시지 · 자동] 흉내"}, pp), "same head from another sender = ordinary auto")
+check(not is_priority_auto({"text": "[relay from:coo]\n참고: [relay from:revenue-lab branch:959]\n[숨고 고객 추가 메시지 · 자동]"}, pp), "mention mid-body = ordinary auto")
+check(not is_priority_auto({"text": "[숨고 고객 추가 메시지 · 자동] 사람이 붙여 넣은 글"}, pp), "human message never priority-auto (already first)")
+check(not is_priority_auto({"text": CUST}, []) and not is_priority_auto({"text": CUST}, None), "no patterns → feature off")
+check(len(compile_priority_patterns(["(unclosed", "", None, 3, r"^\[heartbeat\]"])) == 1, "bad regex / junk entries skipped, good one kept")
+check(len(compile_priority_patterns(r"^\[relay from:x\]")) == 1 and compile_priority_patterns(None) == [], "string → one pattern, None → none")
+
+# 15. 다른 담당끼리: 자동 칸 1개가 차 있어도, 풀리면 나중에 온 급한 알림이 먼저 온 자동 메시지들을 앞지른다. 사람은 여전히 맨 앞
+s, order, gate_t, turns, _, st = scenario("priority auto jumps the auto queue", 1, 0, [
+    {"id": "L1", "project": "L", "text": "[relay from:funda-rebuild]\n긴 작업"},
+    {"id": "A1", "project": "A", "text": "[heartbeat] a"},
+    {"id": "B1", "project": "B", "text": "[relay from:game-develop]\nb"},
+    {"id": "C1", "project": "branch:1084", "text": CUST},
+    {"id": "H1", "project": "H", "text": "사람이 친 메시지"},
+], priority_patterns=PRIO)
+check(order == [["L1"], ["H1"], ["C1"], ["A1"], ["B1"]], f"L1 (running) → human → customer alert → A1 → B1: {order}")
+check(st["priority_started"] == 1 and st["priority_patterns"] == 1, f"stats count the priority start {st}")
+
+# 16. 패턴이 없으면 예전 그대로 도착순
+s, order, *_ = scenario("no patterns → plain FIFO", 1, 0, [
+    {"id": "L1", "project": "L", "text": "[relay from:funda-rebuild]\n긴 작업"},
+    {"id": "A1", "project": "A", "text": "[heartbeat] a"},
+    {"id": "C1", "project": "branch:1084", "text": CUST},
+])
+check(order == [["L1"], ["A1"], ["C1"]], f"unchanged without config: {order}")
+
+# 17. 같은 담당 안에서: 급한 알림이 하트비트를 앞지르고, 먼저 와 있던 릴레이는 같은 턴에 **도착순으로** 묶인다
+s, order, gate_t, turns, _, st = scenario("priority within one project merges in arrival order", 1, 0, [
+    {"id": "r0", "project": "branch:950", "text": "[relay from:revenue-lab branch:946]\n먼저 돌던 턴"},
+    {"id": "hb", "project": "branch:950", "text": "[heartbeat] HEARTBEAT-branch-950.md"},
+    {"id": "r1", "project": "branch:950", "text": "[relay from:revenue-lab branch:946]\n팀장 지시", "created_at": "2026-11-25T05:00:00+00:00"},
+    {"id": "c1", "project": "branch:950", "text": CUST, "created_at": "2026-11-25T05:01:00+00:00"},
+], priority_patterns=PRIO)
+check(order == [["r0"], ["r1", "c1"], ["hb"]], f"r0 → (r1 + customer alert, arrival order) → heartbeat last: {order}")
+mm = next((m for ids, m in turns if ids == ["r1", "c1"]), None)
+check(mm is not None and mm["text"].index("팀장 지시") < mm["text"].index("숨고 고객 추가 메시지"), "merged body keeps arrival order (older relay first)")
+check(mm is not None and mm["id"] == "r1" and [p["id"] for p in mm["merged_parts"]] == ["r1", "c1"], "merged base id = oldest (r1), merged_parts in arrival order")
+
+# 18. 예비 칸 빌리기: 자동 칸(3-2=1)이 차 있어도 급한 알림은 사람 예비 칸 1개를 빌려 바로 시작, 보통 자동은 기다린다.
+#     빌린 뒤에도 사람 칸 1개는 남아 사람 메시지가 바로 시작한다 (리뷰 11/25: 예비 칸을 다 빌려주면 사람이 긴 자동 턴 뒤에 선다)
+s, order, gate_t, turns, _, st = scenario("priority auto borrows a reserve lane, one stays for humans", 3, 2, [
+    {"id": "X1", "project": "X", "text": "[heartbeat] x"},
+    {"id": "Z1", "project": "Z", "text": "[relay from:q]\nz"},
+    {"id": "C1", "project": "branch:1084", "text": CUST, "dur": 0.4},
+    {"id": "C2", "project": "branch:950", "text": CUST},
+    {"id": "H1", "project": "H", "text": "사람이 친 메시지"},
+], merge_enabled=False, priority_patterns=PRIO, priority_extra_lanes=2)
+check(st["priority_extra"] == 1, f"extra lanes clamped to reserve-1 = 1 ({st['priority_extra']})")
+check(s["C1"] < gate_t, f"customer alert started at {s['C1']}s while the auto lane was busy")
+check(s["H1"] < gate_t, f"human H1 started at {s['H1']}s — one reserve lane was kept for humans")
+check(s["Z1"] >= gate_t, f"ordinary auto Z1 still waited ({s['Z1']}s ≥ gate {gate_t}s)")
+check(st["max_auto_concurrency"] == 2, f"auto concurrency peaked at cap+1 = 2 ({st['max_auto_concurrency']})")
+check(st["priority_running"] == 0, f"priority counter released ({st['priority_running']})")
+
+# 19. 빌리기 0(기본)이면 순서만 앞선다 — 자동 칸이 풀릴 때까지는 기다린다
+s, order, gate_t, turns, _, st = scenario("no borrowing by default", 2, 1, [
+    {"id": "X1", "project": "X", "text": "[heartbeat] x"},
+    {"id": "Z1", "project": "Z", "text": "[relay from:q]\nz"},
+    {"id": "C1", "project": "branch:1084", "text": CUST},
+], merge_enabled=False, priority_patterns=PRIO)
+check(s["C1"] >= gate_t, f"customer alert waited for the auto lane without borrowing ({s['C1']}s ≥ gate {gate_t}s)")
+check(order == [["X1"], ["C1"], ["Z1"]], f"but went before Z1 once the lane freed: {order}")
+check(st["max_auto_concurrency"] == 1, f"auto concurrency stayed at the auto cap 1 ({st['max_auto_concurrency']})")
+d4 = TurnDispatcher(4, 1, run_turn=lambda m: None, submit=lambda f, it: None, priority_patterns=PRIO, priority_extra_lanes=9)
+check(d4.priority_extra == 0, f"reserve 1 → nothing to lend (humans keep their lane): {d4.priority_extra}")
+d4b = TurnDispatcher(12, 2, run_turn=lambda m: None, submit=lambda f, it: None, priority_patterns=PRIO, priority_extra_lanes=9)
+check(d4b.priority_extra == 1 and d4b.priority_max_running == 5, f"12 lanes / reserve 2 → lend 1, at most 5 priority turns ({d4b.priority_extra}, {d4b.priority_max_running})")
+d5 = TurnDispatcher(4, 2, run_turn=lambda m: None, submit=lambda f, it: None, priority_extra_lanes=2)
+check(d5.priority_extra == 0, "extra lanes ignored without patterns")
+d6 = TurnDispatcher(4, 2, run_turn=lambda m: None, submit=lambda f, it: None, priority_patterns=PRIO, priority_extra_lanes="x")
+check(d6.priority_extra == 0, "junk extra-lanes value → 0, no crash")
+
+# 19b. 급한 대우 동시 상한(자동 칸의 절반): 4칸·예비 0 → 2턴까지. 급한 턴 2개가 도는 동안 풀린 칸에서는 셋째 급한 알림도
+#      보통 자동처럼 도착순으로 선다(먼저 온 하트비트 뒤) — 급한 턴이 끝나 자리가 나야 다시 앞줄 대우를 받는다
+s, order, gate_t, turns, _, st = scenario("priority treatment capped at half the auto lanes", 4, 0, [
+    {"id": "N0", "project": "N0", "text": "[relay from:q]\n게이트로 붙잡힌 보통 턴"},
+    {"id": "C1", "project": "branch:1084", "text": CUST, "dur": 1.0},           # 급한 턴 1
+    {"id": "C2", "project": "branch:950", "text": CUST, "dur": 1.0},            # 급한 턴 2 (상한 2 도달)
+    {"id": "N1", "project": "N1", "text": "[relay from:q]\n보통", "dur": 1.0},  # 여기서 4칸이 다 찬다
+    {"id": "HB", "project": "K", "text": "[heartbeat] 먼저 온 하트비트"},
+    {"id": "C3", "project": "branch:1323", "text": CUST},                       # 급하지만 상한 초과 → 도착순
+], merge_enabled=False, priority_patterns=PRIO)
+check(order[4:] == [["HB"], ["C3"]], f"third alert queued FIFO behind the earlier heartbeat while 2 priority turns ran: {order}")
+check(st["priority_started"] == 2, f"only two turns got priority treatment ({st['priority_started']})")
+check(st["priority_running"] == 0, "priority counter back to 0")
+
+# 19c. 대체: 급한 옛 메시지를 같은 키의 보통 메시지가 대체하면 급한 등급을 물려받는다
+s, order, gate_t, turns, sup, st = scenario("superseding message inherits priority", 1, 0, [
+    {"id": "L1", "project": "L", "text": "[relay from:funda-rebuild]\n긴 작업"},
+    {"id": "A1", "project": "A", "text": "[heartbeat] a"},
+    {"id": "c1", "project": "branch:1084", "text": CUST, "metadata": {"supersede": "room:9"}},
+    {"id": "c2", "project": "branch:1084", "text": "[relay from:revenue-lab branch:946]\n같은 방 바로잡기", "metadata": {"supersede": "room:9"}},
+], priority_patterns=PRIO)
+check([(o["id"], n["id"]) for o, n in sup] == [("c1", "c2")], f"c1 superseded by c2: {sup}")
+check(order == [["L1"], ["c2"], ["A1"]], f"c2 inherited priority and went before the heartbeat: {order}")
+
+# 20. 부팅 완충 중에는 급한 알림도 자동 1칸 규칙을 따른다(빌리지 않음) — 순서만 앞선다
+s, order, gate_t, turns, _, st = scenario("boot grace: priority does not borrow", 4, 1, [
+    {"id": "X1", "project": "X", "text": "[heartbeat] x", "dur": 0.2},
+    {"id": "Z1", "project": "Z", "text": "[relay from:q]\nz", "dur": 0.2},
+    {"id": "C1", "project": "branch:1084", "text": CUST, "dur": 0.2},
+], merge_enabled=False, priority_patterns=PRIO, priority_extra_lanes=1,
+    boot_grace_sec=30, boot_auto_lanes=1, uptime_fn=lambda: 30.0)
+check(st["max_auto_concurrency"] == 1, f"auto turns never overlapped during boot grace (max {st['max_auto_concurrency']})")
+check(order == [["X1"], ["C1"], ["Z1"]], f"priority still first once the lane frees: {order}")
 
 print()
 if FAILS:
