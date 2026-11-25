@@ -425,6 +425,51 @@ s, order, gate_t, turns, _, st = scenario("boot grace: priority does not borrow"
 check(st["max_auto_concurrency"] == 1, f"auto turns never overlapped during boot grace (max {st['max_auto_concurrency']})")
 check(order == [["X1"], ["C1"], ["Z1"]], f"priority still first once the lane frees: {order}")
 
+# ── 2026-11-25 재시작 복구된 묶음 = 자동 (같은 날 16:45 재시작: 복구된 묶음 950·1084·1324 가 사람으로 세어져 사람 예비 칸을 60분 썼다) ──
+# 21. 분류기: 묶음(merged_ids 2개 이상)은 본문이 「[자동 메시지 N건 묶음]」으로 시작해도 자동. 대체 키 없음. 칸 하나라도 급하면 급함
+_b1 = {"id": 11, "project": "branch:1084", "text": "[relay from:revenue-lab branch:1085]\n[시각 알림 · 자동] 확인", "metadata": {"supersede": "room:7"}}
+_b2 = {"id": 12, "project": "branch:1084", "text": CUST}
+_b3 = {"id": 13, "project": "branch:1084", "text": "[relay from:revenue-lab branch:1085]\n[새 지시 · 자동] 체크리스트"}
+BUNDLE = merge_messages([_b1, _b2])
+RB = dict(BUNDLE, text=RESUME_NOTICE + BUNDLE["text"])           # 복구는 묶음 본문 앞에 머리말을 붙여 다시 넣는다
+RB_PLAIN = dict(merge_messages([_b1, _b3]))
+RB_PLAIN["text"] = RESUME_NOTICE + RB_PLAIN["text"]
+check(is_automatic(BUNDLE) and is_automatic(RB), "bundle / resumed bundle = automatic (was: human)")
+check(not is_mergeable(RB), "resumed bundle is not merged again (no nesting)")
+check(supersede_key(RB) is None and supersede_key(BUNDLE) is None, "bundle has no supersede key (first part's key must not drop the whole bundle)")
+check(is_priority_auto(RB, pp), "resumed bundle with a customer alert inside = priority auto")
+check(not is_priority_auto(RB_PLAIN, pp), "resumed bundle without one = ordinary auto")
+check(not is_automatic({"text": BUNDLE["text"]}), "same text without merged_ids (a human pasting it) = human")
+check(is_priority_auto(dict(merge_messages([_b1, dict(_b2, text=RESUME_NOTICE + CUST)])), pp), "part that itself carries the resume notice still matches")
+
+# 22. 복구된 묶음은 사람 예비 칸을 쓰지 않는다: 자동 칸(2-1=1)이 차 있으면 기다리고, 그 사이 사람 메시지는 바로 시작한다
+s, order, gate_t, turns, sup, st = scenario("resumed bundle stays out of the human reserve lane", 2, 1, [
+    {"id": "G0", "project": "G", "text": "[heartbeat] 게이트로 붙잡힌 긴 자동 턴"},
+    RB_PLAIN,
+    {"id": "H1", "project": "H", "text": "사람이 친 메시지"},
+])
+check(s["H1"] < gate_t, f"H1 (human) started at {s['H1']}s while the auto lane was full")
+check(s[11] >= gate_t, f"resumed bundle waited for the auto lane ({s[11]}s ≥ gate {gate_t}s) — old code ran it as human")
+check(order == [["G0"], ["H1"], [11, 13]], f"bundle ran as one turn with both ids: {order}")
+
+# 23. 대체 키가 같은 새 메시지가 와도 줄 선 복구 묶음은 통째로 빠지지 않는다 (묶음 안 다른 칸까지 사라지면 안 된다)
+s, order, gate_t, turns, sup, st = scenario("queued resumed bundle is not superseded wholesale", 1, 0, [
+    {"id": "G0", "project": "G", "text": "[heartbeat] 게이트"},
+    RB_PLAIN,
+    {"id": "n1", "project": "branch:1084", "text": "[relay from:revenue-lab branch:946]\n같은 방 바로잡기", "metadata": {"supersede": "room:7"}},
+])
+check(sup == [], f"nothing superseded: {[(o['id'], n['id']) for o, n in sup]}")
+check(order == [["G0"], [11, 13], ["n1"]], f"bundle ran, then the correcting message: {order}")
+
+# 24. 복구된 급한 묶음은 급한 줄에 선다: 자동 칸 1개가 풀리면 먼저 온 하트비트보다 먼저
+s, order, gate_t, turns, sup, st = scenario("resumed priority bundle goes before earlier ordinary auto", 1, 0, [
+    {"id": "G0", "project": "G", "text": "[relay from:q]\n게이트로 붙잡힌 보통 턴"},
+    {"id": "HB", "project": "K", "text": "[heartbeat] 먼저 온 하트비트"},
+    RB,
+], priority_patterns=PRIO)
+check(order == [["G0"], [11, 12], ["HB"]], f"priority bundle first: {order}")
+check(st["priority_started"] == 1, f"counted as one priority turn ({st['priority_started']})")
+
 print()
 if FAILS:
     print(f"FAILED {len(FAILS)}: {FAILS}")

@@ -35,6 +35,9 @@
   (전사·크롤링)까지 즉시 재개하면 16GB 기계가 넘친다. 배포 재시작(따뜻한 기계)에는 적용하지 않는다.
 - 재시작 복구 메시지의 머리말 `[안내: 직전 턴이 데몬 재시작으로 중단되었습니다. …]` 은 분류 전에 벗긴다 — 전에는 이 머리말
   때문에 복구된 릴레이·하트비트가 '사람 메시지' 로 분류돼 우선순위·예비 칸·묶기 규칙을 전부 건너뛰었다.
+- 복구된 **묶음**(재시작 전에 이미 합쳐져 돌던 턴 — 큐에 합쳐진 메시지째 남는다)도 자동이다(2026-11-25). 본문 머리가
+  「[자동 메시지 N건 묶음]」이라 머리말로는 안 잡히므로 `merged_ids` 로 판정한다. 다시 묶지 않고, 대체 키는 없으며,
+  칸 하나라도 급한 패턴에 맞으면 급한 줄에 선다. 전에는 사람으로 세어져 사람 예비 칸을 긴 자동 턴이 차지했다.
 
 급한 자동 메시지 먼저 (2026-11-25 — revenue-lab #946 카드 981: 숨고 고객 알림이 자동 줄 25통 뒤에서 20~45분 대기):
 - 배경: 자동 칸(12칸 중 10)이 20~60분짜리 긴 턴(하부 5개 동시 작업·조사 하트비트)으로 차면, 고객이 기다리는 알림 릴레이도
@@ -79,6 +82,8 @@ _NOTICE_RE = re.compile(r"^\s*\[안내:[^\]]*\]\s*")
 
 # 급한 자동 메시지 판정이 보는 본문 앞 글자 수
 PRIORITY_MATCH_CHARS = 400
+# 묶음 본문의 칸 구분선 (merge_messages 가 쓰는 `━━━ i/n · #id · 시각 ━━━`)
+_BUNDLE_SEP = re.compile(r"^━━━ \d+/\d+ · #[^\n]*━━━\n", re.M)
 
 # 부팅 완충 기본값 (config 키와 같은 이름)
 BOOT_GRACE_SEC_DEFAULT = 180
@@ -92,7 +97,24 @@ def body_text(msg: dict) -> str:
     return _NOTICE_RE.sub("", text, count=1).lstrip()
 
 
+def is_bundle(msg: dict) -> bool:
+    """merge_messages 가 만든 묶음인가 — 본문이 아니라 merged_ids 로 본다(사람이 같은 글을 붙여 넣어도 묶음이 아니다)."""
+    ids = msg.get("merged_ids")
+    return isinstance(ids, (list, tuple)) and len(ids) > 1
+
+
+def bundle_part_heads(msg: dict) -> list:
+    """묶음 본문을 구분선으로 나눠 각 칸의 머리(복구 머리말을 벗긴 앞 PRIORITY_MATCH_CHARS 자)만 돌려준다."""
+    parts = _BUNDLE_SEP.split(body_text(msg))[1:]
+    return [_NOTICE_RE.sub("", p, count=1).lstrip()[:PRIORITY_MATCH_CHARS] for p in parts]
+
+
 def is_automatic(msg: dict) -> bool:
+    # 묶음은 자동 메시지만 묶으므로 늘 자동이다. 본문이 「[자동 메시지 N건 묶음]」으로 시작해 머리말로는 안 잡힌다 —
+    # 돌던 묶음 턴이 재시작으로 끊겨 복구될 때(큐에는 합쳐진 메시지가 남는다) 사람으로 분류돼 사람 예비 칸을 쓰고
+    # 자동 칸 상한에도 안 잡혔다 (2026-11-25 16:45 Sean 맥: 복구 묶음 950·1084·1324, 사람 메시지 82~282초 대기).
+    if is_bundle(msg):
+        return True
     text = body_text(msg)
     return text.startswith(AUTO_PREFIXES) and not WORKBENCH_HUMAN.match(text)
 
@@ -118,6 +140,9 @@ def is_priority_auto(msg: dict, patterns) -> bool:
     """급한 자동 메시지인가 — 자동 메시지이고 본문 머리가 패턴 중 하나에 맞을 때만."""
     if not patterns or not is_automatic(msg):
         return False
+    if is_bundle(msg):
+        # 복구된 묶음(재시작 전에 이미 합쳐진 턴): 칸 하나라도 급하면 급하다 — 급한 알림이 턴을 열어 묶였던 것이 복구 뒤 맨 뒤로 가지 않게
+        return any(p.match(h) for h in bundle_part_heads(msg) for p in patterns)
     text = body_text(msg)[:PRIORITY_MATCH_CHARS]   # 머리만 본다 — 느린 식이 긴 본문에서 폴링 스레드를 붙잡지 않게
     return any(p.match(text) for p in patterns)
 
@@ -134,6 +159,8 @@ def is_mergeable(msg: dict) -> bool:
 
 def supersede_key(msg: dict) -> str | None:
     """릴레이 metadata.supersede — 같은 담당·같은 키의 옛 대기 메시지를 대체한다."""
+    if is_bundle(msg):
+        return None   # 묶음은 첫 칸의 metadata 를 물려받는다 — 그 키로 묶음 전체(다른 칸까지)가 빠지거나 남을 빼면 안 된다
     meta = msg.get("metadata")
     if not isinstance(meta, dict):
         return None
