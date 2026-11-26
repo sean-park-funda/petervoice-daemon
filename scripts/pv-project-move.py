@@ -4,6 +4,7 @@
 본기기(유저 열쇠의 데몬이 도는 맥)에서 실행한다. 접속은 본기기 → 기기 한 방향(ssh)뿐이다.
 
     pv-project-move.py plan   <프로젝트> --to <기기>     # 읽기만: 무엇을 어디로, 걸리는 것
+    pv-project-move.py precopy <프로젝트> --to <기기>    # 미리 복사만(배치 그대로) — 큰 프로젝트는 먼저
     pv-project-move.py move   <프로젝트> --to <기기>     # 본기기 → 기기
     pv-project-move.py back   <프로젝트>                 # 기기 → 본기기 (기기가 죽었으면 --device-dead)
     pv-project-move.py mirror <프로젝트> --install       # 기기 → 본기기 읽기 전용 거울(launchd, 기본 5분)
@@ -149,6 +150,14 @@ class Remote:
 
     def home(self) -> str:
         return self.run('printf %s "$HOME"').strip()
+
+
+# 볼륨 뿌리에 macOS 가 두는 것 — 프로젝트 안에 따로 붙인 디스크가 있으면 딸려 온다. 못 읽고(권한) 옮길 것도 아니다.
+VOLUME_JUNK = [".Spotlight-V100", ".fseventsd", ".Trashes", ".TemporaryItems", ".DocumentRevisions-V100"]
+
+
+def with_junk(excludes: list[str] | None) -> list[str]:
+    return list(dict.fromkeys(list(excludes or []) + VOLUME_JUNK))
 
 
 def rsync(src: str, dst: str, excludes: list[str], delete: bool, timeout: int = 6 * 3600) -> None:
@@ -303,8 +312,10 @@ def plists_using(local_dir: str) -> list[str]:
 
 
 def du_kb(path: str) -> int:
+    # 못 읽는 파일이 하나라도 있으면 du 는 1 로 끝나지만 합계는 찍는다 — 종료 코드로 버리지 않는다
     out = subprocess.run(["du", "-sk", path], capture_output=True, text=True)
-    return int(out.stdout.split()[0]) if out.returncode == 0 and out.stdout else 0
+    first = (out.stdout.split() or ["0"])[0]
+    return int(first) if first.isdigit() else 0
 
 
 # ─── 세션 옮기기 ─────────────────────────────────────────────────
@@ -346,6 +357,91 @@ def transcripts_of(session_id: str, claude_dir: Path) -> tuple[str, list[str]] |
             items.append(str(side))
         return p.parent.name, items
     return None
+
+
+def mounts_of(values: list[str] | None) -> list[str]:
+    return [os.path.abspath(os.path.expanduser(m)) for m in (values or [])]
+
+
+def require_mounted(mounts: list[str] | None) -> None:
+    """이 맥에서 따로 붙이는 디스크(예: branches/)가 프로젝트 폴더 안에 있을 때 — 안 붙은 채로 복사하면
+    보내는 쪽에서는 빈 폴더가 --delete 로 기기 사본을 비우고, 받는 쪽에서는 내장 디스크를 채운다."""
+    for mount in mounts or []:
+        if not os.path.ismount(mount):
+            raise MoveError(f"{mount} 이 붙어 있지 않습니다 — 디스크를 붙인 뒤 다시 하세요")
+        if not os.listdir(mount):
+            raise MoveError(f"{mount} 이 비어 있습니다 — 디스크가 제대로 붙었는지 확인하세요")
+
+
+def require_device_filled(remote: "Remote", local_dir: str, device_dir: str, mounts: list[str] | None) -> None:
+    """기기 → 이 맥(--delete) 전에: 이 맥의 따로 붙인 디스크에 해당하는 기기 쪽 폴더가 비어 있으면 그 디스크를 비우게 된다 — 막는다."""
+    for mount in mounts or []:
+        rel = os.path.relpath(mount, local_dir)
+        if rel.startswith(".."):
+            continue
+        count = remote.run(f"ls -A {shlex.quote(device_dir.rstrip('/') + '/' + rel)} 2>/dev/null | wc -l", check=False).strip()
+        if not count.isdigit() or int(count) == 0:
+            raise MoveError(f"기기의 {rel}/ 이 비어 있거나 읽히지 않습니다({count!r}) — 이 맥의 {mount} 을 덮지 않습니다")
+
+
+def sibling_tails(local_dir: str) -> list[str]:
+    """이름이 「<이 프로젝트>-…」로 시작하는 이웃 폴더의 꼬리(기억 폴더 이름에서 이 프로젝트의 하위 폴더와 구분이 안 된다 — 남의 것으로 보고 건드리지 않는다)."""
+    parent, name = os.path.dirname(local_dir.rstrip("/")), os.path.basename(local_dir.rstrip("/"))
+    head = claude_slug(local_dir)
+    tails = []
+    try:
+        for other in os.listdir(parent):
+            slug = claude_slug(os.path.join(parent, other))
+            if other != name and slug.startswith(head + "-"):
+                tails.append(slug[len(head):])
+    except OSError:
+        pass
+    return tails
+
+
+def carry_memory(remote: Remote, claude_dir: Path, local_dir: str, device_dir: str, to_device: bool) -> int:
+    """담당들의 기억 폴더(~/.claude/projects/<폴더 이름>/memory)를 옮긴다. 대화 기록과 달리 세션 번호와 무관하게 폴더째 간다
+    (새 세션으로 시작하는 담당도 기억은 이어진다). 지우지 않는 복사 — 받는 쪽에만 있는 파일은 남는다."""
+    here, there = claude_slug(local_dir), claude_slug(device_dir)
+    ssh = "ssh " + " ".join(SSH_OPTS)
+    moved = 0
+
+    others = sibling_tails(local_dir)
+
+    def mine(name: str, head: str) -> bool:
+        if name == head:
+            return True
+        tail = name[len(head):]
+        return name.startswith(head + "-") and not any(tail == o or tail.startswith(o + "-") for o in others)
+
+    if to_device:
+        for folder in sorted((claude_dir / "projects").glob(here + "*")):
+            memory = folder / "memory"
+            if not mine(folder.name, here) or not memory.is_dir() or not any(memory.iterdir()):
+                continue
+            target = f"~/.claude/projects/{there}{folder.name[len(here):]}/memory"
+            remote.run(f"mkdir -p {target}")
+            proc = subprocess.run(["rsync", "-a", "-e", ssh, str(memory) + "/", f"{remote.host}:{target}/"], capture_output=True, text=True, timeout=600)
+            if proc.returncode != 0:
+                raise MoveError(f"기억 폴더 복사 실패({folder.name}): {proc.stderr.strip()[-200:]}")
+            moved += 1
+        return moved
+    listed = remote.run(f"cd ~/.claude/projects 2>/dev/null && ls -d {there}*/memory 2>/dev/null; echo __listed__", check=False).split()
+    if "__listed__" not in listed:
+        raise MoveError("기기의 기억 폴더 목록을 읽지 못했습니다(ssh 실패)")
+    for rel in listed:
+        if rel == "__listed__":
+            continue
+        name = rel.split("/")[0]
+        if not mine(name, there):
+            continue
+        local = claude_dir / "projects" / (here + name[len(there):]) / "memory"
+        local.mkdir(parents=True, exist_ok=True)
+        proc = subprocess.run(["rsync", "-a", "-e", ssh, f"{remote.host}:~/.claude/projects/{rel}/", str(local) + "/"], capture_output=True, text=True, timeout=600)
+        if proc.returncode != 0:
+            raise MoveError(f"기억 폴더 가져오기 실패({name}): {proc.stderr.strip()[-200:]}")
+        moved += 1
+    return moved
 
 
 def device_daemon(remote: Remote, action: str) -> None:
@@ -500,7 +596,7 @@ def mirror_once(api: Api, state: State, project: str) -> int:
         return 0
     # 이 맥에서 따로 붙이는 디스크가 프로젝트 폴더 안에 있으면(예: branches/), 안 붙은 채로 당겨 와 내장 디스크를 채우지 않는다
     for mount in d.get("mirror_require_mounts") or []:
-        if not os.path.ismount(mount):
+        if not os.path.ismount(mount) or not os.listdir(mount):
             log(f"거울: {mount} 이 붙어 있지 않습니다 — 건너뜁니다")
             (state.dir / f"{project}.mirror.json").write_text(json.dumps(
                 {"at": datetime.now().isoformat(timespec="seconds"), "ok": False, "error": f"not mounted: {mount}"}, ensure_ascii=False), encoding="utf-8")
@@ -525,6 +621,7 @@ def mirror_once(api: Api, state: State, project: str) -> int:
         entries = Remote(d["ssh"]).run(f"ls -A {shlex.quote(d['device_dir'])} | wc -l", timeout=60).strip()
         if not entries.isdigit() or int(entries) == 0:
             raise MoveError(f"기기 폴더가 비어 있거나 읽히지 않습니다({entries!r}) — 거울을 덮지 않습니다")
+        require_device_filled(Remote(d["ssh"]), d["local_dir"], d["device_dir"], d.get("mirror_require_mounts"))
         rsync(f"{d['ssh']}:{d['device_dir']}", d["local_dir"], d.get("excludes") or [], delete=True, timeout=3 * 3600)
         note.update(ok=True, seconds=round(time.time() - started, 1))
     except (MoveError, subprocess.TimeoutExpired) as e:
@@ -640,7 +737,7 @@ def cmd_plan(ctx: Ctx) -> int:
     if free_kb < size_kb * 1.2:
         problems.append(f"기기 디스크가 모자랍니다: 필요 {size_kb / 1048576:.1f}GB × 1.2, 남은 {free_kb / 1048576:.1f}GB")
     existing = remote.run(f"ls -A {shlex.quote(g['device_dir'])} 2>/dev/null | head -3", check=False).strip()
-    mine = ctx.state.data.get("device_dir") == g["device_dir"] and ctx.state.data.get("phase") in ("precopied", "moving")
+    mine = ctx.state.data.get("device_dir") == g["device_dir"] and ctx.state.data.get("phase") in ("precopy", "precopied", "moving", "aborted")
     if existing and not mine and not a.adopt_existing:
         problems.append(f"기기에 대상 폴더가 이미 있고 비어 있지 않습니다: {g['device_dir']} (이어 쓰려면 --adopt-existing)")
     jobs = plists_using(g["local_dir"])
@@ -676,13 +773,18 @@ def cmd_move(ctx: Ctx) -> int:
         raise MoveError("실제로 옮기려면 --yes 를 붙이세요")
     g = gather(ctx, a.to, a.ssh, a.local_dir)
     remote: Remote = g["remote"]
-    local_dir, device_dir, excludes = g["local_dir"], g["device_dir"], a.exclude or []
+    local_dir, device_dir, excludes = g["local_dir"], g["device_dir"], with_junk(a.exclude)
     server_dir = (g["project"].get("directory") or local_dir).rstrip("/")
     keys = {ctx.project} | {f"branch:{b}" for b in g["branch_ids"]}
     queue_dir = ctx.config_dir if ctx.own_account else None
+    mounts = mounts_of(a.require_mount)
+    require_mounted(mounts)
+    before = ctx.state.data.get("excludes")
+    if ctx.state.data.get("phase") == "precopied" and before is not None and sorted(before) != sorted(excludes):
+        log(f"  ⚠️ 미리 복사 때와 제외 목록이 다릅니다({before} → {excludes}) — 그때 제외했던 것은 지금 복사되고, 지금만 제외한 것은 기기에 남습니다")
 
     ctx.state.save(project=ctx.project, device=a.to, ssh=remote.host, local_dir=local_dir, device_dir=device_dir,
-                   server_dir=server_dir, excludes=excludes, phase="precopy", api_key_file=a.api_key_file)
+                   server_dir=server_dir, excludes=excludes, phase="precopy", api_key_file=a.api_key_file, mirror_require_mounts=mounts)
 
     log(f"2/7 미리 복사 {local_dir} → {remote.host}:{device_dir}")
     remote.run(f"mkdir -p {shlex.quote(device_dir)}")
@@ -698,8 +800,16 @@ def cmd_move(ctx: Ctx) -> int:
         wait_until_quiet(ctx.api, ctx.project, queue_dir, keys, a.idle_timeout)
 
         log("4/7 마지막 복사와 대조")
+        require_mounted(mounts)
         rsync(local_dir, f"{remote.host}:{device_dir}", excludes, delete=True)
-        counts = compare(local_dir, remote, device_dir, excludes)
+        try:
+            counts = compare(local_dir, remote, device_dir, excludes)
+        except MoveError as e:
+            # 담당의 턴은 다 끝났어도 이 맥의 다른 작업(색인 갱신 등)이 그 사이 파일을 건드릴 수 있다 — 한 번만 다시
+            log(f"  대조가 어긋남 — 한 번 더 복사하고 대조합니다 ({e})")
+            rsync(local_dir, f"{remote.host}:{device_dir}", excludes, delete=True)
+            counts = compare(local_dir, remote, device_dir, excludes)
+        require_mounted(mounts)          # 복사 도중 디스크가 빠졌으면 「둘 다 비어서 같음」일 수 있다
         log(f"  같음 — 파일 {counts['files']} · 링크 {counts['links']} · 폴더 {counts['dirs']} · {counts['bytes'] / 1048576:.1f}MB")
 
         sessions = {"carried": [], "skipped": []}
@@ -710,6 +820,8 @@ def cmd_move(ctx: Ctx) -> int:
             log(f"  이어지는 세션 {len(sessions['carried'])} · 새로 시작 {len(sessions['skipped'])}")
         else:
             log("5/7 세션 옮기기 건너뜀 — 기기에서는 서버의 인계 요약으로 새 세션을 엽니다")
+        if not a.no_sessions:
+            log(f"  기억 폴더 {carry_memory(remote, ctx.claude_dir, local_dir, device_dir, to_device=True)}개 옮김")
 
         log(f"6/7 배치 = {a.to}, 폴더 칸 {server_dir} → {device_dir}")
         placed = place_final(ctx.api, ctx.project, a.to, {"from": server_dir, "to": device_dir})
@@ -738,10 +850,31 @@ def cmd_move(ctx: Ctx) -> int:
     else:
         log("7/7 확인 턴 건너뜀(--verify 없음)")
     if a.mirror:
-        mirror_install(ctx.project, ctx.config_dir, a.mirror_interval, a.api_key_file)
         ctx.state.save(mirror_interval=a.mirror_interval)
+        mirror_install(ctx.project, ctx.config_dir, a.mirror_interval, a.api_key_file)
     log("끝 — 되돌리려면: pv-project-move.py back " + ctx.project)
     return 0 if verified else 3
+
+
+def cmd_precopy(ctx: Ctx) -> int:
+    """미리 복사만 한다(배치는 그대로 — 프로젝트는 본기기에서 계속 돈다). 큰 프로젝트는 이것을 먼저 돌려 두면 move 의 멈춤 시간이 짧다."""
+    a = ctx.args
+    if cmd_plan(ctx) != 0:
+        raise MoveError("점검에서 걸린 것이 있어 복사하지 않습니다")
+    g = gather(ctx, a.to, a.ssh, a.local_dir)
+    remote: Remote = g["remote"]
+    local_dir, device_dir, excludes = g["local_dir"], g["device_dir"], with_junk(a.exclude)
+    server_dir = (g["project"].get("directory") or local_dir).rstrip("/")
+    mounts = mounts_of(a.require_mount)
+    require_mounted(mounts)
+    ctx.state.save(project=ctx.project, device=a.to, ssh=remote.host, local_dir=local_dir, device_dir=device_dir,
+                   server_dir=server_dir, excludes=excludes, phase="precopy", api_key_file=a.api_key_file, mirror_require_mounts=mounts)
+    log(f"미리 복사 {local_dir} → {remote.host}:{device_dir}")
+    remote.run(f"mkdir -p {shlex.quote(device_dir)}")
+    rsync(local_dir, f"{remote.host}:{device_dir}", excludes, delete=False)
+    ctx.state.save(phase="precopied", precopied_at=datetime.now().isoformat(timespec="seconds"))
+    log("미리 복사 끝 — 이어서 move (같은 --exclude 로)")
+    return 0
 
 
 def cmd_back(ctx: Ctx) -> int:
@@ -772,6 +905,8 @@ def cmd_back(ctx: Ctx) -> int:
         else:
             log(f"2/5 가져오기 {remote.host}:{device_dir} → {local_dir}")
             os.makedirs(local_dir, exist_ok=True)
+            require_mounted(d.get("mirror_require_mounts"))
+            require_device_filled(remote, local_dir, device_dir, d.get("mirror_require_mounts"))
             rsync(f"{remote.host}:{device_dir}", local_dir, excludes, delete=True)
             counts = compare(local_dir, remote, device_dir, excludes)
             log(f"  같음 — 파일 {counts['files']} · {counts['bytes'] / 1048576:.1f}MB")
@@ -779,6 +914,11 @@ def cmd_back(ctx: Ctx) -> int:
                 log("3/5 세션(대화 기록) 가져오기")
                 sessions = carry_sessions_back(remote, ctx.sessions_path, ctx.claude_dir, ctx.project, branch_ids, local_dir, device_dir)
                 log(f"  이어지는 세션 {len(sessions['continued'])} · 이 맥에서 새로 시작 {len(sessions['fresh_on_primary'])}")
+            if not a.no_sessions:
+                try:
+                    log(f"  기억 폴더 {carry_memory(remote, ctx.claude_dir, local_dir, device_dir, to_device=False)}개 가져옴")
+                except MoveError as e:
+                    log(f"  ⚠️ 기억 폴더를 가져오지 못했습니다(기기에는 남아 있습니다 — 손으로 가져오세요): {e}")
 
         log(f"4/5 배치 = 본기기, 폴더 칸 {device_dir} → {server_dir}")
         placed = place_final(ctx.api, ctx.project, None, {"from": device_dir, "to": server_dir})
@@ -847,15 +987,19 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
 
-    for name in ("plan", "move"):
+    for name in ("plan", "precopy", "move"):
         p = sub.add_parser(name, parents=[common])
         p.add_argument("--to", required=True, help="기기 이름")
         p.add_argument("--ssh", default=None, help="기기의 ssh 이름(기본: 기기 이름)")
         p.add_argument("--local-dir", default=None, help="이 맥의 프로젝트 폴더(기본: 서버의 폴더 칸)")
         p.add_argument("--adopt-existing", action="store_true")
+        if name == "precopy":
+            p.add_argument("--exclude", action="append", help="복사하지 않을 파일 · 폴더 이름(여러 번)")
+            p.add_argument("--require-mount", action="append", help="이 맥에 붙어 있어야 하는 마운트 지점(여러 번)")
         if name == "move":
             p.add_argument("--yes", action="store_true")
             p.add_argument("--exclude", action="append", help="복사하지 않을 파일 · 폴더 이름(여러 번)")
+            p.add_argument("--require-mount", action="append", help="복사 · 거울 · 되돌리기 전에 이 맥에 붙어 있어야 하는 마운트 지점(여러 번)")
             p.add_argument("--no-sessions", action="store_true")
             p.add_argument("--idle-timeout", type=float, default=45, help="돌던 턴이 끝나기를 기다릴 분")
             p.add_argument("--device-idle-wait", type=float, default=10, help="세션 장부를 적으려고 기기가 쉬기를 기다릴 분")
@@ -879,7 +1023,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         ctx = Ctx(args)
-        return {"plan": cmd_plan, "move": cmd_move, "back": cmd_back, "mirror": cmd_mirror, "status": cmd_status}[args.command](ctx)
+        return {"plan": cmd_plan, "precopy": cmd_precopy, "move": cmd_move, "back": cmd_back, "mirror": cmd_mirror,
+                "status": cmd_status}[args.command](ctx)
     except MoveError as e:
         log(f"중단: {e}")
         return 2
