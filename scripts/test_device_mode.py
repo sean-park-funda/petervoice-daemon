@@ -72,13 +72,38 @@ check(sb.resolve_user_id() is None and g.DEVICE_NAME == "gamemac", "server unrea
 reset(device="gamemac")
 sb.sync_null_directories()
 check(calls == [], "device: sync_null_directories makes no API call")
-prompts._roster_cache.clear()
-check(prompts.build_agent_roster() == "", "device: roster is empty without API calls")
 
 reset()
 responses[("GET", "/api/projects")] = {"projects": []}
 sb.sync_null_directories()
 check(calls == [("GET", "/api/projects")], "primary: sync_null_directories unchanged")
+
+# ── 2b. 명부: 기기는 서버가 준 자기 몫만 싣고, 「여기 없으면 없다」고 적지 않는다 ──
+import daemon.api as dapi  # noqa: E402
+dapi.api_request = fake_api            # build_agent_roster 는 부를 때 daemon.api 에서 가져온다
+
+
+def roster(device):
+    reset(device=device)
+    prompts._roster_cache.clear()
+    responses[("GET", "/api/projects")] = {"projects": [{"id": "game-develop", "name": "게임 개발"}]}
+    responses[("GET", "/api/branches")] = {"branches": [{"id": 1230, "project_id": "game-develop", "title": "전략판", "updated_at": "2026-11-26"}]}
+    return prompts.build_agent_roster()
+
+
+text = roster("gamemac")
+check(calls == [("GET", "/api/projects"), ("GET", "/api/branches?all_active=1")], "device: roster reads the two agent routes")
+check("`game-develop`" in text and "#1230 전략판" in text, "device: roster lists its own project and branch")
+check("「gamemac」" in text and "allowed_targets" in text, "device: roster says it is this Mac's share and how relays are allowed")
+check("존재하지 않는다" not in text, "device: roster does not claim unlisted agents do not exist")
+
+text = roster(None)
+check("존재하지 않는다" in text and "allowed_targets" not in text and "`game-develop`" in text, "primary: roster wording unchanged")
+
+reset(device="gamemac")
+prompts._roster_cache.clear()
+check(prompts.build_agent_roster() == "", "device: nothing placed yet → empty roster (placeholder falls back to the lookup hint)")
+prompts._roster_cache.clear()
 
 # ── 3. 비밀값: 기기는 허용이 0개가 되면 지운다 ──────────────────
 def sync(secrets):

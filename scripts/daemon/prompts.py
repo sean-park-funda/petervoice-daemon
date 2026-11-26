@@ -97,8 +97,9 @@ def build_agent_roster() -> str:
     if not api_key:
         return cached or ""
     import daemon.globals as g
-    if g.DEVICE_NAME:
-        return ""  # 기기 데몬은 계정의 프로젝트 · 브랜치 목록을 읽지 못한다 (기기용 명부는 서버가 열어 준 뒤에)
+    # 기기 데몬(한 계정 · 여러 기기): 서버가 기기 열쇠에는 이 맥에 놓인 프로젝트 · 그 브랜치만 돌려준다.
+    # 같은 계정의 다른 담당은 명부에 안 보이므로 「여기 없으면 없다」고 적으면 틀린다 — 머리말을 따로 쓴다.
+    device = g.DEVICE_NAME
 
     try:
         proj_res = api_request(api_key, "GET", "/api/projects", timeout=10) or {}
@@ -140,10 +141,18 @@ def build_agent_roster() -> str:
         if not proj_lines and not branch_lines:
             return cached or ""
 
-        parts = [
-            "## 담당자 명부 (자동 주입 — 지금 이 순간의 실제 목록)",
-            "릴레이·핸드오프 대상은 **여기서만** 고른다. 여기 없는 대상은 존재하지 않는다 (추측 금지).",
-        ]
+        if device:
+            parts = [
+                f"## 담당자 명부 (자동 주입 — 이 맥 「{device}」에 놓인 프로젝트만)",
+                "이 맥에는 계정의 프로젝트 중 일부만 놓여 있고, 아래가 그 전부다. 같은 계정의 다른 담당은 다른 맥에서 돌아 여기에 보이지 않는다. "
+                "그쪽으로 가는 릴레이는 계정 주인이 이 맥에 허용한 대상에게만 전달된다 — 허용되지 않은 대상이면 서버가 거절하면서 "
+                "응답의 `allowed_targets` 로 보낼 수 있는 프로젝트 id 를 알려 준다(추측으로 다른 id 를 시도하지 말 것).",
+            ]
+        else:
+            parts = [
+                "## 담당자 명부 (자동 주입 — 지금 이 순간의 실제 목록)",
+                "릴레이·핸드오프 대상은 **여기서만** 고른다. 여기 없는 대상은 존재하지 않는다 (추측 금지).",
+            ]
         if proj_lines:
             parts.append("### 프로젝트 — 릴레이 `to_project`, 핸드오프 `[[voice/handoff:id:용건]]`\n" + "\n".join(proj_lines))
         if branch_lines:
