@@ -631,6 +631,8 @@ def _check_cloudflared_health():
 
     if not config.get("home_portal_enabled", True):
         return
+    if g.DEVICE_NAME:
+        return  # 기기 데몬: 포탈·터널을 띄우지 않으므로 헬스체크/복구도 하지 않는다 (없는 연결기를 20초마다 살리려 들지 않게)
     if config.get("portal_shared"):
         return  # 공유 맥: 터널·포탈은 소유자 데몬이 관리 — 테넌트는 헬스체크/복구 안 함
     if sys.platform != "darwin":  # macOS 전용 (Windows 등 제외)
@@ -1011,7 +1013,7 @@ def main():
         # 추가 기기(한 계정 · 여러 기기): 자기 몫 프로젝트의 턴만 돌린다. 계정 전체를 다루는 일은 본기기 것이다.
         is_device = bool(g.DEVICE_NAME)
         if is_device:
-            logger.info(f"Device mode: \"{g.DEVICE_NAME}\" — account-wide jobs (default projects, summon, session report, manager, portal tunnel) are left to the primary daemon")
+            logger.info(f"Device mode: \"{g.DEVICE_NAME}\" — account-wide jobs (default projects, session report, manager, portal tunnel) are left to the primary daemon")
         else:
             # Ensure default projects (sysadmin, manager) exist
             ensure_default_projects()
@@ -1026,8 +1028,8 @@ def main():
         # DocsSyncer removed — docs are now served via Home Portal API directly
 
         AutoUpdater().start()
-        if not is_device:
-            SummonManager().start()
+        # 소환은 기기에서도 돈다 — 서버(/api/bot/summon)가 그 기기에 놓인 프로젝트가 연 소환만 내려준다
+        SummonManager().start()
 
         worker = Worker()
         worker.start()
