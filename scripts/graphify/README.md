@@ -34,5 +34,10 @@ launchd `com.petervoice.graphify-sync` 가 30분마다 `graphify-sync.sh` 를 �
 - **`set -e` + `graphify update`**: 5,000노드 초과 프로젝트는 HTML viz 에서 반드시 non-zero 를 내는데,
   `set -e` 가 즉시 끝내버려 다음 줄 `rc=$?` 가 실행조차 안 됐다 → `peter-voice` 차례마다 전체 중단.
   로그에 "sync started" 는 있고 "sync done" 이 없는 구간이 그 흔적이다.
+- **`find` 의 rc=1 (2026-11-21~27, 6일 정지)**: 프로젝트 폴더 안에 볼륨이 마운트되자(`designer/tools`) 볼륨 맨 위
+  `.Spotlight-V100` 을 launchd 권한으로 못 읽어 find 가 rc=1 → `set -e` 가 그 프로젝트 차례에서 전체 중단.
+  오류 문구는 `2>/dev/null` 로 숨겨져 있었다 → `|| true` + 볼륨 메타 폴더 prune. 같은 날 `ERR` 트랩을 넣어
+  이제 멈추면 로그에 `=== sync ABORTED (rc=…, line …) ===` 이 남는다.
 
 수정 시 주의: **성공 판정을 종료코드로 하지 말 것.** graph.json 갱신 여부/유효성으로 판정한다.
+멈췄는지 볼 때: `launchctl list com.petervoice.graphify-sync`(LastExitStatus) 와 로그의 마지막 `sync done` 시각.

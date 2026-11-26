@@ -14,6 +14,10 @@ LOG="/Users/sean/.claude-daemon/graphify-sync.log"
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG"; }
 
+# set -e 가 스크립트를 끝낼 때 어디서 끝났는지 로그에 남긴다. 이 스크립트는 종료코드 하나로
+# 세 번(09-06 · 09-06 · 11-21) 조용히 멈췄고, 매번 "sync done 이 없다"는 것 말고는 흔적이 없었다.
+trap 'log "=== sync ABORTED (rc=$?, line $LINENO) ==="' ERR
+
 log "=== sync started ==="
 
 updated=0
@@ -43,10 +47,15 @@ for project_dir in "${ALL_PROJECT_DIRS[@]}"; do
     # (2026-08-08 evolution 지적). 프로젝트 루트를 훑되 잡음 디렉토리는 제외.
     graph_json="$project_dir/graphify-out/graph.json"
     newer_files=$(find "$project_dir" \
-        \( -name node_modules -o -name .git -o -name graphify-out -o -name .next -o -name dist \) -prune -o \
-        -name "*.md" -newer "$graph_json" -print -quit 2>/dev/null)
+        \( -name node_modules -o -name .git -o -name graphify-out -o -name .next -o -name dist \
+           -o -name .Spotlight-V100 -o -name .fseventsd -o -name .Trashes -o -name .DocumentRevisions-V100 \) -prune -o \
+        -name "*.md" -newer "$graph_json" -print -quit 2>/dev/null || true)
     # -print -quit 로 첫 매치에서 멈춘다. 예전 `| head -1` 은 find 에 SIGPIPE 를 보내고
     # pipefail 이 141 을 물려받아 set -e 가 스크립트를 통째로 중단시켰다 (2026-09-06).
+    # `|| true`: find 는 못 읽는 폴더 하나만 만나도 rc=1 을 낸다. 프로젝트 폴더 안에 마운트된
+    # 볼륨의 .Spotlight-V100 을 launchd 권한으로 못 읽어 전체가 6일간 멈췄다 (2026-11-21~27,
+    # designer/tools). 못 읽은 곳은 건너뛰고 읽은 범위의 결과로 판정한다. 볼륨 메타 폴더는
+    # 애초에 훑지 않도록 prune 에도 넣었다.
 
     if [ -n "$newer_files" ]; then
         log "updating: $project_name"
