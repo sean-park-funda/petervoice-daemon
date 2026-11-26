@@ -4,6 +4,7 @@ import os
 import json
 import threading
 
+import daemon.globals as g
 from daemon.globals import config, SECRETS_ENV_PATH, shutdown_event, logger
 from daemon.api import api_request
 
@@ -84,6 +85,18 @@ class SecretsSyncer(threading.Thread):
         if updated:
             logger.info(f"[secrets] Google keyring synced for: {', '.join(updated)}")
 
+    def _clear_synced(self):
+        had_file = SECRETS_ENV_PATH.exists() and SECRETS_ENV_PATH.stat().st_size > 0
+        if not self._synced_keys and not had_file:
+            return
+        for k in self._synced_keys:
+            os.environ.pop(k, None)
+        self._synced_keys = set()
+        if had_file:
+            SECRETS_ENV_PATH.write_text("", encoding="utf-8")
+            os.chmod(SECRETS_ENV_PATH, 0o600)
+        logger.info("[secrets] No secrets allowed on this device — cleared what was synced")
+
     def sync_once(self):
         result = api_request(self.api_key, "GET", "/api/secrets?raw=true", timeout=10)
         if result is None:
@@ -92,6 +105,10 @@ class SecretsSyncer(threading.Thread):
 
         secrets = result.get("secrets", [])
         if not secrets:
+            # 기기 데몬: 허용된 비밀값이 0개인 것은 정상 상태다 — 받아 둔 것을 지운다
+            # (허용을 거두면 1분 안에 그 기기에서 실제로 사라지게). 본기기는 지금처럼 건너뛴다.
+            if g.DEVICE_NAME:
+                self._clear_synced()
             return
 
         lines = []

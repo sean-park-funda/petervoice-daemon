@@ -789,6 +789,10 @@ def _ensure_home_portal():
     if not config.get("home_portal_enabled", True):
         logger.info("[home-portal] Disabled via config")
         return
+    if g.DEVICE_NAME:
+        # 포탈 주소는 지금 계정당 하나(본기기)다. 기기의 포탈 · 터널은 다음 단계에서 연다.
+        logger.info("[home-portal] Skipped on a device daemon")
+        return
 
     api_key = config.get("api_key", "")
     if not api_key:
@@ -1004,8 +1008,13 @@ def main():
         else:
             logger.warning("Could not resolve user_id from api_key — force_restart/project queries may fail")
 
-        # Ensure default projects (sysadmin, manager) exist
-        ensure_default_projects()
+        # 추가 기기(한 계정 · 여러 기기): 자기 몫 프로젝트의 턴만 돌린다. 계정 전체를 다루는 일은 본기기 것이다.
+        is_device = bool(g.DEVICE_NAME)
+        if is_device:
+            logger.info(f"Device mode: \"{g.DEVICE_NAME}\" — account-wide jobs (default projects, summon, session report, manager, portal tunnel) are left to the primary daemon")
+        else:
+            # Ensure default projects (sysadmin, manager) exist
+            ensure_default_projects()
 
         # Initialize encryption key (creates if not exists)
         from daemon.encryption import get_encryptor
@@ -1017,14 +1026,15 @@ def main():
         # DocsSyncer removed — docs are now served via Home Portal API directly
 
         AutoUpdater().start()
-        SummonManager().start()
+        if not is_device:
+            SummonManager().start()
 
         worker = Worker()
         worker.start()
 
         # Session health checker
         session_health_config = config.get("session_health", {})
-        if session_health_config.get("enabled", True):
+        if session_health_config.get("enabled", True) and not is_device:
             health_checker = SessionHealthChecker()
             if session_health_config.get("interval_hours"):
                 health_checker.HEALTH_CHECK_INTERVAL = session_health_config["interval_hours"] * 3600
@@ -1046,7 +1056,7 @@ def main():
 
         # Manager thread
         mgr_config = config.get("manager", {})
-        if mgr_config.get("enabled", False):
+        if mgr_config.get("enabled", False) and not is_device:
             manager_thread = ManagerThread()
             g._manager_instance = manager_thread
             manager_thread.start()

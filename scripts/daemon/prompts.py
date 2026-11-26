@@ -96,6 +96,9 @@ def build_agent_roster() -> str:
     api_key = config.get("api_key", "")
     if not api_key:
         return cached or ""
+    import daemon.globals as g
+    if g.DEVICE_NAME:
+        return ""  # 기기 데몬은 계정의 프로젝트 · 브랜치 목록을 읽지 못한다 (기기용 명부는 서버가 열어 준 뒤에)
 
     try:
         proj_res = api_request(api_key, "GET", "/api/projects", timeout=10) or {}

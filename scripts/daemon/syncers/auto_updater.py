@@ -560,6 +560,8 @@ class AutoUpdater(threading.Thread):
     def _update_codex_cli(self, _env: dict):
         """Update @openai/codex to latest, repairing the install if npm left it broken."""
         import shutil
+        if not config.get("codex_cli_update_enabled", True):
+            return   # 이 기계의 codex 버전은 다른 담당이 고정해 관리한다(좌석 설정과 맞물림) — 올리지도 고치지도 않는다
         if shutil.which("codex", path=_env.get("PATH")) is None and not self._codex_installed_per_npm(_env):
             return   # 이 기계엔 codex 가 없다(설치한 적 없음) — 고칠 것도 올릴 것도 없다. 매 5분 Errno 2 경고를 남기지 않는다 (2026-11-17)
         current = self._codex_version(_env)

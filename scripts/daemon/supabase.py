@@ -19,9 +19,14 @@ def resolve_user_id() -> int | None:
     api_key = config.get("api_key", "")
     if not api_key:
         return None
+    if g.DEVICE_NAME is None and config.get("device_name"):
+        g.DEVICE_NAME = str(config["device_name"])
     result = api_request(api_key, "GET", "/api/bot/me", timeout=5)
     if result and "userId" in result:
         g._cached_user_id = result["userId"]
+        # 기기 열쇠로 붙은 데몬이면 서버가 기기 이름을 돌려준다 (유저 열쇠에는 이 칸이 없다)
+        if result.get("device"):
+            g.DEVICE_NAME = str(result["device"])
         # 기존 고객 config에 username이 없으면 서버에서 받아 저장
         if result.get("username") and not config.get("username"):
             config["username"] = result["username"]
@@ -78,6 +83,8 @@ def sync_null_directories():
     api_key = config.get("api_key", "")
     if not api_key:
         return
+    if g.DEVICE_NAME:
+        return  # 기기 데몬: 계정의 프로젝트 목록을 다루지 않는다 (폴더 경로는 프로젝트를 옮길 때 정해진다)
     try:
         result = api_request(api_key, "GET", "/api/projects", timeout=5)
         if not result or "projects" not in result:

@@ -179,6 +179,10 @@ SKILLS_DIR = Path.home() / ".claude" / "skills"
 # ─── Runtime state ──────────────────────────────────────────────
 config: dict = {}
 _cached_user_id: int | None = None
+# 기기 이름 — 이 데몬이 「기기 열쇠」로 붙은 추가 기기면(한 계정 · 여러 기기) 그 이름, 본기기면 None.
+# 서버가 /api/bot/me 로 알려 주고, 설치 때 config.json 의 device_name 에도 적어 둔다(서버에 못 닿은 채 시작해도 기기로 돌게).
+# 기기 열쇠는 자기 몫 프로젝트의 데몬용 API 만 통하므로, 계정 전체를 다루는 일(기본 프로젝트 만들기 · 포탈 터널 등)은 건너뛴다.
+DEVICE_NAME: str | None = None
 sessions: dict = {}       # "project:task" -> { session_id, created_at, message_count }
 tasks: dict = {}          # "project" -> { current_task, tasks: { name: { created_at, description } } }
 processed_ids: set = set()
