@@ -4,12 +4,14 @@
 본기기에서 launchd 가 짧은 간격(기본 15초)으로 한 회차씩 돌린다. 접속은 본기기 → 기기 한 방향(ssh)뿐이다.
 
   push  본기기의 폴더를 기기의 같은 자리(홈 기준 같은 경로)에 읽기 전용 사본으로 둔다 (--delete — 기기에서 고친 것은 되돌아간다)
+        update = true 면 지우지 않고 「더 새 파일만」 보낸다 — 같은 경로를 pull 에도 적어 양쪽에서 고치는 문서를 잇는 용도
   pull  기기의 폴더를 본기기의 같은 자리로 가져온다 (지우지 않는다 · 본기기 쪽이 더 새 파일이면 덮지 않는다)
         가져온 것이 있으면 on_change 명령을 본기기에서 돌린다 (예: 사이트 재빌드) — 따로 떼어 돌리므로 그동안에도 가져오기는 계속된다.
         도는 중에 또 가져오면 끝난 뒤 한 번 더 돈다(겹쳐 돌지 않는다)
   exec  기기가 맡긴 명령을 본기기에서 대신 돌린다 — 본기기에만 있는 열쇠 · 상태 파일을 쓰는 스크립트용(열쇠를 기기에 두지 않는다).
         기기의 <spool>/req/<id>/{args.json, files/, ready} 를 가져와, 첫 인자가 allow 에 있는 것만 command 뒤에 붙여 돌리고
-        결과를 <spool>/res/<id>.json 으로 돌려준다. 인자 「@@file:N」은 files/N-… 으로 바뀐다. 같은 id 는 한 번만 돈다
+        결과를 <spool>/res/<id>.json 으로 돌려준다. 인자 「@@file:N」은 files/N-… 으로 바뀐다. 같은 id 는 한 번만 돈다.
+        오래 걸릴 수 있는 명령(예: 카톡 발송)은 background = true 로 떼어 돌린다(회차를 막지 않게)
 
 설정: <config-dir>/sidecar/<기기>.json
   { "ssh": "gamemac", "device_home": "/Users/vibegame", "interval": 15,
@@ -86,7 +88,9 @@ def push_one(entry: dict, ssh: str, device_home: str, opts: list[str]) -> tuple[
         return 0, 0, ""          # 빈 원본(디스크가 안 붙었을 수 있다)으로 기기 사본을 비우지 않는다
     subprocess.run(["ssh"] + opts + [ssh, "mkdir", "-p", dst if is_dir else os.path.dirname(dst)], capture_output=True, timeout=30)
     args = ["-e", "ssh " + " ".join(opts)]
-    if is_dir:
+    if entry.get("update"):
+        args.append("--update")          # 기기 쪽이 더 새 파일이면 덮지 않는다(양쪽에서 고치는 문서)
+    elif is_dir:
         args.append("--delete")
     for rule in entry.get("filter") or []:
         args.append(f"--filter={rule}")
@@ -223,6 +227,22 @@ def run_spool(entry: dict, ssh: str, device_home: str, opts: list[str]) -> None:
             mark.unlink(missing_ok=True)
 
 
+def run_exec_background(conf: dict, state_dir: Path, name: str, index: int) -> int:
+    """background 인 대리 실행 통로 하나를 자기 잠금 아래에서 돌린다(앞 것이 아직 돌면 건너뛴다 — 요청은 남아 다음 회차가 집는다)."""
+    entry = (conf.get("exec") or [])[index]
+    lock = open(state_dir / f"{name}.exec{index}.lock", "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return 0
+    try:
+        run_spool(entry, conf["ssh"], conf["device_home"], ssh_opts(state_dir))
+    except (RuntimeError, ValueError, OSError, subprocess.TimeoutExpired) as e:
+        log(f"오류 exec {entry.get('spool')}: {e}")
+        return 1
+    return 0
+
+
 def run_once(conf: dict, state_dir: Path, name: str, run_all: bool) -> int:
     ssh, device_home = conf["ssh"], conf["device_home"]
     opts = ssh_opts(state_dir)
@@ -240,8 +260,11 @@ def run_once(conf: dict, state_dir: Path, name: str, run_all: bool) -> int:
         (state_dir / f"{name}.last.json").write_text(json.dumps(note, ensure_ascii=False))
         return 0          # 기기가 꺼져 있으면 조용히 넘어간다 — 켜지면 다음 회차가 잇는다
 
-    for entry in conf.get("exec") or []:
+    for index, entry in enumerate(conf.get("exec") or []):
         if not due(entry, tick, run_all):
+            continue
+        if entry.get("background"):
+            spawn(state_dir, name, "--exec", index)
             continue
         try:
             run_spool(entry, ssh, device_home, opts)
@@ -342,6 +365,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--all", action="store_true")
     parser.add_argument("--only", type=int, default=None, help="background 항목 하나만(내부용)")
     parser.add_argument("--hook", type=int, default=None, help="가져오기 뒤처리 하나만(내부용)")
+    parser.add_argument("--exec", dest="exec_index", type=int, default=None, help="background 대리 실행 통로 하나만(내부용)")
+    parser.add_argument("--push-now", type=int, nargs="+", default=None, help="보내기 항목 번호들을 지금 한 번(설정을 고친 직후용)")
     args = parser.parse_args(argv)
     config_dir = Path(args.config_dir).expanduser()
     state_dir = config_dir / "sidecar"
@@ -370,6 +395,16 @@ def main(argv: list[str] | None = None) -> int:
         return run_background(conf, state_dir, args.device, args.only)
     if args.hook is not None:
         return run_hook(conf, state_dir, args.device, args.hook)
+    if args.exec_index is not None:
+        return run_exec_background(conf, state_dir, args.device, args.exec_index)
+    if args.push_now is not None:
+        code = 0
+        for index in args.push_now:
+            entry = (conf.get("push") or [])[index]
+            rc, changed, err = push_one(entry, conf["ssh"], conf["device_home"], ssh_opts(state_dir))
+            log(f"보냄 {entry['path']} — {changed}개" if rc in (0, 24) else f"오류 push {entry['path']}: {rc} {err}")
+            code = code or (0 if rc in (0, 24) else 1)
+        return code
 
     lock = open(state_dir / f"{args.device}.lock", "w")
     try:

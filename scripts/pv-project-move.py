@@ -713,6 +713,40 @@ def gather(ctx: Ctx, device_name: str, ssh_host: str | None, local_dir_arg: str 
             "device_home": device_home, "branch_ids": ctx.api.branch_ids(ctx.project)}
 
 
+PROMPT_PATH = re.compile(r"(?<![\w/.-])((?:~|\$HOME|/Users/[A-Za-z0-9_-]+|/opt/homebrew)/[A-Za-z0-9_./@+-]+)")
+
+
+def prompt_paths(texts: list[str], project_dir: str, home: str) -> list[str]:
+    """프롬프트가 가리키는 경로 중 이 맥에 실제로 있는 것(이 프로젝트 폴더 안은 뺀다 — 폴더째 옮겨 간다).
+    담당은 Bash 말고도 Read · 스킬로 이 경로들을 연다 — 명령 기록만 재면 빠진다(11/26 game-develop: hand.py · 모델 기준 문서)."""
+    root = project_dir.rstrip("/")
+    found = set()
+    for text in texts:
+        for m in PROMPT_PATH.finditer(text):
+            token = m.group(1).rstrip(".,)")
+            if token.endswith("-"):
+                continue                                   # 한글 앞에서 잘린 조각
+            full = token.replace("$HOME", home, 1) if token.startswith("$HOME") else (home + token[1:] if token.startswith("~") else token)
+            full = os.path.normpath(full)
+            if full == root or full.startswith(root + "/") or full == home:
+                continue
+            if os.path.exists(full):
+                found.add(full)
+    return sorted(found)
+
+
+def prompts_of(config_dir: Path, project: str, branch_ids: list[int]) -> list[str]:
+    """이 맥 데몬이 만들어 둔 합친 프롬프트(공통 + 프로젝트 + 담당). 한 번도 안 돈 담당의 것은 없다."""
+    names = [f"_combined_{project}_default.md", f"{project}.md"] + [f"_combined_branch_{b}_default.md" for b in branch_ids]
+    texts = []
+    for name in names:
+        try:
+            texts.append((config_dir / "prompts" / name).read_text(encoding="utf-8"))
+        except OSError:
+            pass
+    return texts
+
+
 def cmd_plan(ctx: Ctx) -> int:
     a = ctx.args
     g = gather(ctx, a.to, a.ssh, a.local_dir)
@@ -746,6 +780,15 @@ def cmd_plan(ctx: Ctx) -> int:
     if local_user_home != g["device_home"] and remote.run(f"test -e {shlex.quote(local_user_home)} && echo y || echo n").strip() != "y":
         notes.append(f"기기에 {local_user_home} 경로가 없습니다 — 문서 · 스크립트에 박힌 절대 경로가 깨집니다. "
                      f"기기에서: sudo ln -s {g['device_home']} {local_user_home}")
+    pointed = prompt_paths(prompts_of(ctx.config_dir, ctx.project, g["branch_ids"]), g["local_dir"], local_user_home)
+    if pointed:
+        there = [g["device_home"] + x[len(local_user_home):] if x.startswith(local_user_home + "/") else x for x in pointed]
+        listing = " ".join(shlex.quote(x) for x in there)
+        gone = set(remote.run(f"for p in {listing}; do [ -e \"$p\" ] || echo \"$p\"; done; true", check=False).split("\n"))
+        missing = [x for x, y in zip(pointed, there) if y in gone]
+        if missing:
+            notes.append(f"프롬프트가 가리키는데 기기에 없는 경로 {len(missing)}개 — 읽기 전용 사본으로 보내거나 대역을 두고, 일부러 안 두는 것은 프롬프트에 적습니다: "
+                         + ", ".join(missing[:25]) + (" …" if len(missing) > 25 else ""))
     sessions = {}
     if ctx.sessions_path:
         try:

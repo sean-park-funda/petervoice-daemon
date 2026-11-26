@@ -102,4 +102,13 @@ with tempfile.TemporaryDirectory(prefix="pv-move-test-") as tmp:
     st3.save(mirror_require_mounts=[str(local)])
     check(m.mirror_once(Api("gamemac"), st3, "back-home") == 1 and (local / "work.txt").exists(), "mirror refuses when a required mount point is not mounted")
 
+with tempfile.TemporaryDirectory() as tmp:
+    home = Path(tmp) / "home"
+    (home / "tools").mkdir(parents=True); (home / "tools" / "hand.py").write_text("x")
+    (home / "proj" / "docs").mkdir(parents=True); (home / "proj" / "docs" / "a.md").write_text("x")
+    text = (f"쓰는 법: `python3 ~/tools/hand.py add` · 문서 $HOME/proj/docs/a.md · 없는 것 ~/nope/x.md · "
+            f"잘린 것 {home}/tools/07-한글 · 절대 {home}/tools/hand.py.")
+    got = m.prompt_paths([text], str(home / "proj"), str(home))
+    check(got == [str(home / "tools" / "hand.py")], "prompt paths: existing ones outside the project folder, deduplicated; examples and cut tokens dropped")
+
 print(f"OK — {checks} checks")
