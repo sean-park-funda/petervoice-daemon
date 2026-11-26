@@ -152,7 +152,7 @@ cat > "$PLIST_PATH" <<PLISTEOF
     <key>RunAtLoad</key><true/>
     <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
     <key>ThrottleInterval</key><integer>10</integer>
-    <key>ExitTimeOut</key><integer>60</integer>
+    <key>ExitTimeOut</key><integer>120</integer>
     <key>StandardOutPath</key><string>${DAEMON_DIR}/launchd-stdout.log</string>
     <key>StandardErrorPath</key><string>${DAEMON_DIR}/launchd-stderr.log</string>
     <key>EnvironmentVariables</key>
