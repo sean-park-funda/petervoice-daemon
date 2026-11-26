@@ -576,8 +576,7 @@ def mirror_plist(project: str, config_dir: Path, interval: int, key_file: str | 
         "ProgramArguments": args,
         "StartInterval": int(interval),
         "RunAtLoad": False,
-        "ProcessType": "Background",
-        "LowPriorityIO": True,
+        # 등급을 Background · LowPriorityIO 로 두면 한 회차가 11배 느려진다(실측 33GB · 18만 파일: 24초 → 270초) — 기본 등급으로 둔다
         "EnvironmentVariables": {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "HOME": str(Path.home())},
         "StandardOutPath": log_path,
         "StandardErrorPath": log_path,
