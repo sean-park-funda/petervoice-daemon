@@ -360,6 +360,19 @@ def _ensure_dns_route(api_key: str, username: str, tunnel_id: str):
         "port": 3000,
         "tunnelId": tunnel_id,
     })
+    if g.DEVICE_NAME:
+        # 기기 데몬: 포탈 주소는 서버가 정한다(<기기>--<유저>, 본문의 username · tunnelId 는 서버가 보지 않는다).
+        # 받은 주소를 그대로 쓰고, 헬스체크가 같은 주소를 보도록 config 에 적어 둔다.
+        url = (result or {}).get("url")
+        if not url:
+            logger.warning(f"[tunnel] Device portal route registration failed: {result}")
+            return None
+        if config.get("portal_url") != url:
+            _save_config_fields(portal_url=url)
+            config["portal_url"] = url
+        logger.info(f"[tunnel] Device portal route ensured: {url}")
+        return url
+
     if result and result.get("url"):
         logger.info(f"[tunnel] DNS route ensured: {result['url']}")
     else:
@@ -420,7 +433,11 @@ def _tunnel_url_from_config() -> str | None:
     """config의 username으로 자기 Home Portal 터널 URL을 계산.
 
     _ensure_dns_route()의 슬러그 규칙과 동일해야 함.
+    기기 데몬은 서버가 정해 준 주소(config portal_url)를 쓴다.
     """
+    if g.DEVICE_NAME:
+        url = config.get("portal_url")
+        return (url.rstrip("/") + "/") if url else None
     username = config.get("username")
     if not username:
         return None
@@ -631,8 +648,6 @@ def _check_cloudflared_health():
 
     if not config.get("home_portal_enabled", True):
         return
-    if g.DEVICE_NAME:
-        return  # 기기 데몬: 포탈·터널을 띄우지 않으므로 헬스체크/복구도 하지 않는다 (없는 연결기를 20초마다 살리려 들지 않게)
     if config.get("portal_shared"):
         return  # 공유 맥: 터널·포탈은 소유자 데몬이 관리 — 테넌트는 헬스체크/복구 안 함
     if sys.platform != "darwin":  # macOS 전용 (Windows 등 제외)
@@ -778,6 +793,23 @@ def _check_cloudflared_health():
         _tunnel_unreachable_streak = 0
 
 
+def _foreign_portal_on_port(port: int = 3000) -> bool:
+    """이 계정의 홈포탈 서비스가 떠 있지 않은데 포트가 이미 열려 있으면 True (같은 맥의 다른 계정 포탈)."""
+    import socket
+    import subprocess
+    try:
+        ours = subprocess.run(["launchctl", "list", "com.petervoice.home-portal"], capture_output=True, text=True).returncode == 0
+    except Exception:
+        ours = False
+    if ours:
+        return False
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=1):
+            return True
+    except OSError:
+        return False
+
+
 def _ensure_home_portal():
     """Home Portal + Cloudflare Tunnel 전체 자동 프로비저닝.
 
@@ -791,11 +823,6 @@ def _ensure_home_portal():
     if not config.get("home_portal_enabled", True):
         logger.info("[home-portal] Disabled via config")
         return
-    if g.DEVICE_NAME:
-        # 포탈 주소는 지금 계정당 하나(본기기)다. 기기의 포탈 · 터널은 다음 단계에서 연다.
-        logger.info("[home-portal] Skipped on a device daemon")
-        return
-
     api_key = config.get("api_key", "")
     if not api_key:
         return
@@ -823,6 +850,11 @@ def _ensure_home_portal():
         return
 
     try:
+        if g.DEVICE_NAME and _foreign_portal_on_port():
+            # 이 맥에서 다른 OS 계정의 포탈이 이미 3000 번을 쓰고 있다. 터널을 띄우면 그 포탈로 이어지므로 시작하지 않는다.
+            logger.error("[home-portal] Port 3000 is already used by another account on this Mac — device portal not started")
+            return
+
         # 1. cloudflared 설치 확인
         cloudflared_path = _ensure_cloudflared()
         if not cloudflared_path:
@@ -869,6 +901,9 @@ def _ensure_home_portal():
 
         # 5. DNS + ingress 라우트 등록
         tunnel_url = _ensure_dns_route(api_key, username, tunnel_id)
+        if not tunnel_url:
+            logger.error("[home-portal] Portal route registration failed")
+            return
 
         # 6. tunnel_url 서버에 등록
         api_request(api_key, "PATCH", "/api/bot/status", body={"tunnel_url": tunnel_url})
@@ -1013,7 +1048,7 @@ def main():
         # 추가 기기(한 계정 · 여러 기기): 자기 몫 프로젝트의 턴만 돌린다. 계정 전체를 다루는 일은 본기기 것이다.
         is_device = bool(g.DEVICE_NAME)
         if is_device:
-            logger.info(f"Device mode: \"{g.DEVICE_NAME}\" — account-wide jobs (default projects, session report, manager, portal tunnel) are left to the primary daemon")
+            logger.info(f"Device mode: \"{g.DEVICE_NAME}\" — account-wide jobs (default projects, session report, manager) are left to the primary daemon; this Mac runs its own portal")
         else:
             # Ensure default projects (sysadmin, manager) exist
             ensure_default_projects()

@@ -623,8 +623,9 @@ def start_home_portal(username: str = None) -> dict:
     api_key = config.get("api_key", "")
     hostname = f"{username_slug}.{SITE_DOMAIN}"
 
+    route = None
     if tunnel_id and api_key:
-        api_request(
+        route = api_request(
             api_key, "POST", "/api/tunnel/add-route",
             body={
                 "username": username_slug,
@@ -635,6 +636,9 @@ def start_home_portal(username: str = None) -> dict:
         )
 
     url = f"https://{hostname}"
+    # 기기 데몬(다른 맥)은 서버가 포탈 주소를 정한다 — 받은 주소가 다르면 그것이 맞다
+    if isinstance(route, dict) and route.get("url") and route.get("hostname"):
+        url, hostname = route["url"], route["hostname"]
     logger.info(f"[site_manager] Home portal started → {url} (:{HOME_PORTAL_PORT})")
     return {"url": url, "port": HOME_PORTAL_PORT, "hostname": hostname}
 
