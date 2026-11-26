@@ -310,7 +310,8 @@ def install(name: str, config_dir: Path, interval: int) -> None:
     plist = {
         "Label": label,
         "ProgramArguments": ["/usr/bin/python3", os.path.abspath(__file__), "run", name, "--config-dir", str(config_dir)],
-        "StartInterval": int(interval), "RunAtLoad": True, "ProcessType": "Background", "LowPriorityIO": True,
+        # 등급을 Background 로 두면 macOS 가 회차를 늦춘다(실측 15초 → 34초) — 회차는 가볍고 큰 폴더는 따로 떼어 돌므로 기본 등급으로 둔다
+        "StartInterval": int(interval), "RunAtLoad": True,
         "EnvironmentVariables": {"PATH": "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin", "HOME": str(Path.home())},
         "StandardOutPath": logf, "StandardErrorPath": logf,
     }
