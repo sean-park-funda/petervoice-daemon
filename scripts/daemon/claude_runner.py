@@ -44,10 +44,12 @@ from daemon.sessions import (
     reset_session, session_key,
     save_session_context, _save_session_summary, _build_session_context_prompt,
     get_codex_session_id, get_codex_session_ctx, update_codex_session, reset_codex_session,
+    get_codex_session_seat,
     get_gemini_session_id, update_gemini_session, reset_gemini_session,
 )
 from daemon.tasks import get_current_task, get_task_description
 from daemon.advisor import get_advisor, clear_advisor, stderr_blames_advisor
+from daemon import codex_seats
 from daemon.prompts import get_prompt_file, build_system_prompt, build_connected_services_note, apply_roster_placeholder
 
 
@@ -1089,7 +1091,7 @@ def _codex_home() -> str:
     return os.environ.get("CODEX_HOME") or os.path.join(os.path.expanduser("~"), ".codex")
 
 
-def _read_codex_usage(session_id: str | None) -> tuple[dict | None, dict | None]:
+def _read_codex_usage(session_id: str | None, home: str | None = None) -> tuple[dict | None, dict | None]:
     """코덱스 세션 기록(rollout)에서 한도·토큰 사용량을 읽어 (limits, tokens) 반환.
 
     `codex exec --json` 스트림에는 한도 정보가 실려오지 않는다. 대신 코덱스가 남기는
@@ -1102,7 +1104,7 @@ def _read_codex_usage(session_id: str | None) -> tuple[dict | None, dict | None]
     if not session_id:
         return None, None
     try:
-        pattern = os.path.join(_codex_home(), "sessions", "**", f"*{session_id}*.jsonl")
+        pattern = os.path.join(home or _codex_home(), "sessions", "**", f"*{session_id}*.jsonl")
         paths = glob.glob(pattern, recursive=True)
         if not paths:
             return None, None
@@ -1145,12 +1147,16 @@ def _read_codex_usage(session_id: str | None) -> tuple[dict | None, dict | None]
     return limits, (info.get("total_token_usage") or None)
 
 
-def _report_codex_usage(api_key: str, project: str, model: str | None, session_id: str | None):
-    """코덱스 한도를 배너용으로, 토큰 사용량을 사용량 집계로 보고. 실패해도 턴에 영향 없음."""
-    limits, tokens = _read_codex_usage(session_id)
+def _report_codex_usage(api_key: str, project: str, model: str | None, session_id: str | None,
+                        home: str | None = None, seat: str | None = None):
+    """코덱스 한도를 배너용으로, 토큰 사용량을 사용량 집계로 보고. 실패해도 턴에 영향 없음.
+    home · seat 은 이 턴이 돈 좌석(codex_seats) — 그 좌석의 세션 기록과 로그인에서 읽고, 좌석별 한도로도 적어 둔다."""
+    limits, tokens = _read_codex_usage(session_id, home)
     if limits:
         limits["model"] = model
-        limits["account"] = _codex_account_email()
+        limits["account"] = _codex_account_email(home)
+        if seat:
+            codex_seats.record(seat, limits)
         try:
             api_request(api_key, "PATCH", "/api/bot/status",
                         body={"codex_usage_limits": limits}, timeout=10)
@@ -1170,15 +1176,15 @@ def _report_codex_usage(api_key: str, project: str, model: str | None, session_i
             logger.warning(f"[codex] token report failed: {e}")
     if limits:
         logger.info(
-            f"[codex] usage: 5h={limits.get('session_pct')}% week={limits.get('week_pct')}%"
+            f"[codex] usage{f' seat={seat}' if seat else ''}: 5h={limits.get('session_pct')}% week={limits.get('week_pct')}%"
             + (f" BLOCKED={limits['blocked_reason']}" if limits.get("blocked_reason") else "")
         )
 
 
-def _codex_account_email() -> str | None:
+def _codex_account_email(home: str | None = None) -> str | None:
     """코덱스가 로그인한 ChatGPT 계정 이메일 (배너 표시용). 토큰 값은 다루지 않는다."""
     try:
-        with open(os.path.join(_codex_home(), "auth.json"), "r", encoding="utf-8") as f:
+        with open(os.path.join(home or _codex_home(), "auth.json"), "r", encoding="utf-8") as f:
             tok = (json.load(f).get("tokens") or {}).get("id_token")
         if not tok:
             return None
@@ -1322,6 +1328,7 @@ def _codex_ctx_payload(instructions: str, prompt: str, mode: str) -> str:
 def run_codex(prompt: str, project: str, _retry_count: int = 0) -> tuple[str, str | None, list[str], bool]:
     """Run Codex CLI and return (response_text, session_id, tool_lines)."""
     api_key = config["api_key"]
+    _orig_prompt = prompt  # 아래에서 새 세션이면 대화 맥락을 앞에 붙인다 — 다시 돌릴 때는 원문으로
 
     # Resolve project directory (same logic as run_claude)
     is_branch = project.startswith("branch:")
@@ -1346,6 +1353,23 @@ def run_codex(prompt: str, project: str, _retry_count: int = 0) -> tuple[str, st
     sid = get_codex_session_id(project)
 
     settings_project = real_project if (is_branch or is_kanban) else project
+
+    # 좌석 고르기 (codex_seats) — ~/.codex-seats/seats.json 이 없는 맥은 seat 이 None 이고 지금처럼 기본 폴더로 돈다.
+    seat, codex_home = None, None
+    # 좌석 기능을 켜기 전에 만든 세션은 좌석 표시가 없다 — 기본 폴더가 좌석 폴더로 가는 링크였다면 그 좌석 세션으로 본다
+    _session_seat = get_codex_session_seat(project) or (codex_seats.seat_of_home(_codex_home()) if sid else None)
+    _pick = codex_seats.choose(project, real_project if (is_branch or is_kanban) else None, _session_seat)
+    if _pick and _pick.get("refuse"):
+        logger.warning(f"[{config.get('bot_name', 'bot')}] Codex: no usable seat for {project} — turn not run")
+        return (_pick["refuse"], sid, [], False)
+    if _pick:
+        seat, codex_home = _pick["seat"], _pick["home"]
+    # 코덱스 세션 기록은 그 턴이 돈 폴더 안에 있다 — 폴더가 달라지면 재개할 수 없으니 새 세션으로 시작한다
+    # (아래에서 sid 가 없으면 대화 맥락을 다시 넣는다).
+    if sid and not codex_seats.same_home(codex_seats.home_of(_session_seat) or _codex_home(), codex_home or _codex_home()):
+        reset_codex_session(project, reason=f"seat {_session_seat or 'default'} → {seat or 'default'}")
+        sid = None
+
     proj_settings = _fetch_project_settings(settings_project)
 
     # Build system prompt (reuse existing logic)
@@ -1446,7 +1470,8 @@ def run_codex(prompt: str, project: str, _retry_count: int = 0) -> tuple[str, st
         cmd.extend(common_flags)
         cmd.append(prompt_arg)
 
-    logger.info(f"[{bot_name}] Codex: project={project}, dir={project_dir}, session={sid or 'new'}, model={model or 'default'}, effort={effort or '(model default)'}, ctx={ctx_mode}")
+    logger.info(f"[{bot_name}] Codex: project={project}, dir={project_dir}, session={sid or 'new'}, model={model or 'default'}, effort={effort or '(model default)'}, ctx={ctx_mode}"
+                + (f", seat={seat}" if seat else ""))
 
     # run_claude 와 동일한 이유로 한 번만 반납한다 (세션 오류 재시도 시 이중 release → 동시성 누수)
     _sem_held = False
@@ -1458,15 +1483,28 @@ def run_codex(prompt: str, project: str, _retry_count: int = 0) -> tuple[str, st
         nonlocal _sem_held
         if _sem_held:
             _sem_held = False
+            codex_seats.end(seat)  # 칸을 잡을 때 같이 센 「이 좌석에서 도는 턴」을 같이 내린다 (release 가 실패해도 새지 않게 먼저)
             g.claude_semaphore.release()
 
     try:
         g.claude_semaphore.acquire()
         _sem_held = True
+        codex_seats.begin(seat)
+        # 좌석은 칸을 잡기 전에 골랐다 — 칸을 기다린 사이 그 좌석이 기준을 넘었거나 막혔으면 이 좌석으로 돌리지 않고 다시 고른다
+        _seat_gone = codex_seats.unusable_now(seat) if seat else None
+        if _seat_gone:
+            logger.warning(f"[{bot_name}] Codex: seat {seat} became unusable while waiting ({_seat_gone}) — choosing again for {project}")
+            new_session_id = None
+            _release_semaphore()
+            if _retry_count >= MAX_CONTEXT_OVERFLOW_RETRIES:
+                return (f"코덱스 좌석 {seat} 을(를) 지금 쓸 수 없어 이 턴을 돌리지 않았습니다 — {_seat_gone}.", None, [], False)
+            return run_codex(_orig_prompt, project, _retry_count + 1)
         codex_env = {
             **os.environ,
             "LANG": "en_US.UTF-8",
         }
+        if codex_home:
+            codex_env["CODEX_HOME"] = codex_home
         # Inject OpenAI API key from daemon config if available
         openai_key = config.get("openai_api_key")
         if openai_key:
@@ -1644,6 +1682,8 @@ def run_codex(prompt: str, project: str, _retry_count: int = 0) -> tuple[str, st
                 _release_semaphore()
                 if _retry_count >= MAX_CONTEXT_OVERFLOW_RETRIES:
                     return ("(Codex 세션 오류 - 최대 재시도 횟수 초과)", None, tool_lines, False)
+                # 다시 돈 턴이 자기 한도를 보고한다 — 이 호출의 finally 가 죽은 세션의 옛 값으로 덮어쓰지 않게 비운다
+                new_session_id = None
                 return run_codex(prompt, project, _retry_count + 1)
             return (f"(Codex 오류: exit {proc.returncode})", new_session_id, tool_lines, False)
 
@@ -1656,7 +1696,7 @@ def run_codex(prompt: str, project: str, _retry_count: int = 0) -> tuple[str, st
             # turn.completed 를 안 내는 버전이어도 오류 없이 답이 왔으면 들어간 것으로 본다
             # (표식이 안 남으면 재개 턴마다 지침 전체를 다시 넣는 조용한 낭비가 된다).
             _ctx_ok = feed_ctx and (turn_completed or (got_message and not saw_error and proc.returncode == 0))
-            update_codex_session(project, new_session_id, ctx_hash=ctx_hash if _ctx_ok else None)
+            update_codex_session(project, new_session_id, ctx_hash=ctx_hash if _ctx_ok else None, seat=seat)
 
         return (response_text, new_session_id, tool_lines, False)
 
@@ -1677,7 +1717,7 @@ def run_codex(prompt: str, project: str, _retry_count: int = 0) -> tuple[str, st
         return (f"(Codex 실행 오류: {e})", sid, [], False)
     finally:
         # 성공·실패 어느 쪽으로 끝나든 한도를 갱신한다.
-        _report_codex_usage(api_key, project, model, new_session_id)
+        _report_codex_usage(api_key, project, model, new_session_id, home=codex_home, seat=seat)
         try:
             _release_semaphore()
         except ValueError:

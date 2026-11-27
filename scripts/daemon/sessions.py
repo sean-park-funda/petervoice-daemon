@@ -372,14 +372,25 @@ def get_codex_session_ctx(project: str) -> dict:
         return {"ctx_hash": sess.get("ctx_hash"), "ctx_fed_at": sess.get("ctx_fed_at")}
 
 
-def update_codex_session(project: str, session_id: str, ctx_hash: str | None = None):
-    """ctx_hash 를 주면 「이 턴에 시스템 지침을 stdin 으로 넣었다」는 표식을 함께 남긴다."""
+def get_codex_session_seat(project: str) -> str | None:
+    """이 세션이 만들어진 좌석 이름(~/.codex-seats/<이름>). 기본 폴더에서 만든 세션이면 None."""
+    with _codex_sessions_lock:
+        return _codex_sessions.get(project, {}).get("seat")
+
+
+def update_codex_session(project: str, session_id: str, ctx_hash: str | None = None, seat: str | None = None):
+    """ctx_hash 를 주면 「이 턴에 시스템 지침을 stdin 으로 넣었다」는 표식을 함께 남긴다.
+    seat 은 이 턴이 돈 좌석 — 세션 기록이 그 좌석 폴더에 있으므로 재개도 같은 좌석으로 해야 한다."""
     now = datetime.now().isoformat()
     with _codex_sessions_lock:
         sess = _codex_sessions.setdefault(project, {"created_at": now, "message_count": 0})
         sess["session_id"] = session_id
         sess["last_used"] = now
         sess["message_count"] = sess.get("message_count", 0) + 1
+        if seat:
+            sess["seat"] = seat
+        else:
+            sess.pop("seat", None)
         if ctx_hash:
             sess["ctx_hash"] = ctx_hash
             sess["ctx_fed_at"] = time.time()
