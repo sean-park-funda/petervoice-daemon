@@ -63,17 +63,79 @@ def limits(pct, reset=LATER, blocked=None):
             "blocked_reason": blocked}
 
 
-print("좌석 지도가 없거나 깨졌으면 지금과 같은 동작(None)")
+print("좌석 지도가 없거나 비어 있으면 지금과 같은 동작(None)")
 fresh()
 check(cs.choose("branch:1", "game-develop", None, now=NOW) is None, "seats.json 없음 → None")
-fresh(seat_map="{not json")
-check(cs.choose("branch:1", "game-develop", None, now=NOW) is None, "깨진 seats.json → None (예외 없음)")
+check(cs.any_logged_in() is False, "지도가 없으면 좌석 로그인도 없는 것으로")
 fresh(seat_map={"pool": [], "assign": {}})
 check(cs.choose("branch:1", "game-develop", None, now=NOW) is None, "빈 지도 → None")
+fresh(seat_map="  \n")
+check(cs.choose("branch:1", "game-develop", None, now=NOW) is None, "내용 없는 파일 → None (비우면 꺼진다)")
 fresh(seat_map={"assign": {"ox-plan": "game1"}})
 check(cs.choose("branch:1", "game-develop", None, now=NOW) is None, "pool 없고 내 담당 고정도 없음 → None")
+check(cs.any_logged_in() is True, "고정 좌석만 있어도 로그인돼 있으면 코덱스 가능")
+fresh(seat_map={"pool": ["game1"], "assign": {"branch:1": None}})
+check(cs.choose("branch:1", None, None, now=NOW)["seat"] == "game1", "고정 값이 null 이면 고정 없음(pool)")
+
+print("좌석 지도가 깨졌으면 기본 폴더로 넘기지 않고 돌리지 않는다")
+base = fresh(seat_map="{not json")
+refused = cs.choose("branch:1", "game-develop", None, now=NOW)
+check(bool(refused) and "refuse" in refused and "seats.json" in refused["refuse"], "깨진 seats.json → 거절 (예외 없음 · None 아님)")
+check("읽을 수 없음" in (cs.unusable_now("game1") or ""), "돌리기 직전 재확인도 깨진 지도를 본다")
+check(cs.any_logged_in() is False, "깨진 지도 → 코덱스 가능으로 보고하지 않는다")
+(base / cs.MAP_NAME).write_text(json.dumps({"pool": ["game1"]}))
+check(cs.choose("branch:1", None, None, now=NOW) == {"seat": "game1", "home": str(base / "game1")}, "파일을 고치면 다음 턴부터 돈다(재시작 없음)")
 fresh(seat_map=["game1"])
-check(cs.choose("branch:1", None, None, now=NOW) is None, "최상위가 객체가 아님 → None")
+check("refuse" in (cs.choose("branch:1", None, None, now=NOW) or {}), "최상위가 객체가 아님 → 거절")
+fresh(seat_map={"pool": "game1"})
+check("refuse" in (cs.choose("branch:1", None, None, now=NOW) or {}), "pool 이 목록이 아님 → 거절")
+fresh(seat_map={"pool": ["game1", 2]})
+check("refuse" in (cs.choose("branch:1", None, None, now=NOW) or {}), "pool 에 이름이 아닌 값 → 거절")
+fresh(seat_map={"pool": ["game1"], "assign": {"branch:1": 2}})
+check("refuse" in (cs.choose("branch:9", None, None, now=NOW) or {}), "고정 값이 이름이 아님 → 거절")
+fresh(seat_map={"pool": ["game 1"]})
+refused = cs.choose("branch:1", None, None, now=NOW)
+check(bool(refused) and "폴더 없음" in refused.get("refuse", ""), "오타 난 pool 좌석 하나뿐 → 꺼짐이 아니라 거절")
+
+print("웹 헤더의 코덱스 가능 표시 — 기본 폴더에 로그인이 없어도 좌석이 있으면 켠다")
+import daemon.globals as g  # noqa: E402
+
+
+class _Run:
+    def __init__(self, rc):
+        self.returncode = rc
+
+
+def avail(rc, default_login, seat_login, key=None):
+    """codex --version 결과 · 기본 폴더 로그인 · 좌석 로그인 함수를 바꿔 끼워 판정만 본다."""
+    home = Path(tempfile.mkdtemp(prefix="home.", dir=_TMP))
+    if default_login:
+        (home / ".codex").mkdir()
+        (home / ".codex" / "auth.json").write_text("{}")
+    saved = (g.subprocess.run, os.environ.get("HOME"), g.config.get("openai_api_key"))
+    g.subprocess.run = lambda *a, **k: _Run(rc)
+    os.environ["HOME"] = str(home)
+    g.config.pop("openai_api_key", None)
+    if key:
+        g.config["openai_api_key"] = key
+    g._codex_avail_cache.update(ts=0.0)
+    try:
+        return g.detect_codex_available(seat_login=seat_login)
+    finally:
+        g.subprocess.run = saved[0]
+        os.environ["HOME"] = saved[1] or ""
+        g.config.pop("openai_api_key", None)
+        if saved[2]:
+            g.config["openai_api_key"] = saved[2]
+        g._codex_avail_cache.update(ts=0.0)
+
+
+check(avail(0, True, None) is True, "기본 폴더 로그인 → 가능 (지금과 같음)")
+check(avail(0, False, None) is False, "로그인 없음 · 좌석 판정 없음 → 불가 (지금과 같음)")
+check(avail(0, False, lambda: True) is True, "기본 폴더에 로그인이 없어도 좌석이 있으면 가능")
+check(avail(0, False, lambda: False) is False, "좌석도 없으면 불가")
+check(avail(1, False, lambda: True) is False, "codex 가 설치돼 있지 않으면 좌석이 있어도 불가")
+check(avail(0, False, lambda: 1 / 0) is False, "좌석 판정이 터져도 하트비트는 죽지 않는다")
 
 print("pool — 로그인된 좌석만, 로그인되면 그때부터")
 base = fresh(seat_map={"pool": ["game1", "game2", "game3"]})

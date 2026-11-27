@@ -16,6 +16,8 @@ seats.json (고칠 때마다 다시 읽는다 — 데몬 재시작이 필요 없
   2. 아니면 pool 에서: 그 세션이 쓰던 좌석이 쓸 만하면 그대로 — 코덱스 세션 기록은 좌석 폴더 안에 있어 좌석을 옮기면 이어 갈 수 없다.
      아니면 지금 도는 턴이 가장 적은 좌석 → 마지막으로 본 사용률이 낮은 좌석 → pool 순서.
   3. 쓸 좌석이 없으면 돌리지 않고 이유를 답한다. 협찬 좌석은 한도를 넘기면 막히는 대신 워크스페이스 주인의 크레딧이 깎일 수 있다.
+  4. seats.json 이 있는데 읽을 수 없으면(JSON 오류 · 모양이 다름) 돌리지 않는다 — 기본 폴더 · 다른 엔진으로 넘기지 않는다.
+     끄려면 파일을 지우거나 비운다(내용 없음 또는 pool · assign 없음).
 
 사용률은 데몬이 따로 묻지 않는다 — 코덱스가 턴마다 세션 기록에 남기는 값을 턴이 끝날 때 읽어 좌석별로 적어 둔다(record).
 그래서 다른 기계가 같은 좌석을 쓰면 이 맥의 다음 턴이 끝날 때까지 모른다(한 턴만큼 넘을 수 있다 — max_pct 를 100 보다 낮게 두는 이유).
@@ -79,7 +81,12 @@ def same_home(a: str | None, b: str | None) -> bool:
 # ─── 좌석 지도 ────────────────────────────────────────────────
 
 def load_map() -> dict | None:
-    """seats.json 을 읽어 정리한 값. 파일이 없거나 깨졌거나 비어 있으면 None(= 좌석 기능 꺼짐)."""
+    """seats.json 을 읽어 정리한 값.
+
+    None                              파일이 없거나 비어 있다(pool · assign 둘 다 없음) = 좌석 기능 꺼짐
+    {"error": 이유}                    파일은 있는데 읽을 수 없다 — 좌석을 쓰려던 맥이다. 기본 폴더로 넘기지 않는다(choose 가 거절)
+    {"pool", "assign", "max_pct"}     쓸 수 있는 지도
+    """
     path = SEATS_DIR / MAP_NAME
     try:
         st = path.stat()
@@ -91,22 +98,37 @@ def load_map() -> dict | None:
             return _map_cache["data"]
     data = None
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(raw, dict):
-            raise ValueError("top level is not an object")
-        pool = [s for s in (raw.get("pool") or []) if isinstance(s, str) and _NAME_RE.match(s)]
-        # 고정 좌석 이름은 여기서 거르지 않는다 — 오타를 조용히 버리면 그 담당이 pool 로 흘러가 「고정」이 깨진다(쓸 때 why_unusable 이 거절한다)
-        assign = {str(k): v for k, v in (raw.get("assign") or {}).items() if isinstance(v, str) and v}
-        max_pct = raw.get("max_pct", DEFAULT_MAX_PCT)
-        if not isinstance(max_pct, (int, float)) or isinstance(max_pct, bool) or not 0 < max_pct <= 100:
-            max_pct = DEFAULT_MAX_PCT
-        if pool or assign:
-            data = {"pool": pool, "assign": assign, "max_pct": max_pct}
+        text = path.read_text(encoding="utf-8")
+        if text.strip():
+            raw = json.loads(text)
+            if not isinstance(raw, dict):
+                raise ValueError("top level is not an object")
+            pool, assign = raw.get("pool") or [], raw.get("assign") or {}
+            if not isinstance(pool, list) or not all(isinstance(s, str) and s for s in pool):
+                raise ValueError("pool must be a list of seat names")
+            if not isinstance(assign, dict) or not all(v is None or (isinstance(v, str) and v) for v in assign.values()):
+                raise ValueError("assign must map a project key to a seat name")
+            # 좌석 이름의 모양은 여기서 거르지 않는다 — 오타를 조용히 버리면 그 담당이 다른 좌석 · 기본 폴더로 흘러간다(쓸 때 why_unusable 이 거절한다)
+            assign = {str(k): v for k, v in assign.items() if v}
+            max_pct = raw.get("max_pct", DEFAULT_MAX_PCT)
+            if not isinstance(max_pct, (int, float)) or isinstance(max_pct, bool) or not 0 < max_pct <= 100:
+                max_pct = DEFAULT_MAX_PCT
+            if pool or assign:
+                data = {"pool": pool, "assign": assign, "max_pct": max_pct}
     except Exception as e:
-        logger.warning(f"[codex-seat] {path} unreadable ({e}) — running codex on the default home")
+        data = {"error": str(e)[:160]}
+        logger.warning(f"[codex-seat] {path} unreadable ({e}) — codex turns are refused until the file is fixed")
     with _lock:
         _map_cache["sig"], _map_cache["data"] = sig, data
     return data
+
+
+def any_logged_in() -> bool:
+    """지도에 적힌 좌석 중 로그인된 것이 하나라도 있는가 — 기본 ~/.codex 에 로그인이 없는 맥도 코덱스를 돌릴 수 있는지 볼 때."""
+    seat_map = load_map()
+    if not seat_map or seat_map.get("error"):
+        return False
+    return any(logged_in(seat) for seat in [*seat_map["pool"], *seat_map["assign"].values()])
 
 
 # ─── 좌석별 마지막으로 본 한도 ──────────────────────────────────
@@ -222,8 +244,10 @@ def why_unusable(seat: str, max_pct: float, now: float) -> str | None:
 
 def unusable_now(seat: str) -> str | None:
     """고른 뒤 실제로 돌리기 직전에 한 번 더 본다 — 지금 지도 기준으로 못 쓰게 됐으면 이유, 아니면 None."""
-    seat_map = load_map()
-    return why_unusable(seat, (seat_map or {}).get("max_pct", DEFAULT_MAX_PCT), time.time())
+    seat_map = load_map() or {}
+    if seat_map.get("error"):
+        return f"좌석 지도를 읽을 수 없음({seat_map['error']})"
+    return why_unusable(seat, seat_map.get("max_pct", DEFAULT_MAX_PCT), time.time())
 
 
 # ─── 고르기 ──────────────────────────────────────────────────
@@ -250,6 +274,10 @@ def choose(project: str, parent: str | None, session_seat: str | None, now: floa
     seat_map = load_map()
     if not seat_map:
         return None
+    if seat_map.get("error"):
+        # 좌석을 쓰려던 맥에서 지도가 깨졌다 — 기본 폴더(이 맥에서는 다른 계정일 수 있다)로 돌리면 엉뚱한 계정으로 일이 나간다
+        return {"refuse": f"코덱스 좌석 지도(~/.codex-seats/{MAP_NAME})를 읽을 수 없어 이 턴을 돌리지 않았습니다 — {seat_map['error']}. "
+                          f"파일을 고친 뒤 같은 메시지를 다시 보내 주세요."}
     now = now if now is not None else time.time()
     max_pct = seat_map["max_pct"]
 

@@ -26,6 +26,7 @@ from daemon.tasks import (
 )
 from daemon.prompts import get_prompt_file, build_system_prompt
 from daemon.claude_runner import run_claude, run_codex, run_gemini, rewrite_for_voice, SHUTDOWN_INTERRUPTED
+from daemon import codex_seats
 from daemon.queue import enqueue_message, dequeue_message
 from daemon.dispatch import (TurnDispatcher, turn_message_ids, BOOT_GRACE_SEC_DEFAULT, BOOT_AUTO_LANES_DEFAULT,
                              BOOT_GRACE_UPTIME_SEC_DEFAULT)
@@ -129,7 +130,8 @@ class Worker(threading.Thread):
             "timestamp": datetime.now().isoformat(),
             "active_projects": projects_list,
             "version": g.DAEMON_VERSION,   # 데몬 git HEAD — stale 고객 식별용
-            "codex_available": g.detect_codex_available(),  # 웹 헤더 Codex 선택지 활성화 여부
+            # 웹 헤더 Codex 선택지 활성화 여부. 기본 ~/.codex 에 로그인이 없어도 좌석 지도에 로그인된 좌석이 있으면 돈다(2026-11-27)
+            "codex_available": g.detect_codex_available(seat_login=codex_seats.any_logged_in),
             "gemini_available": g.detect_gemini_available(),  # 제3 엔진(Gemini CLI) 설치+키 여부 (2026-10-14)
         }
         if project:
