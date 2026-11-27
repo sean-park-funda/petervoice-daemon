@@ -747,6 +747,26 @@ def prompts_of(config_dir: Path, project: str, branch_ids: list[int]) -> list[st
     return texts
 
 
+# 데몬이 시작할 때 config.json 에서 읽는 동작 설정. 기기 config 에 없는 키는 데몬 기본값으로 돈다 —
+# 2026-11-26 game-develop 이동 때 턴 시간 제한 두 키가 빠져, 이 맥에서 60분이던 제한이 기기에서 30분이 됐다(턴 5개 끊김).
+BEHAVIOR_KEYS = ["claude_hard_timeout_sec", "claude_hard_timeout_with_tools_sec", "claude_stdout_timeout_sec",
+                 "shutdown_drain_sec", "max_concurrent", "human_reserved_lanes", "max_concurrent_subagents"]
+
+
+def config_differences(config_dir: Path, remote: "Remote") -> list[str]:
+    """이 맥과 기기의 데몬 동작 설정 중 값이 다른 것(비밀값이 든 파일이라 기기에서는 해당 키만 뽑아 온다)."""
+    src = ("import json,os,sys\n"
+           "c=json.load(open(os.path.expanduser('~/.claude-daemon/config.json')))\n"
+           "print(json.dumps({k:c[k] for k in sys.argv[1:] if k in c}))")
+    try:
+        here = json.loads((config_dir / "config.json").read_text(encoding="utf-8"))
+        there = json.loads(remote.python(src, *BEHAVIOR_KEYS, timeout=30).strip() or "{}")
+    except Exception as e:  # noqa: BLE001 — 비교를 못 한 것도 알려야 한다
+        return [f"(비교하지 못했습니다: {e})"]
+    return [f"{k}: 이 맥 {here.get(k, '없음=기본값')} · 기기 {there.get(k, '없음=기본값')}"
+            for k in BEHAVIOR_KEYS if here.get(k) != there.get(k)]
+
+
 def cmd_plan(ctx: Ctx) -> int:
     a = ctx.args
     g = gather(ctx, a.to, a.ssh, a.local_dir)
@@ -789,6 +809,10 @@ def cmd_plan(ctx: Ctx) -> int:
         if missing:
             notes.append(f"프롬프트가 가리키는데 기기에 없는 경로 {len(missing)}개 — 읽기 전용 사본으로 보내거나 대역을 두고, 일부러 안 두는 것은 프롬프트에 적습니다: "
                          + ", ".join(missing[:25]) + (" …" if len(missing) > 25 else ""))
+    differs = config_differences(ctx.config_dir, remote)
+    if differs:
+        notes.append("데몬 동작 설정이 이 맥과 다릅니다 — 옮긴 뒤 턴 시간 제한 · 칸 수가 달라집니다. 일부러 다르게 둔 것이 아니면 기기 "
+                     "config.json 에 맞춰 넣고 기기 데몬을 다시 올립니다: " + " / ".join(differs))
     sessions = {}
     if ctx.sessions_path:
         try:
